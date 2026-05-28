@@ -78,10 +78,16 @@ make snapshot-all ARGS="-y"
 #### 必要な情報（事前準備）
 複製を実行する前に、以下の「プロジェクトIDマッピング情報」を整理してください。
 - **コピー元プロジェクトID**: Host (`shingo-ar-sharedhost0926`), Service 1, Service 3
-- **コピー先（移行先）プロジェクトID**: コピー先となる新しいGCPプロジェクト群を用意します。
-  - コピー先ホスト: (例: `shingo-ar-dsthost0926`)
-  - コピー先サービス1: (例: `shingo-ar-dstservice0926-1`)
-  - コピー先サービス3: (例: `shingo-ar-dstservice0926-3`)
+
+#### 準備: コピー先プロジェクトIDを環境変数としてエクスポートする
+実機スキャン完了後、コピー先となる新しいプロジェクトID群を環境変数（シェル変数）として定義します。これにより、以降のコマンドをマッピング文字列を編集することなくコピペで実行できます。
+
+```bash
+# コピー先のGCPプロジェクトIDをそれぞれ設定します
+export COPY_HOST_PROJECT_ID="your-destination-host-project-id"      # コピー先ホスト
+export COPY_SVC1_PROJECT_ID="your-destination-service1-project-id"  # コピー先サービス1 (Debian)
+export COPY_SVC3_PROJECT_ID="your-destination-service3-project-id"  # コピー先サービス3 (Ubuntu)
+```
 
 #### Step 2.1: オリジナル実機環境の自動スキャン・分析 (`make scan-org`)
 静的定義ファイルに頼らず、現在実際にGCP上で稼働しているオリジナルインフラの実態を動的にディスカバー（探索）し、コピー先の設計図となる `dst/DST.md` を自動生成します。
@@ -91,16 +97,22 @@ make scan-org
 - **高度なOS自動識別**: VMのディスクライセンス情報を解析し、`Debian 12` と `Ubuntu 22.04` のOS構成を100%正確に判定して設計図に落とし込みます。
 - **無関係なリソースの排除**: 手動で作成された定義外のVM（`instance-1` 等）は自動的に検知してスキップし、ツール管理対象のみをクリーンに抽出します。
 
-#### Step 2.2: 同期クローン（復元）のドライラン確認
-プロジェクトIDを差し替え、コピー先で実行される予定のクローン計画を目視確認します。`--project-map` 引数に、先ほど整理したプロジェクトのマッピングペアを渡します。
+#### Step 2.2: コピー先プロジェクトのAPI事前自動有効化 (`make prepare-dst`)
+コピー先でインフラ構築を走らせる前に、デプロイに必要な最小限のAPI（Compute Engine, Cloud DNS）を一撃で並列有効化し、構築エラーを完全に防止します。
 ```bash
-make sync-to-dst ARGS="--project-map shingo-ar-sharedhost0926=【コピー先ホストID】,shingo-ar-sharedservice0926-1=【コピー先サービス1ID】,shingo-ar-sharedservice0926-3=【コピー先サービス3ID】 --dry-run"
+make prepare-dst ARGS="--project-map shingo-ar-sharedhost0926=$COPY_HOST_PROJECT_ID,shingo-ar-sharedservice0926-1=$COPY_SVC1_PROJECT_ID,shingo-ar-sharedservice0926-3=$COPY_SVC3_PROJECT_ID -y"
 ```
 
-#### Step 2.3: スナップショットからの完全復元・同期複製の実行 (`make sync-to-dst`)
+#### Step 2.3: 同期クローン（復元）のドライラン確認
+プロジェクトIDの置換およびスナップショットからクローン復元される実行計画を目視確認します。
+```bash
+make sync-to-dst ARGS="--project-map shingo-ar-sharedhost0926=$COPY_HOST_PROJECT_ID,shingo-ar-sharedservice0926-1=$COPY_SVC1_PROJECT_ID,shingo-ar-sharedservice0926-3=$COPY_SVC3_PROJECT_ID --dry-run"
+```
+
+#### Step 2.4: スナップショットからの完全同期複製の実行 (`make sync-to-dst`)
 クローンデプロイを実行します。
 ```bash
-make sync-to-dst ARGS="--project-map shingo-ar-sharedhost0926=【コピー先ホストID】,shingo-ar-sharedservice0926-1=【コピー先サービス1ID】,shingo-ar-sharedservice0926-3=【コピー先サービス3ID】 -y"
+make sync-to-dst ARGS="--project-map shingo-ar-sharedhost0926=$COPY_HOST_PROJECT_ID,shingo-ar-sharedservice0926-1=$COPY_SVC1_PROJECT_ID,shingo-ar-sharedservice0926-3=$COPY_SVC3_PROJECT_ID -y"
 ```
 > 🚀 **完全同期クローンのメカニズム**
 > 1. 新しいコピー先ホストプロジェクトに、共有VPC、サブネット、NAT、IAP SSH FW等のネットワークインフラを自動構築。
