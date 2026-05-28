@@ -13,6 +13,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
+# Re-use core data structures
 @dataclass
 class SubnetConfig:
     name: str
@@ -40,8 +41,8 @@ class DeployStep:
     resource_type: str
     resource_name: str
     check_cmd: str
-    create_cmd: str # In case of destroy/snapshot, this holds the action command
-    project: str = "" # Associated project ID for state tracking
+    create_cmd: str
+    project: str = ""
 
 @dataclass
 class Stage:
@@ -51,7 +52,7 @@ class Stage:
 
 
 class StateManager:
-    def __init__(self, filepath: str = "state.json"):
+    def __init__(self, filepath: str = "state-sync.json"):
         self.filepath = filepath
         self.lock = threading.Lock()
 
@@ -64,7 +65,6 @@ class StateManager:
                     data = json.load(f)
                     return data.get("resources", [])
             except json.JSONDecodeError:
-                logging.warning(f"Failed to parse state file {self.filepath}. Returning empty state.")
                 return []
 
     def add_resource(self, resource_type: str, resource_name: str, project: str, check_cmd: str, delete_cmd: str):
@@ -91,38 +91,8 @@ class StateManager:
                     "check_cmd": check_cmd,
                     "delete_cmd": delete_cmd
                 })
-                
                 with open(self.filepath, 'w', encoding='utf-8') as f:
                     json.dump(state, f, indent=2)
-
-    def remove_resource(self, resource_type: str, resource_name: str, project: str):
-        with self.lock:
-            if not os.path.exists(self.filepath):
-                return
-            
-            state = {"resources": []}
-            try:
-                with open(self.filepath, 'r', encoding='utf-8') as f:
-                    state = json.load(f)
-            except json.JSONDecodeError:
-                return
-                
-            resources = state.get("resources", [])
-            new_resources = [
-                r for r in resources
-                if not (r["resource_type"] == resource_type and r["resource_name"] == resource_name and r["project"] == project)
-            ]
-            
-            if len(new_resources) != len(resources):
-                state["resources"] = new_resources
-                if not new_resources:
-                    try:
-                        os.remove(self.filepath)
-                    except OSError:
-                        pass
-                else:
-                    with open(self.filepath, 'w', encoding='utf-8') as f:
-                        json.dump(state, f, indent=2)
 
 
 class OrgParser:
@@ -142,12 +112,10 @@ class OrgParser:
 
         for line in lines:
             line = line.strip()
-            
             if line.startswith("## "):
                 self._process_table(current_section, current_subsection, current_project_id, table_lines)
                 table_lines = []
                 in_table = False
-                
                 current_section = line[3:].strip()
                 current_subsection = ""
                 continue
@@ -155,7 +123,6 @@ class OrgParser:
                 self._process_table(current_section, current_subsection, current_project_id, table_lines)
                 table_lines = []
                 in_table = False
-
                 current_subsection = line[4:].strip()
                 match = re.search(r'\(([^)]+)\)', current_subsection)
                 if match:
@@ -201,7 +168,6 @@ class OrgParser:
                 continue
             role = row[0].replace("**", "").strip()
             project_id = row[1].replace("`", "").strip()
-            
             if "Host Project" in role:
                 self.config.host_project = project_id
             elif "Service Project" in role:
@@ -214,7 +180,6 @@ class OrgParser:
             subnet_name = row[0].replace("`", "").strip()
             ip_range = row[1].replace("`", "").strip()
             project_id = row[2].replace("`", "").strip()
-            
             self.config.subnets.append(SubnetConfig(
                 name=subnet_name,
                 ip_range=ip_range,
@@ -223,7 +188,6 @@ class OrgParser:
 
     def _parse_vm_config(self, project_id: str, header: List[str], rows: List[str]):
         header_map = {col: idx for idx, col in enumerate(header)}
-        
         vms = []
         for row in rows:
             try:
@@ -234,22 +198,15 @@ class OrgParser:
                 subnet = row[header_map["サブネット"]].replace("`", "").strip()
                 ip_address = row[header_map["内部固定IPアドレス"]].replace("`", "").strip()
                 
-                image_path = os_image
-                if os_image == "debian-12":
-                    image_path = "projects/debian-cloud/global/images/family/debian-12"
-                elif os_image == "ubuntu-2204-lts":
-                    image_path = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
-
                 vms.append(VMConfig(
                     name=name,
                     machine_type=machine_type,
-                    image=image_path,
+                    image=os_image,
                     zone=zone,
                     subnet=subnet,
                     ip_address=ip_address
                 ))
             except (KeyError, IndexError) as e:
-                print(f"Warning: Failed to parse row {row} due to missing column or index error: {e}", file=sys.stderr)
                 continue
         
         if vms:
@@ -258,61 +215,45 @@ class OrgParser:
             self.config.vms[project_id].extend(vms)
 
 
-STARTUP_SCRIPT = r"""#!/bin/bash
-# Install Nginx and curl
-apt-get update
-apt-get install -y nginx curl
-
-# Get host info
-HOSTNAME=$(hostname)
-IP=$(hostname -I | awk '{print $1}')
-
-# Configure default index page
-echo -e "Hostname: ${HOSTNAME}\nIP: ${IP}" > /var/www/html/index.html
-
-# Overwrite Nginx configuration for /json
-cat <<'EOF' > /etc/nginx/sites-available/default
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-
-    root /var/www/html;
-    index index.html index.htm;
-
-    server_name _;
-
-    location / {
-        default_type text/plain;
-        try_files $uri $uri/ =404;
-    }
-
-    location /json {
-        default_type application/json;
-        return 200 '{"hostname": "HOSTNAME_PLACEHOLDER", "ip": "IP_PLACEHOLDER"}\n';
-    }
-}
-EOF
-
-# Replace placeholders with actual values
-sed -i "s/HOSTNAME_PLACEHOLDER/${HOSTNAME}/" /etc/nginx/sites-available/default
-sed -i "s/IP_PLACEHOLDER/${IP}/" /etc/nginx/sites-available/default
-
-# Apply configuration
-systemctl restart nginx
-"""
-
-
-class GcloudCommandGenerator:
-    def __init__(self, config: EnvConfig, network_name: str = "shared-vpc", region: str = "asia-northeast1", startup_script_path: str = "nginx_startup.sh"):
+class GCPClonerGenerator:
+    def __init__(self, config: EnvConfig, project_map: Dict[str, str], network_name: str = "shared-vpc", region: str = "asia-northeast1"):
         self.config = config
+        self.project_map = project_map
         self.network_name = network_name
         self.region = region
-        self.startup_script_path = startup_script_path
+        
+        # Reverse map to find source project ID from mapped destination project ID
+        self.reverse_project_map = {v: k for k, v in project_map.items()}
 
-    def generate_stages(self) -> List[Stage]:
+    def apply_project_mapping(self):
+        # 1. Map Host Project
+        orig_host = self.config.host_project
+        self.config.host_project = self.project_map.get(orig_host, orig_host)
+        
+        # 2. Map Service Projects (Filter out projects not present in mapping)
+        self.config.service_projects = [
+            self.project_map[p] for p in self.config.service_projects if p in self.project_map
+        ]
+        
+        # 3. Map Subnet projects (Filter out subnets belonging to unmapped projects)
+        self.config.subnets = [
+            sub for sub in self.config.subnets if sub.project in self.project_map or sub.project == orig_host
+        ]
+        for sub in self.config.subnets:
+            sub.project = self.project_map.get(sub.project, sub.project)
+            
+        # 4. Map VMs map keys (Filter out VMs belonging to unmapped projects)
+        new_vms = {}
+        for orig_proj, vms in self.config.vms.items():
+            if orig_proj in self.project_map:
+                mapped_proj = self.project_map[orig_proj]
+                new_vms[mapped_proj] = vms
+        self.config.vms = new_vms
+
+    def generate_sync_stages(self) -> List[Stage]:
         stages = []
         
-        # Stage 1: Host Setup (Sequential)
+        # Stage 1: VPC & Host Setup (Sequential)
         host_setup_steps = []
         host_setup_steps.append(DeployStep(
             resource_type="VPC Network",
@@ -352,7 +293,7 @@ class GcloudCommandGenerator:
             create_cmd=f"gcloud compute routers nats create shared-nat --router=shared-router --region={self.region} --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges --project={self.config.host_project}",
             project=self.config.host_project
         ))
-        # IAP SSH Firewall Rule Creation (Host Project)
+        # IAP SSH Firewall Rule Creation
         host_setup_steps.append(DeployStep(
             resource_type="Firewall Rule",
             resource_name="allow-shared-iap-ssh",
@@ -360,7 +301,7 @@ class GcloudCommandGenerator:
             create_cmd=f"gcloud compute firewall-rules create allow-shared-iap-ssh --network={self.network_name} --allow=tcp:22 --source-ranges=35.235.240.0/20 --direction=INGRESS --project={self.config.host_project}",
             project=self.config.host_project
         ))
-        # all-for-incredibuild Firewall Rule Creation (Host Project)
+        # all-for-incredibuild Firewall Rule Creation
         host_setup_steps.append(DeployStep(
             resource_type="Firewall Rule",
             resource_name="all-for-incredibuild",
@@ -368,7 +309,7 @@ class GcloudCommandGenerator:
             create_cmd=f"gcloud compute firewall-rules create all-for-incredibuild --network={self.network_name} --allow=all --source-ranges=10.0.0.0/8 --direction=INGRESS --project={self.config.host_project}",
             project=self.config.host_project
         ))
-        # ssh Firewall Rule Creation (Host Project)
+        # ssh Firewall Rule Creation
         host_setup_steps.append(DeployStep(
             resource_type="Firewall Rule",
             resource_name="ssh",
@@ -376,7 +317,7 @@ class GcloudCommandGenerator:
             create_cmd=f"gcloud compute firewall-rules create ssh --network={self.network_name} --allow=tcp:22 --source-ranges=10.0.0.0/8 --direction=INGRESS --project={self.config.host_project}",
             project=self.config.host_project
         ))
-        # rdp Firewall Rule Creation (Host Project)
+        # rdp Firewall Rule Creation
         host_setup_steps.append(DeployStep(
             resource_type="Firewall Rule",
             resource_name="rdp",
@@ -389,6 +330,8 @@ class GcloudCommandGenerator:
         # Stage 2: Subnets (Parallelized)
         subnet_steps = []
         for subnet in self.config.subnets:
+            if not subnet.name.startswith("subnet-"):
+                continue
             subnet_steps.append(DeployStep(
                 resource_type="Subnet",
                 resource_name=subnet.name,
@@ -398,33 +341,36 @@ class GcloudCommandGenerator:
             ))
         stages.append(Stage(name="Subnet Creation", steps=subnet_steps, is_parallel=True))
 
-        # Stage 3: Static IPs (Parallelized)
-        ip_steps = []
+        # Stage 3: Clone Disk from Original Snapshot (Parallelized)
+        disk_steps = []
         for proj_id, vms in self.config.vms.items():
+            src_proj = self.reverse_project_map.get(proj_id, proj_id)
             for vm in vms:
-                subnet_path = f"projects/{self.config.host_project}/regions/{self.region}/subnetworks/{vm.subnet}"
-                ip_steps.append(DeployStep(
-                    resource_type="Static Private IP Address",
-                    resource_name=f"{vm.name}-ip",
-                    check_cmd=f"gcloud compute addresses describe {vm.name}-ip --region={self.region} --project={proj_id} --format='value(name)'",
-                    create_cmd=f"gcloud compute addresses create {vm.name}-ip --addresses={vm.ip_address} --subnet={subnet_path} --region={self.region} --project={proj_id}",
+                disk_name = f"{vm.name}-disk"
+                snapshot_path = f"projects/{src_proj}/global/snapshots/{vm.name}"
+                disk_steps.append(DeployStep(
+                    resource_type="Disk",
+                    resource_name=disk_name,
+                    check_cmd=f"gcloud compute disks describe {disk_name} --zone={vm.zone} --project={proj_id} --format='value(name)'",
+                    create_cmd=f"gcloud compute disks create {disk_name} --source-snapshot={snapshot_path} --zone={vm.zone} --project={proj_id} --quiet",
                     project=proj_id
                 ))
-        stages.append(Stage(name="IP Reservation", steps=ip_steps, is_parallel=True))
+        stages.append(Stage(name="Disk Cloning from Snapshot", steps=disk_steps, is_parallel=True))
 
-        # Stage 4: VM Instances (Parallelized) with --metadata-from-file
+        # Stage 4: Clone VMs launching from Cloned Boot Disks (Parallelized)
         vm_steps = []
         for proj_id, vms in self.config.vms.items():
             for vm in vms:
                 subnet_path = f"projects/{self.config.host_project}/regions/{self.region}/subnetworks/{vm.subnet}"
+                disk_name = f"{vm.name}-disk"
                 vm_steps.append(DeployStep(
                     resource_type="VM Instance",
                     resource_name=vm.name,
                     check_cmd=f"gcloud compute instances describe {vm.name} --zone={vm.zone} --project={proj_id} --format='value(name)'",
-                    create_cmd=f"gcloud compute instances create {vm.name} --machine-type={vm.machine_type} --image={vm.image} --subnet={subnet_path} --private-network-ip={vm.ip_address} --zone={vm.zone} --project={proj_id} --no-address --metadata-from-file=startup-script={self.startup_script_path}",
+                    create_cmd=f"gcloud compute instances create {vm.name} --disk=name={disk_name},boot=yes,auto-delete=yes --subnet={subnet_path} --private-network-ip={vm.ip_address} --zone={vm.zone} --project={proj_id} --no-address --quiet --machine-type={vm.machine_type}",
                     project=proj_id
                 ))
-        stages.append(Stage(name="VM Provisioning", steps=vm_steps, is_parallel=True))
+        stages.append(Stage(name="VM Cloned Provisioning", steps=vm_steps, is_parallel=True))
 
         return stages
 
@@ -451,10 +397,10 @@ class GcloudCommandGenerator:
                 f"gcloud compute networks subnets describe {resource_name} --region={z_r} --project={project} --format='value(name)'",
                 f"gcloud compute networks subnets delete {resource_name} --region={z_r} --project={project} --quiet"
             )
-        elif resource_type == "Static Private IP Address":
+        elif resource_type == "Disk":
             return (
-                f"gcloud compute addresses describe {resource_name} --region={z_r} --project={project} --format='value(name)'",
-                f"gcloud compute addresses delete {resource_name} --region={z_r} --project={project} --quiet"
+                f"gcloud compute disks describe {resource_name} --zone={z_r} --project={project} --format='value(name)'",
+                f"gcloud compute disks delete {resource_name} --zone={z_r} --project={project} --quiet"
             )
         elif resource_type == "VM Instance":
             return (
@@ -480,99 +426,20 @@ class GcloudCommandGenerator:
         return ("", "")
 
 
-def build_destroy_stages_from_state(state_resources: List[Dict]) -> List[Stage]:
-    vm_steps = []
-    ip_steps = []
-    nat_steps = []
-    router_steps = []
-    firewall_steps = []
-    subnet_steps = []
-    host_steps = []
-    
-    for r in reversed(state_resources):
-        step = DeployStep(
-            resource_type=r["resource_type"],
-            resource_name=r["resource_name"],
-            check_cmd=r["check_cmd"],
-            create_cmd=r["delete_cmd"],
-            project=r["project"]
-        )
-        
-        if r["resource_type"] == "VM Instance":
-            vm_steps.append(step)
-        elif r["resource_type"] == "Static Private IP Address":
-            ip_steps.append(step)
-        elif r["resource_type"] == "Cloud NAT":
-            nat_steps.append(step)
-        elif r["resource_type"] == "Cloud Router":
-            router_steps.append(step)
-        elif r["resource_type"] == "Firewall Rule":
-            firewall_steps.append(step)
-        elif r["resource_type"] == "Subnet":
-            subnet_steps.append(step)
-        else:
-            host_steps.append(step)
-            
-    stages = []
-    if vm_steps:
-        stages.append(Stage(name="VM Destruction", steps=vm_steps, is_parallel=True))
-    if ip_steps:
-        stages.append(Stage(name="IP Release", steps=ip_steps, is_parallel=True))
-    if nat_steps:
-        stages.append(Stage(name="NAT Destruction", steps=nat_steps, is_parallel=True))
-    if router_steps:
-        stages.append(Stage(name="Router Destruction", steps=router_steps, is_parallel=True))
-    if firewall_steps:
-        stages.append(Stage(name="Firewall Destruction", steps=firewall_steps, is_parallel=True))
-    if subnet_steps:
-        stages.append(Stage(name="Subnet Deletion", steps=subnet_steps, is_parallel=True))
-    if host_steps:
-        stages.append(Stage(name="VPC & Host Cleanup", steps=host_steps, is_parallel=False))
-        
-    return stages
-
-
-def build_snapshot_stage_from_state(state_resources: List[Dict]) -> Stage:
+def build_api_enablement_stage_from_projects(projects: List[str]) -> Stage:
     steps = []
-    for r in state_resources:
-        if r["resource_type"] == "VM Instance":
-            vm_name = r["resource_name"]
-            project = r["project"]
-            
-            # Extract zone from check_cmd (default to asia-northeast1-a)
-            zone = "asia-northeast1-a"
-            match = re.search(r'--zone=([^\s]+)', r["check_cmd"])
-            if match:
-                zone = match.group(1)
-                
-            steps.append(DeployStep(
-                resource_type="Snapshot",
-                resource_name=vm_name,
-                check_cmd=f"gcloud compute snapshots describe {vm_name} --project={project} --format='value(name)'",
-                create_cmd=f"gcloud compute snapshots create {vm_name} --source-disk={vm_name} --source-disk-zone={zone} --project={project} --quiet",
-                project=project
-            ))
-            
-    return Stage(name="Snapshot Creation", steps=steps, is_parallel=True)
+    for project in projects:
+        steps.append(DeployStep(
+            resource_type="API",
+            resource_name=project,
+            check_cmd=f"gcloud services list --enabled --project={project} --format='value(config.name)' | grep -w compute.googleapis.com",
+            create_cmd=f"gcloud services enable compute.googleapis.com dns.googleapis.com --project={project} --quiet",
+            project=project
+        ))
+    return Stage(name="API Enablement", steps=steps, is_parallel=True)
 
 
-def setup_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    
-    formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    file_handler = logging.FileHandler('build.log', mode='a', encoding='utf-8')
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-
-def execute_single_step_thread(step: DeployStep, prefix: str, is_destroy: bool, state_mgr: StateManager, generator: GcloudCommandGenerator) -> Tuple[bool, str]:
+def execute_single_step_thread(step: DeployStep, prefix: str, state_mgr: StateManager, cloner: GCPClonerGenerator) -> Tuple[bool, str]:
     log_stream = io.StringIO()
     t_logger = logging.getLogger(f"thread_{step.resource_name}")
     t_logger.setLevel(logging.INFO)
@@ -583,59 +450,49 @@ def execute_single_step_thread(step: DeployStep, prefix: str, is_destroy: bool, 
     handler.setFormatter(formatter)
     t_logger.addHandler(handler)
 
-    t_logger.info(f"{prefix} Checking existence...")
+    t_logger.info(f"{prefix} Checking existence in destination...")
     check_result = subprocess.run(step.check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     exists = (check_result.returncode == 0)
     
     success = True
-    if is_destroy:
-        if not exists:
-            t_logger.info(f"{prefix} -> [SKIP] Already deleted (not found).")
-            state_mgr.remove_resource(step.resource_type, step.resource_name, step.project)
-            return True, log_stream.getvalue()
-        t_logger.info(f"{prefix} -> [DELETE] Found. Deleting...")
-    else:
-        if exists:
-            # Distinct label for already created snapshots
-            already_verb = "already taken" if step.resource_type == "Snapshot" else "Already exists"
-            t_logger.info(f"{prefix} -> [SKIP] {already_verb}.")
-            
-            # Track created resources (excluding snapshots) in state.json
-            if step.resource_type != "Snapshot":
-                zone_or_region = ""
-                if step.resource_type == "VM Instance":
-                    match = re.search(r'--zone=([^\s]+)', step.check_cmd)
-                    if match: zone_or_region = match.group(1)
-                check_c, delete_c = generator.get_delete_cmd_for_resource(step.resource_type, step.resource_name, step.project, zone_or_region)
-                if delete_c:
-                    state_mgr.add_resource(step.resource_type, step.resource_name, step.project, check_c, delete_c)
-            return True, log_stream.getvalue()
+    if exists:
+        already_verb = "already enabled" if step.resource_type == "API" else "Already exists in destination"
+        t_logger.info(f"{prefix} -> [SKIP] {already_verb}.")
         
-        action_verb = "Taking snapshot" if step.resource_type == "Snapshot" else "Creating"
-        t_logger.info(f"{prefix} -> [RUN] Not found. {action_verb}...")
+        # Track successfully synced resource (excluding APIs)
+        if step.resource_type != "API":
+            zone_or_region = ""
+            if step.resource_type in ["VM Instance", "Disk"]:
+                match = re.search(r'--zone=([^\s]+)', step.check_cmd)
+                if match: zone_or_region = match.group(1)
+            check_c, delete_c = cloner.get_delete_cmd_for_resource(step.resource_type, step.resource_name, step.project, zone_or_region)
+            if delete_c:
+                state_mgr.add_resource(step.resource_type, step.resource_name, step.project, check_c, delete_c)
+        return True, log_stream.getvalue()
         
+    action_verb = "Enabling required APIs" if step.resource_type == "API" else "Replicating resource"
+    t_logger.info(f"{prefix} -> [RUN] Not found. {action_verb}...")
     t_logger.info(f"  Executing: {step.create_cmd}")
     
     try:
         result = subprocess.run(step.create_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         
-        if is_destroy:
-            success_verb = "Deleted"
-        elif step.resource_type == "Snapshot":
-            success_verb = "Snapshotted"
+        if step.resource_type == "API":
+            success_verb = "Enabled"
+        elif step.resource_type == "VM Instance" or step.resource_type == "Disk":
+            success_verb = "Replicated"
         else:
             success_verb = "Created"
             
         t_logger.info(f"{prefix} -> [SUCCESS] {success_verb} successfully.")
         
-        if is_destroy:
-            state_mgr.remove_resource(step.resource_type, step.resource_name, step.project)
-        elif step.resource_type != "Snapshot": # Exclude backup snapshots from cleanup state tracking
+        # Track successfully synced resource (excluding APIs)
+        if step.resource_type != "API":
             zone_or_region = ""
-            if step.resource_type == "VM Instance":
+            if step.resource_type in ["VM Instance", "Disk"]:
                 match = re.search(r'--zone=([^\s]+)', step.create_cmd)
                 if match: zone_or_region = match.group(1)
-            check_c, delete_c = generator.get_delete_cmd_for_resource(step.resource_type, step.resource_name, step.project, zone_or_region)
+            check_c, delete_c = cloner.get_delete_cmd_for_resource(step.resource_type, step.resource_name, step.project, zone_or_region)
             if delete_c:
                 state_mgr.add_resource(step.resource_type, step.resource_name, step.project, check_c, delete_c)
 
@@ -644,8 +501,6 @@ def execute_single_step_thread(step: DeployStep, prefix: str, is_destroy: bool, 
     except subprocess.CalledProcessError as e:
         t_logger.error(f"{prefix} -> [FAILED] Command failed with exit code {e.returncode}.")
         t_logger.error(f"Command: {e.cmd}")
-        if e.stdout:
-            t_logger.error(f"Stdout:\n{e.stdout}")
         if e.stderr:
             t_logger.error(f"Stderr:\n{e.stderr}")
         success = False
@@ -653,8 +508,8 @@ def execute_single_step_thread(step: DeployStep, prefix: str, is_destroy: bool, 
     return success, log_stream.getvalue()
 
 
-def execute_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state_mgr: StateManager, generator: GcloudCommandGenerator, is_destroy: bool = False, is_snapshot: bool = False):
-    action_label = "Destroy" if is_destroy else ("Snapshot" if is_snapshot else "Deployment")
+def execute_sync_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state_mgr: StateManager, cloner: GCPClonerGenerator, is_prepare: bool = False):
+    action_label = "API Enablement" if is_prepare else "Environment Replication"
     
     if dry_run:
         logging.info(f"=== [DRY RUN] Planned {action_label} Stages ===")
@@ -665,57 +520,29 @@ def execute_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state
                 logging.info(f"  Step {i:02d}: [{step.resource_type}] {step.resource_name}")
                 logging.info(f"    Check:  {step.check_cmd}")
                 logging.info(f"    Action: {step.create_cmd}")
-        logging.info("=============================================")
+        logging.info("=======================================================")
         return
 
     logging.info(f"=== Prepared {action_label} Stages ===")
     for s_idx, stage in enumerate(stages, 1):
         mode = "PARALLEL" if stage.is_parallel else "SEQUENTIAL"
         logging.info(f"Stage {s_idx:02d}: {stage.name} ({len(stage.steps)} steps, {mode})")
-    logging.info("=======================================")
+    logging.info("====================================")
 
-    # Confirmation prompt
     if not auto_approve:
-        if is_destroy:
-            logging.warning("!!! WARNING: This operation will DESTROY all resources recorded in state.json !!!")
-            host_proj_id = ""
-            for s in stages:
-                for step in s.steps:
-                    if step.resource_type == "Shared VPC Host":
-                        host_proj_id = step.resource_name
-                        break
-            if not host_proj_id:
-                host_proj_id = "confirm"
-            try:
-                user_input = input(f"\nTo confirm deletion, please type '{host_proj_id}': ").strip()
-                if user_input != host_proj_id:
-                    logging.error("Confirmation failed. Aborting.")
-                    sys.exit(1)
-            except KeyboardInterrupt:
-                logging.warning("Cancelled by user.")
-                sys.exit(1)
-        elif is_snapshot:
-            try:
-                response = input(f"\nDo you want to take snapshots of all {len(stages[0].steps)} VMs? [y/N]: ").strip().lower()
-            except KeyboardInterrupt:
-                logging.warning("Cancelled by user.")
-                sys.exit(1)
-            if response != 'y':
-                logging.info("Cancelled.")
-                return
-        else:
-            try:
-                response = input("\nDo you want to proceed with the deployment? [y/N]: ").strip().lower()
-            except KeyboardInterrupt:
-                logging.warning("Cancelled by user.")
-                sys.exit(1)
-            if response != 'y':
-                logging.info("Cancelled.")
-                return
+        try:
+            prompt_str = f"Do you want to proceed with the {action_label.lower()}? [y/N]: "
+            response = input(prompt_str).strip().lower()
+        except KeyboardInterrupt:
+            logging.warning("Cancelled by user.")
+            sys.exit(1)
+        if response != 'y':
+            logging.info("Cancelled.")
+            return
     else:
         logging.info("Auto-approve enabled. Skipping confirmation.")
 
-    logging.info(f"Starting {action_label.lower()}...")
+    logging.info(f"Starting {action_label.lower()} to destination...")
 
     for s_idx, stage in enumerate(stages, 1):
         mode = "PARALLEL" if stage.is_parallel else "SEQUENTIAL"
@@ -727,12 +554,11 @@ def execute_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state
             
         if stage.is_parallel:
             logging.info(f"Spawning {len(stage.steps)} threads for parallel execution...")
-            
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 futures = {}
                 for i, step in enumerate(stage.steps, 1):
                     prefix = f"[Stage {s_idx}][Thread-{i}/{len(stage.steps)}] ({step.resource_type}: {step.resource_name})"
-                    future = executor.submit(execute_single_step_thread, step, prefix, is_destroy, state_mgr, generator)
+                    future = executor.submit(execute_single_step_thread, step, prefix, state_mgr, cloner)
                     futures[future] = step
                 
                 stage_failed = False
@@ -743,86 +569,84 @@ def execute_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state
                         stage_failed = True
                         
                 if stage_failed:
-                    logging.error(f"Stage '{stage.name}' failed. Stopping execution. Remaining stages preserved.")
+                    logging.error(f"Stage '{stage.name}' failed. Stopping. Remaining stages preserved.")
                     sys.exit(1)
-                    
         else:
             for i, step in enumerate(stage.steps, 1):
                 prefix = f"[Stage {s_idx}][Seq-{i}/{len(stage.steps)}] ({step.resource_type}: {step.resource_name})"
-                success, buffered_log = execute_single_step_thread(step, prefix, is_destroy, state_mgr, generator)
+                success, buffered_log = execute_single_step_thread(step, prefix, state_mgr, cloner)
                 print(buffered_log, end="")
-                
                 if not success:
-                    logging.error(f"Step failed. Stopping execution. Remaining stages preserved.")
+                    logging.error("Step failed. Stopping execution. Remaining stages preserved.")
                     sys.exit(1)
                     
-    logging.info(f"\n{action_label} completed successfully (or no changes needed).")
+    logging.info(f"\n{action_label} completed successfully.")
+
+
+def setup_logging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    file_handler = logging.FileHandler('sync.log', mode='a', encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+
+def parse_project_map(map_str: str) -> Dict[str, str]:
+    # Expects: src_host=dst_host,src_svc1=dst_svc1,...
+    project_map = {}
+    if not map_str:
+        return project_map
+        
+    pairs = map_str.split(",")
+    for pair in pairs:
+        if "=" not in pair:
+            logging.error(f"Invalid project-map pair format: {pair}. Expected key=value.")
+            sys.exit(1)
+        k, v = pair.split("=", 1)
+        project_map[k.strip()] = v.strip()
+    return project_map
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Build, Destroy, or Backup GCP environment from ORG.md")
-    parser.add_argument("--config", required=True, help="Path to ORG.md")
+    parser = argparse.ArgumentParser(description="Sync/Replicate GCP environment from scan file (DST.md) using snapshots")
+    parser.add_argument("--config", required=True, help="Path to scanned DST.md configuration file")
+    parser.add_argument("--project-map", required=True, help="Comma-separated project ID mappings: src_proj=dst_proj,...")
+    parser.add_argument("--prepare", action="store_true", help="Only enable required APIs (Compute Engine, DNS) in mapped projects")
     parser.add_argument("--dry-run", action="store_true", help="Show commands without executing")
-    parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt (auto-approve)")
-    parser.add_argument("--destroy", action="store_true", help="Destroy all resources tracked in state.json")
-    parser.add_argument("--snapshot", action="store_true", help="Create disk snapshots of all VMs tracked in state.json")
+    parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
     args = parser.parse_args()
 
     setup_logging()
 
+    project_map = parse_project_map(args.project_map)
     state_mgr = StateManager()
 
-    startup_script_path = "nginx_startup.sh"
-    if not args.dry_run and not args.destroy and not args.snapshot:
-        logging.info(f"Writing temporary startup script file: {startup_script_path}")
-        with open(startup_script_path, "w", encoding="utf-8") as f:
-            f.write(STARTUP_SCRIPT)
-        os.chmod(startup_script_path, 0o755)
+    logging.info(f"Parsing scanned configuration: {args.config}")
+    org_parser = OrgParser(args.config)
+    config = org_parser.parse()
 
-    try:
-        if args.destroy:
-            logging.info("Loading deployed resources from state.json...")
-            state_resources = state_mgr.load_state()
-            if not state_resources:
-                logging.info("No resources found in state.json to destroy. Nothing to do.")
-                sys.exit(0)
-                
-            org_parser = OrgParser(args.config)
-            config = org_parser.parse()
-            generator = GcloudCommandGenerator(config, startup_script_path=startup_script_path)
-            
-            stages = build_destroy_stages_from_state(state_resources)
-            execute_stages(stages, args.dry_run, args.yes, state_mgr=state_mgr, generator=generator, is_destroy=True)
-            
-        elif args.snapshot:
-            logging.info("Loading deployed VMs from state.json for snapshotting...")
-            state_resources = state_mgr.load_state()
-            has_vms = any(r["resource_type"] == "VM Instance" for r in state_resources)
-            if not has_vms:
-                logging.info("No deployed VMs found in state.json. Cannot take snapshots.")
-                sys.exit(0)
-                
-            org_parser = OrgParser(args.config)
-            config = org_parser.parse()
-            generator = GcloudCommandGenerator(config, startup_script_path=startup_script_path)
-            
-            snapshot_stage = build_snapshot_stage_from_state(state_resources)
-            execute_stages([snapshot_stage], args.dry_run, args.yes, state_mgr=state_mgr, generator=generator, is_destroy=False, is_snapshot=True)
-            
-        else:
-            logging.info(f"Parsing config: {args.config}")
-            org_parser = OrgParser(args.config)
-            config = org_parser.parse()
-            
-            generator = GcloudCommandGenerator(config, startup_script_path=startup_script_path)
-            stages = generator.generate_stages()
-            execute_stages(stages, args.dry_run, args.yes, state_mgr=state_mgr, generator=generator, is_destroy=False)
-    finally:
-        if os.path.exists(startup_script_path):
-            try:
-                logging.info(f"Cleaning up temporary startup script file: {startup_script_path}")
-                os.remove(startup_script_path)
-            except OSError as e:
-                logging.warning(f"Failed to remove temporary file {startup_script_path}: {e}")
+    # Initialize cloner, map project IDs to destination mapping
+    cloner = GCPClonerGenerator(config, project_map)
+    cloner.apply_project_mapping()
+    
+    if args.prepare:
+        logging.info("Preparing copy target: Enabling required GCP service APIs...")
+        # Extract unique destination projects list (Host + Service projects mapped)
+        dst_projects = list(set([cloner.config.host_project] + cloner.config.service_projects))
+        
+        # Generate api enablement stage
+        api_stage = build_api_enablement_stage_from_projects(dst_projects)
+        execute_sync_stages([api_stage], args.dry_run, args.yes, state_mgr=state_mgr, cloner=cloner, is_prepare=True)
+    else:
+        stages = cloner.generate_sync_stages()
+        execute_sync_stages(stages, args.dry_run, args.yes, state_mgr=state_mgr, cloner=cloner, is_prepare=False)
 
 if __name__ == "__main__":
     main()
