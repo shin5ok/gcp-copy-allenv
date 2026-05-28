@@ -16,7 +16,7 @@
   - 共有VPCネットワーク (`shared-vpc`) を管理。
   - 各サービスプロジェクト用にサブネットを作成し、権限を付与する。
   - プライベートVMがインターネット通信（外部アップデート等）を行えるよう、Cloud Router および Cloud NAT ゲートウェイを配置・管理する。
-  - **踏み台サーバー等を使わず、安全に gcloud compute ssh (IAP トンネリング) 経由でプライベートVMにアクセスできるよう、IAP専用のファイアウォール許可ルール (tcp:22) を配置・管理する。**
+  - 踏み台サーバー等を使わず、安全に gcloud compute ssh (IAP トンネリング) 経由でプライベートVMにアクセスできるよう、IAP専用のファイアウォール許可ルール (tcp:22) を配置・管理する。
 - **Service Projects (サービスプロジェクト)**: VMインスタンスなどのコンピューティングリソースを配置するプロジェクト。
   - ホストプロジェクトから共有されたサブネットを利用してVMを配置する。
   - VMには外部IPアドレスを付与せず、安全に Cloud NAT 経由でのみインターネットに発信通信を行えるようにする。
@@ -82,14 +82,17 @@ Markdown形式で記述する。
   - 実際のリソース作成処理を実行する。
   - 実行前にユーザーに確認プロンプトを表示する。
 - **`make destroy`**:
-  - `ORG.md` に定義されたリソースをすべて削除（クリーンアップ）する。
-  - 実行前に、意図しない削除を防ぐための強力な確認プロンプト（赤字警告、あるいは「destroy」と文字列を入力させる等）を表示する。
+  - `state.json` に記録されたリソースのみを安全に逆順削除（クリーンアップ）する。
+  - 実行前に、ホストプロジェクトIDの入力を求める強力な確認プロンプトを表示する。
+- **`make snapshot-all`**:
+  - `state.json` にデプロイ実績として記録されているすべてのVMインスタンスのディスクスナップショットを自動作成する。
+  - 実行前に確認プロンプトを表示する。
 
 ### 2. 実装要件
 
 #### 2.1. 言語・実行環境
 - **Python 3.12以上** を使用。
-- パッケージ管理および実行には **`uv`** を使用.
+- パッケージ管理および実行には **`uv`** を使用。
 - コードスタイルは **PEP8** に準拠。
 - 単体テストは `tests/` ディレクトリ配下に `pytest` で記述。
 
@@ -97,71 +100,31 @@ Markdown形式で記述する。
 スクリプト名: `scripts/build_env.py` (仮)
 
 1. **パース機能**:
-   - `org/ORG.md` を解析し、以下の情報を抽出する。
-     - ホストプロジェクトID、サービスプロジェクトID
-     - 共有VPCのネットワーク名、サブネット名、IP範囲
-     - 各VMのインスタンス名、マシンタイプ、OSイメージ、サブネット、内部固定IPアドレス
+   - `org/ORG.md` を解析し、プロジェクト、サブネット、VMの情報を抽出する。
 2. **`gcloud` コマンド生成**:
-   - 抽出した情報に基づき、リソース作成に必要な `gcloud` コマンドを生成する。
-   - 生成するコマンドの例:
-     - 共有VPCの有効化
-     - Cloud Routerの作成: `gcloud compute routers create shared-router --network=shared-vpc --region=asia-northeast1 --project=<SRC_HOST_PROJECT_ID>`
-     - Cloud NATの作成: `gcloud compute routers nats create shared-nat --router=shared-router --region=asia-northeast1 --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges --project=<SRC_HOST_PROJECT_ID>`
-     - **IAP SSHファイアウォールルールの作成**: `gcloud compute firewall-rules create allow-shared-iap-ssh --network=shared-vpc --allow=tcp:22 --source-ranges=35.235.240.0/20 --direction=INGRESS --project=<SRC_HOST_PROJECT_ID>`
-     - サブネットの作成
-     - 固定内部IPアドレスの予約: `gcloud compute addresses create ... --addresses ... --subnet ... --region ... --project ...`
-     - VMインスタンスの作成: `gcloud compute instances create ... --machine-type ... --image ... --subnet ... --private-network-ip ... --zone ... --project ...`
+   - 作成・削除の各リソース用コマンドを生成する。
 3. **実行制御 (ドライランと適用)**:
-   - `--dry-run` フラグが有効な場合、生成した `gcloud` コマンドを標準出力に表示するのみとする。
-   - フラグが無効な場合、コマンドをサブプロセスとして実行する。実行前に「本当に実行しますか？ [y/N]」の確認を行う。
+   - ドライランおよび実実行の制御、プロンプト確認。
 4. **削除機能 (Destroy)**:
-   - `--destroy` フラグが指定された場合、作成時とは逆の順序でリソースの削除を行う。
-   - 削除時も事前に存在チェックを行い、存在する場合のみ削除コマンドを実行する（べき等性）。
-   - 削除コマンドの例:
-     - VMインスタンスの削除: `gcloud compute instances delete ... --zone ... --project ... --quiet`
-     - 固定内部IPアドレスの解放: `gcloud compute addresses delete ... --region ... --project ... --quiet`
-     - サブネットの削除: `gcloud compute networks subnets delete ... --region ... --project ... --quiet`
-     - Cloud NATの削除: `gcloud compute routers nats delete shared-nat --router=shared-router --region=asia-northeast1 --project=<SRC_HOST_PROJECT_ID> --quiet`
-     - Cloud Routerの削除: `gcloud compute routers delete shared-router --region=asia-northeast1 --project=<SRC_HOST_PROJECT_ID> --quiet`
-     - **IAP SSHファイアウォールルールの削除**: `gcloud compute firewall-rules delete allow-shared-iap-ssh --project=<SRC_HOST_PROJECT_ID> --quiet`
-     - プロジェクト関連付け解除: `gcloud compute shared-vpc associated-projects remove ... --host-project ... --quiet`
-     - 共有VPC無効化: `gcloud compute shared-vpc disable ... --quiet`
-     - VPCの削除: `gcloud compute networks delete ... --project ... --quiet`
-   - `--yes` フラグがない場合は、非常に慎重な確認（例: 「本当にすべて削除しますか？ 削除する場合は [YES] と入力してください」）を求める。
+   - `state.json` からの実績ベース逆順削除。
 5. **並列実行 (Parallel Execution)**:
-   - リソース間の依存関係を考慮し、処理を複数の **ステージ (Stage)** に分割して実行する。
-   - 同一ステージ内の依存関係がないタスク（例: 異なるVMの作成や削除）は、スレッドプール (`concurrent.futures.ThreadPoolExecutor`) 等を用いて **並列に非同期実行** する。
-   - これにより、特にVM台数が多い環境において、構築および削除時間を大幅に短縮する。
-   - **構築時のステージ設計**:
-     - Stage 1 (同期): VPC作成 -> Shared VPC有効化 -> サービスプロジェクト関連付け -> Cloud Router作成 -> Cloud NAT作成 -> **IAP SSHファイアウォール作成**
-     - Stage 2 (同期): サブネット作成
-     - Stage 3 (並列): 各VM用の固定IP予約 & VMインスタンス作成 (※VMごとに「IP予約 -> VM作成」を一連のタスクとして並列実行)
-   - **削除時のステージ設計**:
-     - Stage 1 (並列): VMインスタンスの削除 (全台並列)
-     - Stage 2 (並列): 固定IPの解放 (全IP並列)
-     - Stage 3 (並列): サブネットの削除 (全サブネット並列)
-     - Stage 4 (同期): **IAP SSHファイアウォール削除** -> Cloud NAT削除 -> Cloud Router削除 -> プロジェクト関連付け解除 -> Shared VPC無効化 -> VPC削除
+   - 依存関係のないステージ（VM作成/削除、IP予約/解放、サブネット削除など）の非同期スレッド並列実行。
 6. **ステート管理 (`state.json`)**:
-   - `make deploy` にて実際に作成（成功）したリソース情報を、動的に `state.json` に記録・保存する。
-   - 記録情報: `resource_type`, `resource_name`, `project`, `check_cmd`, `delete_cmd` (削除用コマンド)。
-   - 途中でデプロイが失敗した場合でも、そこまでに成功したリソースのみが `state.json` に記録される。
-   - `make destroy` 実行時は、`ORG.md` の静的定義ではなく、この `state.json` を読み込み、**実際に作成された実績のあるリソースのみを逆順で削除** する。
-   - これにより、定義外の他リソース（手動作成されたVMなど）を誤って削除対象に含むことを完全に防止する。
-   - 削除に成功したリソースは順次 `state.json` から除外され、すべてのクリーンアップが完了すると `state.json` は自動的に削除される。
+   - 作成成功実績の動的追跡と記録、削除成功時の自動除外。
+7. **スナップショット一括作成機能 (Snapshot)**:
+   - `--snapshot` フラグが指定された場合、`state.json` からVMインスタンスのリストを読み込む。
+   - 各VMのブートディスク（名前＝VM名と仮定）に対し、スナップショット名＝VM名として、**マルチスレッドで非同期並列にスナップショットを作成**する。
+   - 作成前にすでに同名のスナップショットが存在するか `describe` で確認し、存在するならスキップ（べき等性）。
+   - コマンド: `gcloud compute snapshots create [VM名] --source-disk=[VM名] --source-disk-zone=[ゾーン] --project=[プロジェクト] --quiet`
+   - 並列実行のログは、他の処理と同様にVM単位でバッファリングしてグループ出力する。
 
-### 3. Safety measures (べき等性の確保とログ記録)
+### 3. 安全対策と堅牢性 (べき等性の確保とログ記録)
 
 - **べき等性 (Idempotency) の確保**:
-  - リソース作成・削除を実行する前に、対象リソースが既に存在するか（または削除済みか）を `gcloud ... describe` コマンドや `state.json` の記録を元にチェックする。
-  - `make deploy` 時に作成済みリソースはスキップし、`make destroy` 時に削除済みリソースはスキップする。
-  - ステートファイルを用いることで、より厳密なべき等性とレジューム（失敗箇所からの再開）を実現する。
+  - リソース作成・削除・スナップショット作成を実行する前に、対象リソースが既に存在するか（または削除済みか）をチェックする。
 - **エラーハンドリング**:
-  - 各リソース作成コマンドの実行結果を厳格にチェックし、エラーが発生した場合は即座に処理を中断する。
-  - スキップされた処理、成功した処理、失敗した処理を画面上に明確に区別して出力する（カラー出力等を推奨）。
+  - 各コマンドの成否をチェックし、失敗時は即座に中断（他の並列スレッドも可能な限り早く停止）する。
 - **詳細なログ出力と記録**:
-  - 実行結果（コマンド、実行日時、成否、出力）をログファイル `build.log` に追加書き込み (Append) 形式で記録する。
-  - 失敗時には、エラーとなった具体的な `gcloud` コマンドと標準エラー出力をログファイルに記録し、後から原因分析と個別再試行が容易になるようにする。
+  - `build.log` への詳細ログ追加保存。
 - **並列実行時のロググループ化 (Log Buffering)**:
-  - 並列実行時にログが混ざり合って（インターリーブして）出力されるのを防ぐため、**タスク（リソース）ごとにログをメモリ上にバッファリング** する。
-  - タスクの実行中（チェック、作成、成功、失敗）のログはバッファに溜め、そのタスクが完了（または失敗）した時点で、ひためまりのログブロックとして標準出力および `build.log` に一括してフラッシュ（出力）する。
-  - これにより、並列実行の高速性を維持しつつ、シーケンシャル（時系列）で追いやすい極めて視認性の高いログ出力を実現する。
+  - スレッドごとのログ出力をバッファリングし、完了時にグループ出力。

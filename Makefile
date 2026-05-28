@@ -1,4 +1,4 @@
-.PHONY: plan deploy destroy test setup
+.PHONY: plan deploy destroy test setup snapshot-all
 
 setup:
 	uv sync
@@ -11,6 +11,9 @@ deploy:
 
 destroy:
 	uv run scripts/build_env.py --config org/ORG.md --destroy $(ARGS)
+
+snapshot-all: setup
+	uv run scripts/build_env.py --config org/ORG.md --snapshot $(ARGS)
 
 test:
 	PYTHONPATH=. uv run pytest
