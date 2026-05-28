@@ -1,4 +1,4 @@
-.PHONY: plan deploy destroy test setup snapshot-all scan-org sync-to-dst
+.PHONY: plan deploy destroy test setup snapshot-all scan-org sync-to-dst prepare-dst
 
 setup:
 	uv sync
@@ -17,6 +17,9 @@ snapshot-all: setup
 
 scan-org: setup
 	uv run scripts/scan_env.py --project <SRC_HOST_PROJECT_ID> --network shared-vpc --output dst/DST.md $(ARGS)
+
+prepare-dst: setup
+	uv run scripts/sync_env.py --config dst/DST.md --prepare $(ARGS)
 
 sync-to-dst: setup
 	uv run scripts/sync_env.py --config dst/DST.md $(ARGS)
