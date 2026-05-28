@@ -110,3 +110,28 @@ def test_sync_generator_stages():
     # Launches from restored boot disk 'org-svc1-deb-e2-std4-01-disk', auto-delete=yes, no metadata startup-script
     subnet_path = "projects/dst-host/regions/asia-northeast1/subnetworks/subnet-svc1"
     assert stages[3].steps[0].create_cmd == f"gcloud compute instances create org-svc1-deb-e2-std4-01 --disk=name=org-svc1-deb-e2-std4-01-disk,boot=yes,auto-delete=yes --subnet={subnet_path} --private-network-ip=10.100.1.11 --zone=asia-northeast1-a --project=dst-svc1 --no-address --quiet"
+
+def test_build_api_enablement_stage_from_projects():
+    from scripts.sync_env import build_api_enablement_stage_from_projects
+    
+    projects = ["dst-host", "dst-svc1"]
+    stage = build_api_enablement_stage_from_projects(projects)
+    
+    assert stage.name == "API Enablement"
+    assert stage.is_parallel
+    assert len(stage.steps) == 2
+    
+    # Assert Step 1: dst-host
+    assert stage.steps[0].resource_type == "API"
+    assert stage.steps[0].resource_name == "dst-host"
+    assert stage.steps[0].project == "dst-host"
+    assert stage.steps[0].check_cmd == "gcloud services list --enabled --project=dst-host --format='value(config.name)' | grep -w compute.googleapis.com"
+    assert stage.steps[0].create_cmd == "gcloud services enable compute.googleapis.com dns.googleapis.com --project=dst-host --quiet"
+    
+    # Assert Step 2: dst-svc1
+    assert stage.steps[1].resource_type == "API"
+    assert stage.steps[1].resource_name == "dst-svc1"
+    assert stage.steps[1].project == "dst-svc1"
+    assert stage.steps[1].check_cmd == "gcloud services list --enabled --project=dst-svc1 --format='value(config.name)' | grep -w compute.googleapis.com"
+    assert stage.steps[1].create_cmd == "gcloud services enable compute.googleapis.com dns.googleapis.com --project=dst-svc1 --quiet"
+

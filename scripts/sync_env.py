@@ -302,7 +302,6 @@ class GCPClonerGenerator:
         # Stage 2: Subnets (Parallelized)
         subnet_steps = []
         for subnet in self.config.subnets:
-            # Only create subnet if it's tool-defined (avoiding tokyo/tokyo-2 pre-existing subnets detected in scan)
             if not subnet.name.startswith("subnet-"):
                 continue
             subnet_steps.append(DeployStep(
@@ -314,16 +313,13 @@ class GCPClonerGenerator:
             ))
         stages.append(Stage(name="Subnet Creation", steps=subnet_steps, is_parallel=True))
 
-        # Stage 3: Clone Disk from Original Snapshot (Parallelized) - NEW STAGE
+        # Stage 3: Clone Disk from Original Snapshot (Parallelized)
         disk_steps = []
         for proj_id, vms in self.config.vms.items():
-            # Find original source project ID corresponding to this destination project ID
             src_proj = self.reverse_project_map.get(proj_id, proj_id)
-            
             for vm in vms:
                 disk_name = f"{vm.name}-disk"
                 snapshot_path = f"projects/{src_proj}/global/snapshots/{vm.name}"
-                
                 disk_steps.append(DeployStep(
                     resource_type="Disk",
                     resource_name=disk_name,
@@ -333,18 +329,16 @@ class GCPClonerGenerator:
                 ))
         stages.append(Stage(name="Disk Cloning from Snapshot", steps=disk_steps, is_parallel=True))
 
-        # Stage 4: Clone VMs launching from Cloned Boot Disks (Parallelized) - NEW STAGE
+        # Stage 4: Clone VMs launching from Cloned Boot Disks (Parallelized)
         vm_steps = []
         for proj_id, vms in self.config.vms.items():
             for vm in vms:
                 subnet_path = f"projects/{self.config.host_project}/regions/{self.region}/subnetworks/{vm.subnet}"
                 disk_name = f"{vm.name}-disk"
-                
                 vm_steps.append(DeployStep(
                     resource_type="VM Instance",
                     resource_name=vm.name,
                     check_cmd=f"gcloud compute instances describe {vm.name} --zone={vm.zone} --project={proj_id} --format='value(name)'",
-                    # Boot disk is attached as restored clone disk, auto-delete is enabled
                     create_cmd=f"gcloud compute instances create {vm.name} --disk=name={disk_name},boot=yes,auto-delete=yes --subnet={subnet_path} --private-network-ip={vm.ip_address} --zone={vm.zone} --project={proj_id} --no-address --quiet",
                     project=proj_id
                 ))
@@ -375,7 +369,7 @@ class GCPClonerGenerator:
                 f"gcloud compute networks subnets describe {resource_name} --region={z_r} --project={project} --format='value(name)'",
                 f"gcloud compute networks subnets delete {resource_name} --region={z_r} --project={project} --quiet"
             )
-        elif resource_type == "Disk": # Restored Boot Disks
+        elif resource_type == "Disk":
             return (
                 f"gcloud compute disks describe {resource_name} --zone={z_r} --project={project} --format='value(name)'",
                 f"gcloud compute disks delete {resource_name} --zone={z_r} --project={project} --quiet"
@@ -404,6 +398,19 @@ class GCPClonerGenerator:
         return ("", "")
 
 
+def build_api_enablement_stage_from_projects(projects: List[str]) -> Stage:
+    steps = []
+    for project in projects:
+        steps.append(DeployStep(
+            resource_type="API",
+            resource_name=project,
+            check_cmd=f"gcloud services list --enabled --project={project} --format='value(config.name)' | grep -w compute.googleapis.com",
+            create_cmd=f"gcloud services enable compute.googleapis.com dns.googleapis.com --project={project} --quiet",
+            project=project
+        ))
+    return Stage(name="API Enablement", steps=steps, is_parallel=True)
+
+
 def execute_single_step_thread(step: DeployStep, prefix: str, state_mgr: StateManager, cloner: GCPClonerGenerator) -> Tuple[bool, str]:
     log_stream = io.StringIO()
     t_logger = logging.getLogger(f"thread_{step.resource_name}")
@@ -421,31 +428,45 @@ def execute_single_step_thread(step: DeployStep, prefix: str, state_mgr: StateMa
     
     success = True
     if exists:
-        t_logger.info(f"{prefix} -> [SKIP] Already exists in destination.")
-        zone_or_region = ""
-        if step.resource_type in ["VM Instance", "Disk"]:
-            match = re.search(r'--zone=([^\s]+)', step.check_cmd)
-            if match: zone_or_region = match.group(1)
-        check_c, delete_c = cloner.get_delete_cmd_for_resource(step.resource_type, step.resource_name, step.project, zone_or_region)
-        if delete_c:
-            state_mgr.add_resource(step.resource_type, step.resource_name, step.project, check_c, delete_c)
+        already_verb = "already enabled" if step.resource_type == "API" else "Already exists in destination"
+        t_logger.info(f"{prefix} -> [SKIP] {already_verb}.")
+        
+        # Track successfully synced resource (excluding APIs)
+        if step.resource_type != "API":
+            zone_or_region = ""
+            if step.resource_type in ["VM Instance", "Disk"]:
+                match = re.search(r'--zone=([^\s]+)', step.check_cmd)
+                if match: zone_or_region = match.group(1)
+            check_c, delete_c = cloner.get_delete_cmd_for_resource(step.resource_type, step.resource_name, step.project, zone_or_region)
+            if delete_c:
+                state_mgr.add_resource(step.resource_type, step.resource_name, step.project, check_c, delete_c)
         return True, log_stream.getvalue()
         
-    t_logger.info(f"{prefix} -> [CLONE] Replicating resource...")
+    action_verb = "Enabling required APIs" if step.resource_type == "API" else "Replicating resource"
+    t_logger.info(f"{prefix} -> [RUN] Not found. {action_verb}...")
     t_logger.info(f"  Executing: {step.create_cmd}")
     
     try:
         result = subprocess.run(step.create_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        t_logger.info(f"{prefix} -> [SUCCESS] Replicated successfully.")
         
-        # Track successfully synced resource
-        zone_or_region = ""
-        if step.resource_type in ["VM Instance", "Disk"]:
-            match = re.search(r'--zone=([^\s]+)', step.create_cmd)
-            if match: zone_or_region = match.group(1)
-        check_c, delete_c = cloner.get_delete_cmd_for_resource(step.resource_type, step.resource_name, step.project, zone_or_region)
-        if delete_c:
-            state_mgr.add_resource(step.resource_type, step.resource_name, step.project, check_c, delete_c)
+        if step.resource_type == "API":
+            success_verb = "Enabled"
+        elif step.resource_type == "VM Instance" or step.resource_type == "Disk":
+            success_verb = "Replicated"
+        else:
+            success_verb = "Created"
+            
+        t_logger.info(f"{prefix} -> [SUCCESS] {success_verb} successfully.")
+        
+        # Track successfully synced resource (excluding APIs)
+        if step.resource_type != "API":
+            zone_or_region = ""
+            if step.resource_type in ["VM Instance", "Disk"]:
+                match = re.search(r'--zone=([^\s]+)', step.create_cmd)
+                if match: zone_or_region = match.group(1)
+            check_c, delete_c = cloner.get_delete_cmd_for_resource(step.resource_type, step.resource_name, step.project, zone_or_region)
+            if delete_c:
+                state_mgr.add_resource(step.resource_type, step.resource_name, step.project, check_c, delete_c)
 
         if result.stdout:
             t_logger.debug(f"Output:\n{result.stdout}")
@@ -459,9 +480,11 @@ def execute_single_step_thread(step: DeployStep, prefix: str, state_mgr: StateMa
     return success, log_stream.getvalue()
 
 
-def execute_sync_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state_mgr: StateManager, cloner: GCPClonerGenerator):
+def execute_sync_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state_mgr: StateManager, cloner: GCPClonerGenerator, is_prepare: bool = False):
+    action_label = "API Enablement" if is_prepare else "Environment Replication"
+    
     if dry_run:
-        logging.info("=== [DRY RUN] Planned Environment Replication Stages ===")
+        logging.info(f"=== [DRY RUN] Planned {action_label} Stages ===")
         for s_idx, stage in enumerate(stages, 1):
             mode = "PARALLEL" if stage.is_parallel else "SEQUENTIAL"
             logging.info(f"\n--- Stage {s_idx:02d}: {stage.name} ({mode}) ---")
@@ -472,7 +495,7 @@ def execute_sync_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, 
         logging.info("=======================================================")
         return
 
-    logging.info("=== Prepared Replication Stages ===")
+    logging.info(f"=== Prepared {action_label} Stages ===")
     for s_idx, stage in enumerate(stages, 1):
         mode = "PARALLEL" if stage.is_parallel else "SEQUENTIAL"
         logging.info(f"Stage {s_idx:02d}: {stage.name} ({len(stage.steps)} steps, {mode})")
@@ -480,7 +503,8 @@ def execute_sync_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, 
 
     if not auto_approve:
         try:
-            response = input("\nDo you want to proceed with the environment replication? [y/N]: ").strip().lower()
+            prompt_str = f"Do you want to proceed with the {action_label.lower()}? [y/N]: "
+            response = input(prompt_str).strip().lower()
         except KeyboardInterrupt:
             logging.warning("Cancelled by user.")
             sys.exit(1)
@@ -490,7 +514,7 @@ def execute_sync_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, 
     else:
         logging.info("Auto-approve enabled. Skipping confirmation.")
 
-    logging.info("Starting replication/sync to destination...")
+    logging.info(f"Starting {action_label.lower()} to destination...")
 
     for s_idx, stage in enumerate(stages, 1):
         mode = "PARALLEL" if stage.is_parallel else "SEQUENTIAL"
@@ -501,7 +525,7 @@ def execute_sync_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, 
             continue
             
         if stage.is_parallel:
-            logging.info(f"Spawning {len(stage.steps)} threads for parallel replication...")
+            logging.info(f"Spawning {len(stage.steps)} threads for parallel execution...")
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 futures = {}
                 for i, step in enumerate(stage.steps, 1):
@@ -517,7 +541,7 @@ def execute_sync_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, 
                         stage_failed = True
                         
                 if stage_failed:
-                    logging.error(f"Replication Stage '{stage.name}' failed. Stopping. Remaining stages preserved.")
+                    logging.error(f"Stage '{stage.name}' failed. Stopping. Remaining stages preserved.")
                     sys.exit(1)
         else:
             for i, step in enumerate(stage.steps, 1):
@@ -528,7 +552,7 @@ def execute_sync_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, 
                     logging.error("Step failed. Stopping execution. Remaining stages preserved.")
                     sys.exit(1)
                     
-    logging.info("\nEnvironment replication/sync completed successfully.")
+    logging.info(f"\n{action_label} completed successfully.")
 
 
 def setup_logging():
@@ -566,6 +590,7 @@ def main():
     parser = argparse.ArgumentParser(description="Sync/Replicate GCP environment from scan file (DST.md) using snapshots")
     parser.add_argument("--config", required=True, help="Path to scanned DST.md configuration file")
     parser.add_argument("--project-map", required=True, help="Comma-separated project ID mappings: src_proj=dst_proj,...")
+    parser.add_argument("--prepare", action="store_true", help="Only enable required APIs (Compute Engine, DNS) in mapped projects")
     parser.add_argument("--dry-run", action="store_true", help="Show commands without executing")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
     args = parser.parse_args()
@@ -579,12 +604,21 @@ def main():
     org_parser = OrgParser(args.config)
     config = org_parser.parse()
 
-    # Create cloner generator, map project IDs, and build sync stages
+    # Initialize cloner, map project IDs to destination mapping
     cloner = GCPClonerGenerator(config, project_map)
     cloner.apply_project_mapping()
     
-    stages = cloner.generate_sync_stages()
-    execute_sync_stages(stages, args.dry_run, args.yes, state_mgr=state_mgr, cloner=cloner)
+    if args.prepare:
+        logging.info("Preparing copy target: Enabling required GCP service APIs...")
+        # Extract unique destination projects list (Host + Service projects mapped)
+        dst_projects = list(set([cloner.config.host_project] + cloner.config.service_projects))
+        
+        # Generate api enablement stage
+        api_stage = build_api_enablement_stage_from_projects(dst_projects)
+        execute_sync_stages([api_stage], args.dry_run, args.yes, state_mgr=state_mgr, cloner=cloner, is_prepare=True)
+    else:
+        stages = cloner.generate_sync_stages()
+        execute_sync_stages(stages, args.dry_run, args.yes, state_mgr=state_mgr, cloner=cloner, is_prepare=False)
 
 if __name__ == "__main__":
     main()
