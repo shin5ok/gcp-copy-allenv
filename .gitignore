@@ -1,6 +1,8 @@
 .venv/
 build.log
+sync.log
 state.json
+state-sync.json
 __pycache__/
 .pytest_cache/
 *.pyc

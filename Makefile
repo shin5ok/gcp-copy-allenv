@@ -1,4 +1,4 @@
-.PHONY: plan deploy destroy test setup snapshot-all
+.PHONY: plan deploy destroy test setup snapshot-all scan-org sync-to-dst
 
 setup:
 	uv sync
@@ -14,6 +14,12 @@ destroy:
 
 snapshot-all: setup
 	uv run scripts/build_env.py --config org/ORG.md --snapshot $(ARGS)
+
+scan-org: setup
+	uv run scripts/scan_env.py --project shingo-ar-sharedhost0926 --network shared-vpc --output dst/DST.md $(ARGS)
+
+sync-to-dst: setup
+	uv run scripts/sync_env.py --config dst/DST.md $(ARGS)
 
 test:
 	PYTHONPATH=. uv run pytest
