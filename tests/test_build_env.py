@@ -253,3 +253,45 @@ def test_command_generator_destroy_stages_from_state():
     assert stages[6].steps[0].resource_type == "VPC Network"
     assert stages[6].steps[0].check_cmd == "gcloud compute networks describe test-vpc --project=test-host-proj --format='value(name)'"
     assert stages[6].steps[0].create_cmd == "gcloud compute networks delete test-vpc --project=test-host-proj --quiet"
+
+def test_build_snapshot_stage_from_state():
+    from scripts.build_env import build_snapshot_stage_from_state
+    
+    # Dummy state representing mixed resources
+    dummy_state = [
+        {
+            "resource_type": "VPC Network",
+            "resource_name": "test-vpc",
+            "project": "test-host-proj",
+            "check_cmd": "...",
+            "delete_cmd": "..."
+        },
+        {
+            "resource_type": "VM Instance",
+            "resource_name": "vm-deb-01",
+            "project": "test-svc-proj-1",
+            "check_cmd": "gcloud compute instances describe vm-deb-01 --zone=asia-northeast1-a --project=test-svc-proj-1 --format='value(name)'",
+            "delete_cmd": "..."
+        },
+        {
+            "resource_type": "Static Private IP Address",
+            "resource_name": "vm-deb-01-ip",
+            "project": "test-svc-proj-1",
+            "check_cmd": "...",
+            "delete_cmd": "..."
+        }
+    ]
+    
+    stage = build_snapshot_stage_from_state(dummy_state)
+    
+    # Verify that ONLY the VM Instance is selected for snapshotting
+    assert stage.name == "Snapshot Creation"
+    assert stage.is_parallel
+    assert len(stage.steps) == 1
+    
+    assert stage.steps[0].resource_type == "Snapshot"
+    assert stage.steps[0].resource_name == "vm-deb-01"
+    assert stage.steps[0].project == "test-svc-proj-1"
+    assert stage.steps[0].check_cmd == "gcloud compute snapshots describe vm-deb-01 --project=test-svc-proj-1 --format='value(name)'"
+    assert stage.steps[0].create_cmd == "gcloud compute snapshots create vm-deb-01 --source-disk=vm-deb-01 --source-disk-zone=asia-northeast1-a --project=test-svc-proj-1 --quiet"
+

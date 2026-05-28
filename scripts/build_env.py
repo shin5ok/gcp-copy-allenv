@@ -40,7 +40,7 @@ class DeployStep:
     resource_type: str
     resource_name: str
     check_cmd: str
-    create_cmd: str # In case of destroy, this holds the delete command
+    create_cmd: str # In case of destroy/snapshot, this holds the action command
     project: str = "" # Associated project ID for state tracking
 
 @dataclass
@@ -77,7 +77,6 @@ class StateManager:
                 except json.JSONDecodeError:
                     pass
             
-            # Check for duplicates
             resources = state.setdefault("resources", [])
             exists = any(
                 r["resource_type"] == resource_type and r["resource_name"] == resource_name and r["project"] == project
@@ -398,7 +397,6 @@ class GcloudCommandGenerator:
                     resource_type="VM Instance",
                     resource_name=vm.name,
                     check_cmd=f"gcloud compute instances describe {vm.name} --zone={vm.zone} --project={proj_id} --format='value(name)'",
-                    # FIXED: Use --metadata-from-file to avoid shell comma escape parser bugs in gcloud dict flags
                     create_cmd=f"gcloud compute instances create {vm.name} --machine-type={vm.machine_type} --image={vm.image} --subnet={subnet_path} --private-network-ip={vm.ip_address} --zone={vm.zone} --project={proj_id} --no-address --metadata-from-file=startup-script={self.startup_script_path}",
                     project=proj_id
                 ))
@@ -510,6 +508,30 @@ def build_destroy_stages_from_state(state_resources: List[Dict]) -> List[Stage]:
     return stages
 
 
+def build_snapshot_stage_from_state(state_resources: List[Dict]) -> Stage:
+    steps = []
+    for r in state_resources:
+        if r["resource_type"] == "VM Instance":
+            vm_name = r["resource_name"]
+            project = r["project"]
+            
+            # Extract zone from check_cmd (default to asia-northeast1-a)
+            zone = "asia-northeast1-a"
+            match = re.search(r'--zone=([^\s]+)', r["check_cmd"])
+            if match:
+                zone = match.group(1)
+                
+            steps.append(DeployStep(
+                resource_type="Snapshot",
+                resource_name=vm_name,
+                check_cmd=f"gcloud compute snapshots describe {vm_name} --project={project} --format='value(name)'",
+                create_cmd=f"gcloud compute snapshots create {vm_name} --source-disk={vm_name} --source-disk-zone={zone} --project={project} --quiet",
+                project=project
+            ))
+            
+    return Stage(name="Snapshot Creation", steps=steps, is_parallel=True)
+
+
 def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -550,27 +572,41 @@ def execute_single_step_thread(step: DeployStep, prefix: str, is_destroy: bool, 
         t_logger.info(f"{prefix} -> [DELETE] Found. Deleting...")
     else:
         if exists:
-            t_logger.info(f"{prefix} -> [SKIP] Already exists.")
-            zone_or_region = ""
-            if step.resource_type == "VM Instance":
-                match = re.search(r'--zone=([^\s]+)', step.check_cmd)
-                if match: zone_or_region = match.group(1)
-            check_c, delete_c = generator.get_delete_cmd_for_resource(step.resource_type, step.resource_name, step.project, zone_or_region)
-            if delete_c:
-                state_mgr.add_resource(step.resource_type, step.resource_name, step.project, check_c, delete_c)
+            # Distinct label for already created snapshots
+            already_verb = "already taken" if step.resource_type == "Snapshot" else "Already exists"
+            t_logger.info(f"{prefix} -> [SKIP] {already_verb}.")
+            
+            # Track created resources (excluding snapshots) in state.json
+            if step.resource_type != "Snapshot":
+                zone_or_region = ""
+                if step.resource_type == "VM Instance":
+                    match = re.search(r'--zone=([^\s]+)', step.check_cmd)
+                    if match: zone_or_region = match.group(1)
+                check_c, delete_c = generator.get_delete_cmd_for_resource(step.resource_type, step.resource_name, step.project, zone_or_region)
+                if delete_c:
+                    state_mgr.add_resource(step.resource_type, step.resource_name, step.project, check_c, delete_c)
             return True, log_stream.getvalue()
-        t_logger.info(f"{prefix} -> [CREATE] Not found. Creating...")
+        
+        action_verb = "Taking snapshot" if step.resource_type == "Snapshot" else "Creating"
+        t_logger.info(f"{prefix} -> [RUN] Not found. {action_verb}...")
         
     t_logger.info(f"  Executing: {step.create_cmd}")
     
     try:
         result = subprocess.run(step.create_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        success_verb = "Deleted" if is_destroy else "Created"
+        
+        if is_destroy:
+            success_verb = "Deleted"
+        elif step.resource_type == "Snapshot":
+            success_verb = "Snapshotted"
+        else:
+            success_verb = "Created"
+            
         t_logger.info(f"{prefix} -> [SUCCESS] {success_verb} successfully.")
         
         if is_destroy:
             state_mgr.remove_resource(step.resource_type, step.resource_name, step.project)
-        else:
+        elif step.resource_type != "Snapshot": # Exclude backup snapshots from cleanup state tracking
             zone_or_region = ""
             if step.resource_type == "VM Instance":
                 match = re.search(r'--zone=([^\s]+)', step.create_cmd)
@@ -593,8 +629,8 @@ def execute_single_step_thread(step: DeployStep, prefix: str, is_destroy: bool, 
     return success, log_stream.getvalue()
 
 
-def execute_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state_mgr: StateManager, generator: GcloudCommandGenerator, is_destroy: bool = False):
-    action_label = "Destroy" if is_destroy else "Deployment"
+def execute_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state_mgr: StateManager, generator: GcloudCommandGenerator, is_destroy: bool = False, is_snapshot: bool = False):
+    action_label = "Destroy" if is_destroy else ("Snapshot" if is_snapshot else "Deployment")
     
     if dry_run:
         logging.info(f"=== [DRY RUN] Planned {action_label} Stages ===")
@@ -634,6 +670,15 @@ def execute_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state
             except KeyboardInterrupt:
                 logging.warning("Cancelled by user.")
                 sys.exit(1)
+        elif is_snapshot:
+            try:
+                response = input(f"\nDo you want to take snapshots of all {len(stages[0].steps)} VMs? [y/N]: ").strip().lower()
+            except KeyboardInterrupt:
+                logging.warning("Cancelled by user.")
+                sys.exit(1)
+            if response != 'y':
+                logging.info("Cancelled.")
+                return
         else:
             try:
                 response = input("\nDo you want to proceed with the deployment? [y/N]: ").strip().lower()
@@ -690,20 +735,20 @@ def execute_stages(stages: List[Stage], dry_run: bool, auto_approve: bool, state
     logging.info(f"\n{action_label} completed successfully (or no changes needed).")
 
 def main():
-    parser = argparse.ArgumentParser(description="Build or Destroy GCP environment from ORG.md with State Management")
+    parser = argparse.ArgumentParser(description="Build, Destroy, or Backup GCP environment from ORG.md")
     parser.add_argument("--config", required=True, help="Path to ORG.md")
     parser.add_argument("--dry-run", action="store_true", help="Show commands without executing")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt (auto-approve)")
-    parser.add_argument("--destroy", action="store_true", help="Destroy all resources tracked in state.json instead of creating them")
+    parser.add_argument("--destroy", action="store_true", help="Destroy all resources tracked in state.json")
+    parser.add_argument("--snapshot", action="store_true", help="Create disk snapshots of all VMs tracked in state.json")
     args = parser.parse_args()
 
     setup_logging()
 
     state_mgr = StateManager()
 
-    # Temporary file setup for startup script to bypass shell comma escaping parsing bugs in gcloud
     startup_script_path = "nginx_startup.sh"
-    if not args.dry_run and not args.destroy:
+    if not args.dry_run and not args.destroy and not args.snapshot:
         logging.info(f"Writing temporary startup script file: {startup_script_path}")
         with open(startup_script_path, "w", encoding="utf-8") as f:
             f.write(STARTUP_SCRIPT)
@@ -723,6 +768,22 @@ def main():
             
             stages = build_destroy_stages_from_state(state_resources)
             execute_stages(stages, args.dry_run, args.yes, state_mgr=state_mgr, generator=generator, is_destroy=True)
+            
+        elif args.snapshot:
+            logging.info("Loading deployed VMs from state.json for snapshotting...")
+            state_resources = state_mgr.load_state()
+            has_vms = any(r["resource_type"] == "VM Instance" for r in state_resources)
+            if not has_vms:
+                logging.info("No deployed VMs found in state.json. Cannot take snapshots.")
+                sys.exit(0)
+                
+            org_parser = OrgParser(args.config)
+            config = org_parser.parse()
+            generator = GcloudCommandGenerator(config, startup_script_path=startup_script_path)
+            
+            snapshot_stage = build_snapshot_stage_from_state(state_resources)
+            execute_stages([snapshot_stage], args.dry_run, args.yes, state_mgr=state_mgr, generator=generator, is_destroy=False, is_snapshot=True)
+            
         else:
             logging.info(f"Parsing config: {args.config}")
             org_parser = OrgParser(args.config)
@@ -732,7 +793,6 @@ def main():
             stages = generator.generate_stages()
             execute_stages(stages, args.dry_run, args.yes, state_mgr=state_mgr, generator=generator, is_destroy=False)
     finally:
-        # Cleanup temporary startup script file safely
         if os.path.exists(startup_script_path):
             try:
                 logging.info(f"Cleaning up temporary startup script file: {startup_script_path}")
