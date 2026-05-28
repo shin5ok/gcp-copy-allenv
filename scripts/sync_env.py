@@ -351,7 +351,7 @@ class GCPClonerGenerator:
                     resource_type="VM Instance",
                     resource_name=vm.name,
                     check_cmd=f"gcloud compute instances describe {vm.name} --zone={vm.zone} --project={proj_id} --format='value(name)'",
-                    create_cmd=f"gcloud compute instances create {vm.name} --disk=name={disk_name},boot=yes,auto-delete=yes --subnet={subnet_path} --private-network-ip={vm.ip_address} --zone={vm.zone} --project={proj_id} --no-address --quiet",
+                    create_cmd=f"gcloud compute instances create {vm.name} --disk=name={disk_name},boot=yes,auto-delete=yes --subnet={subnet_path} --private-network-ip={vm.ip_address} --zone={vm.zone} --project={proj_id} --no-address --quiet --machine-type={vm.machine_type}",
                     project=proj_id
                 ))
         stages.append(Stage(name="VM Cloned Provisioning", steps=vm_steps, is_parallel=True))
