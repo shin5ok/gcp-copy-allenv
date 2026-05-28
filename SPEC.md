@@ -17,7 +17,8 @@
   - 共有VPCネットワーク (`shared-vpc`) を管理。
   - 各サービスプロジェクト用にサブネットを作成し、権限を付与する。
   - プライベートVMがインターネット通信（外部アップデート等）を行えるよう、Cloud Router および Cloud NAT ゲートウェイを配置・管理する。
-  - 踏み台サーバー等を使わず、安全に gcloud compute ssh (IAP トンネリング) 経由でプライベートVMにアクセスできるよう、IAP専用 of ファイアウォール許可ルール (tcp:22) を配置・管理する。
+  - 踏み台サーバー等を使わず、安全に gcloud compute ssh (IAP トンネリング) 経由でプライベートVMにアクセスできるよう、IAP専用のファイアウォール許可ルール (tcp:22) を配置・管理する。
+  - **同一VPC内のVM同士が自由に通信（ping, curl, udp等）できるよう、VPC内通信許可ファイアウォールルール (allow-shared-internal) を配置・管理する。**
 - **Service Projects (サービスプロジェクト)**: VMインスタンスなどのコンピューティングリソースを配置するプロジェクト。
   - ホストプロジェクトから共有されたサブネットを利用してVMを配置する。
   - VMには外部IPアドレスを付与せず、安全に Cloud NAT 経由でのみインターネットに発信通信を行えるようにする。
@@ -32,7 +33,7 @@
 
 ## 自動構築・同期複製ツール仕様
 
-本ツールは、環境の構築（Deploy）、削除（Destroy）、バックアップ（Snapshot）に加え、オリジナル環境の動的スキャン（Scan）、**コピー先のAPI自動有効化（Prepare）**、およびスナップショットからのクローン復元（Sync）をサポートする。
+本ツールは、環境の構築（Deploy）、削除（Destroy）、バックアップ（Snapshot）に加え、オリジナル環境の動的スキャン（Scan）、コピー先のAPI自動有効化（Prepare）、およびスナップショットからのクローン復元（Sync）をサポートする。
 
 ### 1. インターフェース (Makefile)
 ユーザーは `make` コマンドを介してツールを実行する。
@@ -42,11 +43,9 @@
 - **`make destroy`**: `state.json` に基づくデプロイ済みリソースの安全な逆順クリーンアップ。
 - **`make snapshot-all`**: 稼働中VMのディスクスナップショットの一括並列作成。
 - **`make scan-org`**: 実機環境をスキャンして `dst/DST.md` を自動生成する。
-- **`make prepare-dst`**:
-  - **コピー先となる新しいプロジェクト群（Host, Service 1, 3）に対し、デプロイに必要なすべてのGCP APIを並列一括で自動有効化（Enable）する。**
-  - 実行前に確認プロンプトを表示する。
+- **`make prepare-dst`**: コピー先プロジェクトに必要なサービスAPI（Compute Engine, Cloud DNS）を一撃で並列自動有効化する。
 - **`make sync-to-dst`**:
-  - コピー先プロジェクト群に対し、インフラ（VPC、サブネット等）を自動構築する。
+  - コピー先プロジェクト群に対し、インフラ（VPC、サブネット、NAT、ルーター、**IAP SSH許可FW、内部通信許可FW**）を自動構築する。
   - オリジナル環境で取得したスナップショットをソースとしてディスクを復元し、データが完全に維持されたクローンVMインスタンス群をコピー先に並列プロビジョニングする。
 
 ### 2. 実装要件
@@ -57,17 +56,15 @@
 #### 2.2. 主要ロジック (Pythonスクリプト: scripts/sync_env.py 等)
 
 1. **API事前準備機能 (Prepare - 並列)**:
-   - コピー先ホストおよびサービスプロジェクトにおいて、構築に必要な以下のAPIを有効化する。
-     - `compute.googleapis.com` (Compute Engine API)
-     - `dns.googleapis.com` (Cloud DNS API)
-   - コマンド: `gcloud services enable compute.googleapis.com dns.googleapis.com --project=[コピー先プロジェクト] --quiet`
-   - 存在（有効化済み）チェック (べき等性): `gcloud services list --enabled --project=[プロジェクト] --format='value(config.name)' | grep -w compute.googleapis.com`
-   - ホスト、サービス1、3のすべてのコピー先プロジェクトに対して、**スレッドプールを用いて完全に並列非同期に一括有効化**する。
-2. **スキャンロジック (Scan & Discovery)**:
+   - コピー先で必要なサービスAPI（Compute, DNS）を自動有効化。
+2. **インフラ自動構築 (VPC Network & Host Setup)**:
+   - VPC作成 ➔ Host有効化 ➔ サービスプロジェクト関連付け ➔ Cloud Router ➔ Cloud NAT ➔ **IAP SSH FW (`allow-shared-iap-ssh`)** ➔ **VPC内通信許可FW (`allow-shared-internal`)** の順で自動構築。
+   - `allow-shared-internal` 設定: INGRESS, ALLOW, ソースIP: `10.100.0.0/16`, プロトコル: `tcp,udp,icmp`
+3. **スキャンロジック (Scan & Discovery)**:
    - ネットワーク、サブネット、関連プロジェクト、および全VMインスタンスの実機構成情報を動的に発見する。
-3. **クローン復元ロジック (Clone & Restore)**:
+4. **クローン復元ロジック (Clone & Restore)**:
    - オリジナルのスナップショットからコピー先にディスクを復元し、そのディスクを用いてVMインスタンスを新規プロビジョニングする。
 
 ### 3. 安全対策と堅牢性 (べき等性の確保とログ記録)
-- **べき等性の維持**: API有効化、ディスク作成やVM作成時も、すでに完了していないか事前チェックを徹底する。
+- **べき等性の維持**: ファイアウォールルール、API有効化、ディスク作成やVM作成時も、すでに完了していないか事前チェックを徹底する。
 - **並列処理とロググループ化**: すべての非同期スレッドのログはグループ化して見やすく整理する。

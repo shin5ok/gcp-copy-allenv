@@ -230,20 +230,24 @@ class GCPClonerGenerator:
         orig_host = self.config.host_project
         self.config.host_project = self.project_map.get(orig_host, orig_host)
         
-        # 2. Map Service Projects
+        # 2. Map Service Projects (Filter out projects not present in mapping)
         self.config.service_projects = [
-            self.project_map.get(p, p) for p in self.config.service_projects
+            self.project_map[p] for p in self.config.service_projects if p in self.project_map
         ]
         
-        # 3. Map Subnet projects
+        # 3. Map Subnet projects (Filter out subnets belonging to unmapped projects)
+        self.config.subnets = [
+            sub for sub in self.config.subnets if sub.project in self.project_map or sub.project == orig_host
+        ]
         for sub in self.config.subnets:
             sub.project = self.project_map.get(sub.project, sub.project)
             
-        # 4. Map VMs map keys
+        # 4. Map VMs map keys (Filter out VMs belonging to unmapped projects)
         new_vms = {}
         for orig_proj, vms in self.config.vms.items():
-            mapped_proj = self.project_map.get(orig_proj, orig_proj)
-            new_vms[mapped_proj] = vms
+            if orig_proj in self.project_map:
+                mapped_proj = self.project_map[orig_proj]
+                new_vms[mapped_proj] = vms
         self.config.vms = new_vms
 
     def generate_sync_stages(self) -> List[Stage]:
@@ -295,6 +299,14 @@ class GCPClonerGenerator:
             resource_name="allow-shared-iap-ssh",
             check_cmd=f"gcloud compute firewall-rules describe allow-shared-iap-ssh --project={self.config.host_project} --format='value(name)'",
             create_cmd=f"gcloud compute firewall-rules create allow-shared-iap-ssh --network={self.network_name} --allow=tcp:22 --source-ranges=35.235.240.0/20 --direction=INGRESS --project={self.config.host_project}",
+            project=self.config.host_project
+        ))
+        # VPC Internal Communication Firewall Rule Creation
+        host_setup_steps.append(DeployStep(
+            resource_type="Firewall Rule",
+            resource_name="allow-shared-internal",
+            check_cmd=f"gcloud compute firewall-rules describe allow-shared-internal --project={self.config.host_project} --format='value(name)'",
+            create_cmd=f"gcloud compute firewall-rules create allow-shared-internal --network={self.network_name} --allow=tcp,udp,icmp --source-ranges=10.100.0.0/16 --direction=INGRESS --project={self.config.host_project}",
             project=self.config.host_project
         ))
         stages.append(Stage(name="VPC & Host Setup", steps=host_setup_steps, is_parallel=False))

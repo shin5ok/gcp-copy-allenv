@@ -78,7 +78,7 @@ def test_command_generator_stages(temp_org_file):
     # Stage 1: VPC & Host Setup (Sequential)
     assert stages[0].name == "VPC & Host Setup"
     assert not stages[0].is_parallel
-    assert len(stages[0].steps) == 6 # VPC, Shared VPC, Associated Project, Router, NAT, Firewall
+    assert len(stages[0].steps) == 7 # VPC, Shared VPC, Associated Project, Router, NAT, IAP FW, Internal FW
     
     # VPC Network
     assert stages[0].steps[0].resource_type == "VPC Network"
@@ -105,10 +105,15 @@ def test_command_generator_stages(temp_org_file):
     assert stages[0].steps[4].check_cmd == "gcloud compute routers describe shared-router --region=asia-northeast1 --project=test-host-proj --format='value(nats.name)' | grep -w shared-nat"
     assert stages[0].steps[4].create_cmd == "gcloud compute routers nats create shared-nat --router=shared-router --region=asia-northeast1 --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges --project=test-host-proj"
 
-    # Firewall Rule
+    # Firewall Rule (IAP SSH)
     assert stages[0].steps[5].resource_type == "Firewall Rule"
     assert stages[0].steps[5].check_cmd == "gcloud compute firewall-rules describe allow-shared-iap-ssh --project=test-host-proj --format='value(name)'"
     assert stages[0].steps[5].create_cmd == "gcloud compute firewall-rules create allow-shared-iap-ssh --network=test-vpc --allow=tcp:22 --source-ranges=35.235.240.0/20 --direction=INGRESS --project=test-host-proj"
+
+    # Firewall Rule (Internal communication)
+    assert stages[0].steps[6].resource_type == "Firewall Rule"
+    assert stages[0].steps[6].check_cmd == "gcloud compute firewall-rules describe allow-shared-internal --project=test-host-proj --format='value(name)'"
+    assert stages[0].steps[6].create_cmd == "gcloud compute firewall-rules create allow-shared-internal --network=test-vpc --allow=tcp,udp,icmp --source-ranges=10.100.0.0/16 --direction=INGRESS --project=test-host-proj"
 
     # Stage 2: Subnets (Parallel)
     assert stages[1].name == "Subnet Creation"

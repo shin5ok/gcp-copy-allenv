@@ -71,7 +71,7 @@ def test_sync_generator_stages():
     # Stage 1: VPC & Host Setup (Sequential)
     assert stages[0].name == "VPC & Host Setup"
     assert not stages[0].is_parallel
-    assert len(stages[0].steps) == 6
+    assert len(stages[0].steps) == 7
     # Assert destination host project substitution in VPC network step
     assert stages[0].steps[0].resource_type == "VPC Network"
     assert stages[0].steps[0].check_cmd == "gcloud compute networks describe dst-vpc --project=dst-host --format='value(name)'"
