@@ -87,7 +87,7 @@ def test_command_generator_stages(temp_org_file):
     
     # Shared VPC Host Enable
     assert stages[0].steps[1].resource_type == "Shared VPC Host"
-    assert stages[0].steps[1].check_cmd == "gcloud compute shared-vpc get-host-project --project=test-host-proj --format='value(name)'"
+    assert stages[0].steps[1].check_cmd == "gcloud compute shared-vpc associated-projects list --project=test-host-proj"
     assert stages[0].steps[1].create_cmd == "gcloud compute shared-vpc enable test-host-proj"
     
     # Associated Project

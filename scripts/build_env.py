@@ -324,7 +324,7 @@ class GcloudCommandGenerator:
         host_setup_steps.append(DeployStep(
             resource_type="Shared VPC Host",
             resource_name=self.config.host_project,
-            check_cmd=f"gcloud compute shared-vpc get-host-project --project={self.config.host_project} --format='value(name)'",
+            check_cmd=f"gcloud compute shared-vpc associated-projects list --project={self.config.host_project}",
             create_cmd=f"gcloud compute shared-vpc enable {self.config.host_project}",
             project=self.config.host_project
         ))
