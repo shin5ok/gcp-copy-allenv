@@ -109,7 +109,7 @@ def test_sync_generator_stages():
     assert stages[3].steps[0].check_cmd == "gcloud compute instances describe org-svc1-deb-e2-std4-01 --zone=asia-northeast1-a --project=dst-svc1 --format='value(name)'"
     # Launches from restored boot disk 'org-svc1-deb-e2-std4-01-disk', auto-delete=yes, no metadata startup-script
     subnet_path = "projects/dst-host/regions/asia-northeast1/subnetworks/subnet-svc1"
-    assert stages[3].steps[0].create_cmd == f"gcloud compute instances create org-svc1-deb-e2-std4-01 --disk=name=org-svc1-deb-e2-std4-01-disk,boot=yes,auto-delete=yes --subnet={subnet_path} --private-network-ip=10.100.1.11 --zone=asia-northeast1-a --project=dst-svc1 --no-address --quiet"
+    assert stages[3].steps[0].create_cmd == f"gcloud compute instances create org-svc1-deb-e2-std4-01 --disk=name=org-svc1-deb-e2-std4-01-disk,boot=yes,auto-delete=yes --subnet={subnet_path} --private-network-ip=10.100.1.11 --zone=asia-northeast1-a --project=dst-svc1 --no-address --quiet --machine-type=e2-standard-4"
 
 def test_build_api_enablement_stage_from_projects():
     from scripts.sync_env import build_api_enablement_stage_from_projects
