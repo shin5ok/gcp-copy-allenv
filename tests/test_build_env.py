@@ -78,7 +78,7 @@ def test_command_generator_stages(temp_org_file):
     # Stage 1: VPC & Host Setup (Sequential)
     assert stages[0].name == "VPC & Host Setup"
     assert not stages[0].is_parallel
-    assert len(stages[0].steps) == 6 # VPC, Shared VPC, Associated Project, Router, NAT, Firewall
+    assert len(stages[0].steps) == 9 # VPC, Shared VPC, Associated Project, Router, NAT, IAP FW, Incredibuild FW, SSH FW, RDP FW
     
     # VPC Network
     assert stages[0].steps[0].resource_type == "VPC Network"
@@ -87,7 +87,7 @@ def test_command_generator_stages(temp_org_file):
     
     # Shared VPC Host Enable
     assert stages[0].steps[1].resource_type == "Shared VPC Host"
-    assert stages[0].steps[1].check_cmd == "gcloud compute shared-vpc get-host-project --project=test-host-proj --format='value(name)'"
+    assert stages[0].steps[1].check_cmd == "gcloud compute shared-vpc associated-projects list --project=test-host-proj"
     assert stages[0].steps[1].create_cmd == "gcloud compute shared-vpc enable test-host-proj"
     
     # Associated Project
@@ -105,10 +105,25 @@ def test_command_generator_stages(temp_org_file):
     assert stages[0].steps[4].check_cmd == "gcloud compute routers describe shared-router --region=asia-northeast1 --project=test-host-proj --format='value(nats.name)' | grep -w shared-nat"
     assert stages[0].steps[4].create_cmd == "gcloud compute routers nats create shared-nat --router=shared-router --region=asia-northeast1 --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges --project=test-host-proj"
 
-    # Firewall Rule
+    # Firewall Rule (IAP SSH)
     assert stages[0].steps[5].resource_type == "Firewall Rule"
     assert stages[0].steps[5].check_cmd == "gcloud compute firewall-rules describe allow-shared-iap-ssh --project=test-host-proj --format='value(name)'"
     assert stages[0].steps[5].create_cmd == "gcloud compute firewall-rules create allow-shared-iap-ssh --network=test-vpc --allow=tcp:22 --source-ranges=35.235.240.0/20 --direction=INGRESS --project=test-host-proj"
+
+    # Firewall Rule (all-for-incredibuild)
+    assert stages[0].steps[6].resource_type == "Firewall Rule"
+    assert stages[0].steps[6].check_cmd == "gcloud compute firewall-rules describe all-for-incredibuild --project=test-host-proj --format='value(name)'"
+    assert stages[0].steps[6].create_cmd == "gcloud compute firewall-rules create all-for-incredibuild --network=test-vpc --allow=all --source-ranges=10.0.0.0/8 --direction=INGRESS --project=test-host-proj"
+
+    # Firewall Rule (ssh)
+    assert stages[0].steps[7].resource_type == "Firewall Rule"
+    assert stages[0].steps[7].check_cmd == "gcloud compute firewall-rules describe ssh --project=test-host-proj --format='value(name)'"
+    assert stages[0].steps[7].create_cmd == "gcloud compute firewall-rules create ssh --network=test-vpc --allow=tcp:22 --source-ranges=10.0.0.0/8 --direction=INGRESS --project=test-host-proj"
+
+    # Firewall Rule (rdp)
+    assert stages[0].steps[8].resource_type == "Firewall Rule"
+    assert stages[0].steps[8].check_cmd == "gcloud compute firewall-rules describe rdp --project=test-host-proj --format='value(name)'"
+    assert stages[0].steps[8].create_cmd == "gcloud compute firewall-rules create rdp --network=test-vpc --allow=tcp:3389 --source-ranges=0.0.0.0/0 --direction=INGRESS --project=test-host-proj"
 
     # Stage 2: Subnets (Parallel)
     assert stages[1].name == "Subnet Creation"
