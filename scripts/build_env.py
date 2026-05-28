@@ -360,12 +360,28 @@ class GcloudCommandGenerator:
             create_cmd=f"gcloud compute firewall-rules create allow-shared-iap-ssh --network={self.network_name} --allow=tcp:22 --source-ranges=35.235.240.0/20 --direction=INGRESS --project={self.config.host_project}",
             project=self.config.host_project
         ))
-        # VPC Internal Communication Firewall Rule Creation (Host Project)
+        # all-for-incredibuild Firewall Rule Creation (Host Project)
         host_setup_steps.append(DeployStep(
             resource_type="Firewall Rule",
-            resource_name="allow-shared-internal",
-            check_cmd=f"gcloud compute firewall-rules describe allow-shared-internal --project={self.config.host_project} --format='value(name)'",
-            create_cmd=f"gcloud compute firewall-rules create allow-shared-internal --network={self.network_name} --allow=tcp,udp,icmp --source-ranges=10.100.0.0/16 --direction=INGRESS --project={self.config.host_project}",
+            resource_name="all-for-incredibuild",
+            check_cmd=f"gcloud compute firewall-rules describe all-for-incredibuild --project={self.config.host_project} --format='value(name)'",
+            create_cmd=f"gcloud compute firewall-rules create all-for-incredibuild --network={self.network_name} --allow=all --source-ranges=10.0.0.0/8 --direction=INGRESS --project={self.config.host_project}",
+            project=self.config.host_project
+        ))
+        # ssh Firewall Rule Creation (Host Project)
+        host_setup_steps.append(DeployStep(
+            resource_type="Firewall Rule",
+            resource_name="ssh",
+            check_cmd=f"gcloud compute firewall-rules describe ssh --project={self.config.host_project} --format='value(name)'",
+            create_cmd=f"gcloud compute firewall-rules create ssh --network={self.network_name} --allow=tcp:22 --source-ranges=10.0.0.0/8 --direction=INGRESS --project={self.config.host_project}",
+            project=self.config.host_project
+        ))
+        # rdp Firewall Rule Creation (Host Project)
+        host_setup_steps.append(DeployStep(
+            resource_type="Firewall Rule",
+            resource_name="rdp",
+            check_cmd=f"gcloud compute firewall-rules describe rdp --project={self.config.host_project} --format='value(name)'",
+            create_cmd=f"gcloud compute firewall-rules create rdp --network={self.network_name} --allow=tcp:3389 --source-ranges=0.0.0.0/0 --direction=INGRESS --project={self.config.host_project}",
             project=self.config.host_project
         ))
         stages.append(Stage(name="VPC & Host Setup", steps=host_setup_steps, is_parallel=False))
