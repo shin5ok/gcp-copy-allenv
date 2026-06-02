@@ -14,13 +14,21 @@ setup:
 
 ## run: dst/config.yaml に基づいて移行処理（スキャンからクローン同期まで）を本番実行します
 run: setup
-	uv run python3 scripts/main.py --no-dry-run $(ARGS)
+	uv run python3 scripts/sync_env.py --no-dry-run $(ARGS)
 
 ## plan: ドライランモードで実行計画（予定されるgcloud/terraformコマンドと日本語補足）を表示します
 plan: setup
-	uv run python3 scripts/main.py --dry-run $(ARGS)
+	uv run python3 scripts/sync_env.py --dry-run $(ARGS)
 
 ## test: ツール全体の単体テスト（pytest）を実行します
 test:
 	PYTHONPATH=. uv run pytest
+
+## projects: dst/config.yaml に基づいてコピー先（Destination）プロジェクト群を新規作成・初期化します
+projects: setup
+	uv run python3 scripts/create_projects.py --no-dry-run $(ARGS)
+
+## projects-plan: プロジェクト作成のドライラン（シミュレーション）を実行します
+projects-plan: setup
+	uv run python3 scripts/create_projects.py --dry-run $(ARGS)
 
