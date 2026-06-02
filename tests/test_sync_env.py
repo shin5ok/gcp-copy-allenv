@@ -161,7 +161,7 @@ class TestLoadConfigFailsFast:
 
 
 # ============================================================
-# check_prerequisites: Config Connector 必須
+# check_prerequisites: 有効ステップが必要とする CLI を実行前に検査
 # ============================================================
 class TestCheckPrerequisites:
     def _setup(self, temp_dir, **steps):
@@ -198,6 +198,36 @@ class TestCheckPrerequisites:
         o.mock = True
         monkeypatch.setattr("scripts.sync_env.shutil.which", lambda name: None)
         o.check_prerequisites()  # Mock では実コマンドを叩かないのでスキップ
+
+    def test_missing_terraform_exits_when_apply_enabled(self, temp_dir, monkeypatch):
+        o = self._setup(temp_dir, terraform_apply={"enabled": True})
+        # terraform だけ無い、他はある
+        monkeypatch.setattr(
+            "scripts.sync_env.shutil.which",
+            lambda name: None if name == "terraform" else f"/usr/bin/{name}",
+        )
+        with pytest.raises(SystemExit) as ei:
+            o.check_prerequisites()
+        assert ei.value.code == 1
+
+    def test_terraform_not_required_when_apply_disabled(self, temp_dir, monkeypatch):
+        # cai_scan のみ有効。terraform が無くても止まらない
+        o = self._setup(temp_dir, cai_scan={"enabled": True})
+        monkeypatch.setattr(
+            "scripts.sync_env.shutil.which",
+            lambda name: None if name == "terraform" else f"/usr/bin/{name}",
+        )
+        o.check_prerequisites()  # 例外なし
+
+    def test_missing_gcloud_exits(self, temp_dir, monkeypatch):
+        o = self._setup(temp_dir, cai_scan={"enabled": True})
+        monkeypatch.setattr(
+            "scripts.sync_env.shutil.which",
+            lambda name: None if name == "gcloud" else f"/usr/bin/{name}",
+        )
+        with pytest.raises(SystemExit) as ei:
+            o.check_prerequisites()
+        assert ei.value.code == 1
 
 
 # ============================================================
