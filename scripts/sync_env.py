@@ -298,6 +298,8 @@ class MigrationOrchestrator:
         self.mock_override = mock_override
         self.stats = StageStats()
         self.start_t = time.time()
+        # src プロジェクト番号 → dst プロジェクト番号 の対応（customize で番号置換に使用）
+        self.proj_num_map: Dict[str, str] = {}
 
     # ----- 設定 -----
     def load_config(self):
@@ -563,12 +565,15 @@ class MigrationOrchestrator:
         allow_fail: bool = False,
         cwd: Optional[str] = None,
         impersonate_sa: Optional[str] = None,
+        retries: int = 0,
     ) -> Optional[str]:
         """外部コマンドを安全に実行する。
 
         Args:
             side: "src" (ORG = read-only 必須) / "dst" (コピー先) / "local" (terraform 等)
             impersonate_sa: 借用 SA。side="src" では必須。
+            retries: 失敗時の追加リトライ回数（config-connector 等のフレーキー対策）。
+                     リトライ中の失敗は失敗カウントに含めない。
         """
         tag = f"[{desc}] " if desc else ""
 
@@ -623,34 +628,48 @@ class MigrationOrchestrator:
         else:
             logger.info(f"{tag}実行中…")
 
-        try:
-            result = subprocess.run(
-                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, cwd=cwd, env=env,
-            )
-            if result.returncode != 0:
-                logger.error(f"{tag}✗ 失敗 (exit={result.returncode})")
-                if result.stderr:
-                    logger.error(f"      理由: {result.stderr.strip()[:600]}")
-                if not allow_fail:
+        attempt = 0
+        while True:
+            try:
+                result = subprocess.run(
+                    cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, cwd=cwd, env=env,
+                )
+                if result.returncode != 0:
+                    # まだリトライ余地があれば、失敗カウントせず再試行
+                    if attempt < retries:
+                        attempt += 1
+                        logger.warning(
+                            f"{tag}一時失敗 (exit={result.returncode})。再試行 {attempt}/{retries}"
+                        )
+                        time.sleep(min(5 * attempt, 30))
+                        continue
+                    logger.error(f"{tag}✗ 失敗 (exit={result.returncode})")
+                    if result.stderr:
+                        logger.error(f"      理由: {result.stderr.strip()[:600]}")
                     self.stats.incr("failed")
-                    sys.exit(result.returncode)
-                self.stats.incr("failed")
-                return None
-            else:
-                if side == "src":
-                    self.stats.incr("read")
+                    if not allow_fail:
+                        sys.exit(result.returncode)
+                    return None
                 else:
-                    self.stats.incr("executed")
-                if result.stdout and self.verbose:
-                    logger.debug(f"{tag}[STDOUT]\n{result.stdout.strip()}")
-                return result.stdout.strip()
-        except Exception as e:
-            logger.error(f"{tag}例外発生: {e}")
-            self.stats.incr("failed")
-            if not allow_fail:
-                sys.exit(1)
-            return None
+                    if side == "src":
+                        self.stats.incr("read")
+                    else:
+                        self.stats.incr("executed")
+                    if result.stdout and self.verbose:
+                        logger.debug(f"{tag}[STDOUT]\n{result.stdout.strip()}")
+                    return result.stdout.strip()
+            except Exception as e:
+                if attempt < retries:
+                    attempt += 1
+                    logger.warning(f"{tag}例外発生: {e}。再試行 {attempt}/{retries}")
+                    time.sleep(min(5 * attempt, 30))
+                    continue
+                logger.error(f"{tag}例外発生: {e}")
+                self.stats.incr("failed")
+                if not allow_fail:
+                    sys.exit(1)
+                return None
 
     # ----- Mock シミュレータ（fail-closed 化済み） -----
     def _simulate_command(self, cmd: str, logger: logging.Logger, tag: str) -> Optional[str]:
@@ -1000,10 +1019,55 @@ resource "google_storage_bucket" "mock_bucket" {{
                     desc=f"Bulk Export {proj_id}",
                     explanation=f"{proj_id} のリソース定義を Terraform HCL としてエクスポート",
                     impersonate_sa=sa, allow_fail=True,
+                    retries=3,  # config-connector は時々フレーキーに失敗するため再試行
                 )
+
+        # プロジェクト番号マップを構築（customize で number 置換に使う）。
+        # bulk-export は project = "<番号>" や "<番号>-compute@developer" を出力するが、
+        # 番号は ID 置換では変わらないため、別途 src番号 → dst番号 に置換する必要がある。
+        # （未置換だと google_project_service が src を操作したり、VM が src の
+        #  既定 compute SA を参照して actAs 失敗になる）
+        if not self.dry_run and not self.mock:
+            self._build_project_number_map()
 
         self.customize_hcl(raw_dir, active_dir)
         self.org_logger.info("  ✓ Step 3 完了")
+
+    def _get_project_number(self, project: str, impersonate_sa: Optional[str] = None) -> Optional[str]:
+        """gcloud projects describe でプロジェクト番号を取得（read-only）。"""
+        env = os.environ.copy()
+        if impersonate_sa:
+            env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = impersonate_sa
+        try:
+            res = subprocess.run(
+                f"gcloud projects describe {project} --format='value(projectNumber)'",
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+        except Exception:
+            pass
+        return None
+
+    def _build_project_number_map(self):
+        """src/dst の各プロジェクト番号を取得し proj_num_map(src番号→dst番号) を作る。
+
+        describe は read-only。借用 SA 経由だと対象プロジェクトの CRM API 無効で
+        失敗するため、実行ユーザー権限（terraform と同じ local 認証）で取得する。
+        """
+        self.proj_num_map = {}
+        for src, dst, src_sa, dst_sa in self._iter_project_pairs():
+            sn = self._get_project_number(src)
+            dn = self._get_project_number(dst)
+            if sn and dn:
+                self.proj_num_map[sn] = dn
+                self.org_logger.info(f"  プロジェクト番号マップ: {sn} → {dn} ({src} → {dst})")
+            else:
+                self.org_logger.warning(
+                    f"  プロジェクト番号を取得できませんでした（{src}={sn} / {dst}={dn}）。"
+                    f"番号置換をスキップします。"
+                )
 
     # ----- HCL のカスタマイズ（バグ修正版） -----
     def customize_hcl(self, raw_dir: str, active_dir: str):
@@ -1027,12 +1091,26 @@ resource "google_storage_bucket" "mock_bucket" {{
             self.org_logger.warning(f"  raw_dir が存在しないため HCL カスタマイズをスキップ: {raw_dir}")
             return
 
-        # active は raw から毎回再生成する派生ディレクトリ。過去の入れ子構造や
-        # mock 残骸が混ざって Terraform ルートが汚れるのを防ぐため、本番時は作り直す。
+        # active は raw から再生成する派生ディレクトリ。ただし terraform.tfstate /
+        # .terraform / lock は作成済みリソースの記録なので保持し、再 apply を冪等にする
+        # （state を消すと既存リソースが "already exists" で衝突する）。
+        # - 現 export に無い孤児プロジェクト dir は丸ごと削除（別 config / mock 残骸対策）
+        # - 既存プロジェクト dir は .tf のみ削除し、state 等は残す
         if not self.dry_run and os.path.isdir(active_dir):
-            self.org_logger.info(f"  既存の active を作り直し: {active_dir}")
-            shutil.rmtree(active_dir, ignore_errors=True)
-            os.makedirs(active_dir, exist_ok=True)
+            raw_projects = set(os.listdir(raw_dir))
+            for name in os.listdir(active_dir):
+                d = os.path.join(active_dir, name)
+                if os.path.isdir(d):
+                    if name not in raw_projects:
+                        self.org_logger.info(f"  孤児プロジェクト dir を削除: {d}")
+                        shutil.rmtree(d, ignore_errors=True)
+                    else:
+                        for r, _dirs, fs in os.walk(d):
+                            for f in fs:
+                                if f.endswith('.tf'):
+                                    os.remove(os.path.join(r, f))
+                else:
+                    os.remove(d)
 
         for root, _, files in os.walk(raw_dir):
             for file in files:
@@ -1071,6 +1149,15 @@ resource "google_storage_bucket" "mock_bucket" {{
                             dst, content,
                         )
 
+                    # 1.2. プロジェクト番号置換（src番号 → dst番号）。
+                    #    project = "<番号>" や "<番号>-compute@developer" など、ID 置換
+                    #    では変わらない番号参照を dst のものに置き換える。桁境界でマッチ。
+                    for snum in sorted(self.proj_num_map.keys(), key=len, reverse=True):
+                        content = re.sub(
+                            rf'(?<!\d){re.escape(snum)}(?!\d)',
+                            self.proj_num_map[snum], content,
+                        )
+
                     # 1.5. Terraform のリソース/データ名（2 番目のラベル）を有効化。
                     #    bulk-export はプロジェクト番号由来で数字始まりのラベルを
                     #    生成することがあり、そのままでは構文エラーになる。
@@ -1085,6 +1172,13 @@ resource "google_storage_bucket" "mock_bucket" {{
 
                     # 3. VM の boot_disk.source 行を削除（スナップショット復元前提）
                     content = self._strip_boot_disk_source(content, rel)
+
+                    # 3.5. 予約 IP（compute address）の固定 IP 指定を外し自動採番に。
+                    content = self._strip_reserved_ip(content)
+
+                    # 3.6. 組織ポリシー（uniformBucketLevelAccess 強制）に合わせ、
+                    #    バケットの uniform_bucket_level_access を true に統一。
+                    content = self._enforce_uniform_bucket_access(content)
 
                     # 4. Google 管理のデフォルト SA など、Terraform で作成不能な
                     #    リソースはスキップ（account_id が GCP 命名規則違反のもの）。
@@ -1118,17 +1212,92 @@ resource "google_storage_bucket" "mock_bucket" {{
         return content
 
     def _skip_reason_for_file(self, content: str) -> Optional[str]:
-        """Terraform で作成不能なリソースを含むファイルはスキップ理由を返す。
+        """Terraform で作成不能 / 管理不能なリソースを含むファイルはスキップ理由を返す。
 
-        現状の対象: `google_service_account` のうち `account_id` が GCP の命名規則
-        `^[a-z]([-a-z0-9]*[a-z0-9])?$` に反するもの（プロジェクト番号始まりの
-        Google 管理デフォルト SA など）。これらは自動生成され Terraform では作れない。
+        bulk-export は「プロジェクト自体」や「自動生成される既定リソース」まで出力する。
+        これらを dst に apply すると "already exists" や "forbidden" で失敗するため除外する。
+
+        対象:
+        - `google_project`            … dst プロジェクトは既存。再作成は不可。
+        - `google_logging_project_sink` の `_Default` / `_Required`
+                                       … 既定ログシンク。作成/更新できない（forbidden）。
+        - `google_service_account` の account_id が GCP 命名規則
+          `^[a-z]([-a-z0-9]*[a-z0-9])?$` に反するもの
+                                       … プロジェクト番号始まりの Google 管理既定 SA。
         """
+        # プロジェクト本体（google_project_service 等は別物なので閉じ引用符込みで判定）
+        if 'resource "google_project"' in content:
+            return "既存プロジェクト（google_project は作成不可）"
+
+        if 'resource "google_logging_project_sink"' in content:
+            m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+            if m and m.group(1) in ("_Default", "_Required"):
+                return f"既定ログシンク（{m.group(1)}）は変更不可"
+
         if 'resource "google_service_account"' in content:
             m = re.search(r'\baccount_id\s*=\s*"([^"]+)"', content)
             if m and not re.match(r'^[a-z]([-a-z0-9]*[a-z0-9])?$', m.group(1)):
                 return f"作成不能なデフォルト SA: account_id={m.group(1)}"
+
+        # NAT 用に自動払い出しされる外部 IP は手動作成できない。
+        if 'resource "google_compute_address"' in content and \
+                re.search(r'\bpurpose\s*=\s*"NAT_AUTO"', content):
+            return "NAT_AUTO アドレス（手動作成不可）"
+
+        # クロスプロジェクト（共有 VPC ホスト）の subnet を参照する予約アドレスは
+        # サービスプロジェクトからは作成できない（Cross-project references not allowed）。
+        if 'resource "google_compute_address"' in content:
+            pm = re.search(r'\bproject\s*=\s*"([^"]+)"', content)
+            sm = re.search(r'\bsubnetwork\s*=\s*"[^"]*projects/([^/"]+)/', content)
+            if pm and sm and pm.group(1) != sm.group(1):
+                return f"クロスプロジェクト subnet 参照のアドレス（host={sm.group(1)}）は作成不可"
+
+        # スナップショット / イメージは移行モデルでは terraform で作らない。
+        # snapshot は dst に存在しないディスクを source にしており、image はその
+        # snapshot 由来。VM ディスクは Step 5 で src スナップショットから復元する。
+        if 'resource "google_compute_snapshot"' in content:
+            return "snapshot は terraform 対象外（Step 5 で src から復元）"
+        if 'resource "google_compute_image"' in content:
+            return "image（snapshot 由来）は dst に存在せず作成不可"
         return None
+
+    def _enforce_uniform_bucket_access(self, content: str) -> str:
+        """google_storage_bucket に uniform_bucket_level_access = true を強制する。
+
+        組織ポリシー constraints/storage.uniformBucketLevelAccess が有効な環境では、
+        この指定が無い / false のバケット作成は弾かれるため統一する。
+        """
+        if 'resource "google_storage_bucket"' not in content:
+            return content
+        if re.search(r'\buniform_bucket_level_access\b', content):
+            return re.sub(
+                r'\buniform_bucket_level_access\s*=\s*\w+',
+                'uniform_bucket_level_access = true', content,
+            )
+        return re.sub(
+            r'(resource\s+"google_storage_bucket"\s+"[^"]+"\s*\{)',
+            r'\1\n  uniform_bucket_level_access = true',
+            content, count=1,
+        )
+
+    def _strip_reserved_ip(self, content: str) -> str:
+        """google_compute_address / global_address の固定 IP 指定を外し自動採番にする。
+
+        src の予約 IP（例: 34.x.x.x）は dst プロジェクトに割り当てられていないため、
+        その IP のまま作成しようとすると "IP address is not allocated" で失敗する。
+        `address = "<ip>"` 行を削除して GCP に新しい IP を採番させる（移行先で IP が
+        変わるのは許容）。`address_type` 行は別物なので消さない。
+        """
+        if ('resource "google_compute_address"' not in content
+                and 'resource "google_compute_global_address"' not in content):
+            return content
+        out: List[str] = []
+        for line in content.split('\n'):
+            if re.match(r'^\s*address\s*=\s*"[0-9A-Fa-f:.]+"\s*$', line):
+                self.org_logger.info(f"      予約IP指定を削除し自動採番に変更: {line.strip()}")
+                continue
+            out.append(line)
+        return '\n'.join(out)
 
     def _sanitize_resource_names(self, content: str, rel: str) -> str:
         """Terraform のリソース/データ名（block の 2 番目のラベル）を有効化する。
@@ -1260,6 +1429,10 @@ resource "google_storage_bucket" "mock_bucket" {{
                 explanation="Terraform 初期化",
                 cwd=proj_dir,
             )
+            # apply 前に既存リソースを state に取り込み、再実行/汚れた dst でも
+            # "already exists" にならないようにする（冪等化）。dry_run ではスキップ。
+            if not self.dry_run and not self.mock:
+                self._terraform_import_existing(proj_dir)
             self.run_command(
                 "terraform plan -out=tfplan", side="local", logger=self.dst_logger,
                 desc=f"TF Plan {os.path.basename(proj_dir)}",
@@ -1275,6 +1448,46 @@ resource "google_storage_bucket" "mock_bucket" {{
                     cwd=proj_dir,
                 )
         self.dst_logger.info("  ✓ Step 4 完了")
+
+    def _terraform_import_existing(self, proj_dir: str):
+        """apply 前に既存リソースを terraform state へ取り込み、再実行を冪等にする。
+
+        bulk-export は各 .tf に `# terraform import <addr> <id>` コメントを残すため、
+        それを使って「dst に既に存在するリソース」を adopt する。既に state にある／
+        実在しないリソースの import 失敗は無視（best-effort）。
+        - 一部リソースは comment の id 形式が古い/不正なので補正する:
+          * google_project_iam_custom_role は `proj##role` → `projects/proj/roles/role`
+        - google_storage_bucket は名前変更しており comment の id が一致しないため除外
+          （存在しなければ新規作成、存在すれば apply で衝突しないよう別途リネーム済み）。
+        """
+        import glob
+        pairs: List[tuple] = []
+        for tf in sorted(glob.glob(os.path.join(proj_dir, "*.tf"))):
+            try:
+                with open(tf, encoding="utf-8") as f:
+                    for line in f:
+                        m = re.match(r'#\s*terraform import\s+(\S+)\s+(.+?)\s*$', line)
+                        if m:
+                            pairs.append((m.group(1), m.group(2)))
+            except OSError:
+                continue
+        if not pairs:
+            return
+        self.dst_logger.info(f"    既存リソースの取り込みを試行: {len(pairs)} 件")
+        imported = 0
+        for addr, imp_id in pairs:
+            if addr.startswith("google_storage_bucket."):
+                continue  # リネーム済みのため comment id は不一致。新規作成に任せる。
+            if addr.startswith("google_project_iam_custom_role.") and "##" in imp_id:
+                proj, role = imp_id.split("##", 1)
+                imp_id = f"projects/{proj}/roles/{role}"
+            rc, _o, _e = self._sa_preflight_run(
+                f"terraform -chdir={proj_dir} import -input=false -lock=false "
+                f"'{addr}' '{imp_id}'"
+            )
+            if rc == 0:
+                imported += 1
+        self.dst_logger.info(f"    取り込み成功: {imported} 件（既存 state / 不在は無視）")
 
     def _collect_terraform_roots(self, active_dir: str) -> List[str]:
         """active 配下で「直下に .tf を持つ」プロジェクトディレクトリを列挙して返す。
