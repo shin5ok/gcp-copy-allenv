@@ -90,14 +90,10 @@ steps:
   terraform_apply:
     enabled: true
 
-  # [Step 5] 共有VPCの設定
-  shared_vpc:
+  # [Step 5] GCE VM 復元 (スナップショットから復元したディスクをVMに紐付け起動)
+  gce_restore:
     enabled: true
 
-  # [Step 6] dst へGCEのコピー (Snapshotからの復元)
-  gce_copy:
-    enabled: true
-
-  # [Step 7] データの移行 (GCS, BigQueryなど)
-  data_migration:
+  # [Step 6] データの移行 (GCS, BigQueryなど)
+  data_sync:
     enabled: true
