@@ -22,6 +22,14 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
   ```
 - **`terraform`**（Step 4 のインフラ再現で使用）
 - **`gcloud` / `bq`**（GCP CLI）
+- **Config Connector**（**必須**）: Step 3 の Terraform エクスポート
+  (`gcloud beta resource-config bulk-export --resource-format=terraform`) が依存する gcloud コンポーネント。
+  未インストールだと `make plan` / `make run` は前提チェックで**即停止**します（Mock モードを除く）。
+  ```bash
+  gcloud components install config-connector   # インストール
+  which config-connector                       # 確認（パスが返れば OK）
+  ```
+  > ℹ️ Config Connector は `bulk_export` ステップが有効な場合のみ必須です。`make mock` では実コマンドを叩かないためチェックをスキップします。
 
 ### 2. GCP 認証と安全なアクセス設定（Impersonation）
 セキュリティ向上のため、サービスアカウントキー (JSON) は使用せず、

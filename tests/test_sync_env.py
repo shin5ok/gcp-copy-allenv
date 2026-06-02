@@ -161,6 +161,46 @@ class TestLoadConfigFailsFast:
 
 
 # ============================================================
+# check_prerequisites: Config Connector 必須
+# ============================================================
+class TestCheckPrerequisites:
+    def _setup(self, temp_dir, **steps):
+        cfg = _full_config(temp_dir)
+        cfg["steps"] = steps
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_missing_config_connector_exits(self, temp_dir, monkeypatch):
+        o = self._setup(temp_dir, bulk_export={"enabled": True})
+        monkeypatch.setattr("scripts.sync_env.shutil.which", lambda name: None)
+        with pytest.raises(SystemExit) as ei:
+            o.check_prerequisites()
+        assert ei.value.code == 1
+
+    def test_config_connector_present_passes(self, temp_dir, monkeypatch):
+        o = self._setup(temp_dir, bulk_export={"enabled": True})
+        monkeypatch.setattr(
+            "scripts.sync_env.shutil.which",
+            lambda name: "/path/to/config-connector",
+        )
+        o.check_prerequisites()  # 例外なし
+
+    def test_skipped_when_bulk_export_disabled(self, temp_dir, monkeypatch):
+        o = self._setup(temp_dir, bulk_export={"enabled": False})
+        monkeypatch.setattr("scripts.sync_env.shutil.which", lambda name: None)
+        o.check_prerequisites()  # bulk-export 無効なら未インストールでも通る
+
+    def test_skipped_in_mock_mode(self, temp_dir, monkeypatch):
+        o = self._setup(temp_dir, bulk_export={"enabled": True})
+        o.mock = True
+        monkeypatch.setattr("scripts.sync_env.shutil.which", lambda name: None)
+        o.check_prerequisites()  # Mock では実コマンドを叩かないのでスキップ
+
+
+# ============================================================
 # run_command: ORG 保護
 # ============================================================
 class TestRunCommandSafety:

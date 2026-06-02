@@ -316,6 +316,43 @@ class MigrationOrchestrator:
         self.org_logger = setup_logger('org', os.path.join(self.run_dir, org_log_name), self.verbose)
         self.dst_logger = setup_logger('dst', os.path.join(self.run_dir, dst_log_name), self.verbose)
 
+    # ----- 前提コンポーネントの確認 -----
+    def check_prerequisites(self):
+        """実行に必要な外部コンポーネントの存在を確認する。
+
+        特に **Config Connector** は Step 3 (Terraform エクスポート) で使う
+        `gcloud beta resource-config bulk-export --resource-format=terraform`
+        の必須コンポーネント。未インストールだとエクスポートが失敗するため、
+        dry-run（make plan）を含め実行前に検出して停止する。
+        Mock モードでは実コマンドを叩かないためスキップする。
+        """
+        if self.mock:
+            self.org_logger.info("  [前提チェック] Mock モードのため外部コンポーネントのチェックをスキップ")
+            return
+
+        steps = self.config.get('steps', {})
+        bulk_export_enabled = steps.get('bulk_export', {}).get('enabled', False)
+
+        missing: List[str] = []
+        # Config Connector は bulk-export (Step 3) の必須コンポーネント
+        if bulk_export_enabled and shutil.which("config-connector") is None:
+            missing.append(
+                "config-connector (Config Connector) … `gcloud beta resource-config "
+                "bulk-export` に必須です。インストール: "
+                "`gcloud components install config-connector`"
+            )
+
+        if missing:
+            print("=" * 60, file=sys.stderr)
+            print(" [前提チェック] 必須コンポーネントが見つかりません。処理を中止します:", file=sys.stderr)
+            for m in missing:
+                print(f"  - {m}", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            sys.exit(1)
+
+        if bulk_export_enabled:
+            self.org_logger.info("  [前提チェック] config-connector OK")
+
     # ----- 安全に外部コマンドを実行 -----
     def run_command(
         self,
@@ -513,6 +550,7 @@ resource "google_storage_bucket" "mock_bucket" {{
     # ----- 実行制御 -----
     def execute(self):
         self.load_config()
+        self.check_prerequisites()
 
         self.org_logger.info("=" * 60)
         self.org_logger.info(" copy-all-env  移行オーケストレータ  開始")
