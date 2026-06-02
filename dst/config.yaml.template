@@ -10,8 +10,15 @@
 # ------------------------------------------------------------------------------
 global:
   # ログの出力先ディレクトリ。
-  # 実行時に `org.log` と `dst.log` がこのディレクトリ内に作成されます。
   log_dir: "./logs"
+
+  # コピー元（Original）の作業ログファイル名（log_dir内）
+  # コピー元からの情報取得やスナップショット確認などのログが記録されます。
+  org_log_file: "org.log"
+
+  # コピー先（Destination）の作業ログファイル名（log_dir内）
+  # コピー先でのリソース作成やデータ移行などのログが記録されます。
+  dst_log_file: "dst.log"
 
   # 並列実行数。
   # GCEのコピーやデータ移行など、並列処理が可能なステップで使用されます。
@@ -26,6 +33,19 @@ global:
   # true の場合、実行された生の gcloud/terraform コマンド文字列と、
   # 人間が理解しやすい実行目的の補足説明がログに詳細に出力されます。
   verbose_logging: true
+
+# ------------------------------------------------------------------------------
+# 1.5. 事前準備設定 (Provisioning / Bootstrap Settings)
+# ------------------------------------------------------------------------------
+# コピー先プロジェクトを新規作成する場合に必要な設定です。
+# make コマンドによる事前準備（プロジェクト作成）時に使用されます。
+bootstrap:
+  # 組織ID (Organization ID)
+  org_id: "123456789012"
+  # フォルダID (Folder ID) - 任意。指定された場合はフォルダ配下にプロジェクトを作成します。
+  # folder_id: "987654321098"
+  # 請求先アカウントID (Billing Account ID) - 必須。作成したプロジェクトに紐付けます。
+  billing_account: "012345-6789AB-CDEF01"
 
 # ------------------------------------------------------------------------------
 # 2. プロジェクトマッピング定義 (Project Mapping)
@@ -78,18 +98,18 @@ steps:
     enabled: true
     output_dir: "./cai_export"
 
-  # [Step 2] gcloud bulk-export によるIaC化 (Terraformコード生成)
-  bulk_export:
-    enabled: true
-    output_dir: "./terraform"
-
-  # [Step 3] GCE Snapshot の準備
+  # [Step 2] GCE Snapshot の準備
   gce_snapshot:
     enabled: true
     prefix: "migration-snap"
     # 許容するスナップショットの最大作成経過日数 (デフォルト: 30日)
     # データの新鮮さを保証するため、この期間内に作成されたスナップショットがない場合はエラーにします。
     max_age_days: 30
+
+  # [Step 3] gcloud bulk-export によるIaC化 (Terraformコード生成)
+  bulk_export:
+    enabled: true
+    output_dir: "./terraform"
 
   # [Step 4] dst へIaCでの再現 (Terraform適用)
   terraform_apply:

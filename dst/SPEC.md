@@ -80,9 +80,16 @@
 
 #### `global` (共通設定)
 - `log_dir` (string, 必須): ログ出力先。
+- `org_log_file` (string, 任意): コピー元作業ログファイル名。デフォルト `"org.log"`。
+- `dst_log_file` (string, 任意): コピー先作業ログファイル名. デフォルト `"dst.log"`。
 - `parallel_jobs` (integer, 任意): 並列実行数。デフォルト `4`。
 - `dry_run` (boolean, 任意): ドライランモード。デフォルト `true`。
 - `verbose_logging` (boolean, 任意): 詳細ログ（生コマンドおよび実行補足説明）の出力有無。デフォルト `true`。
+
+#### `bootstrap` (事前準備設定)
+- `org_id` (string, 必須): 組織ID。
+- `folder_id` (string, 任意): フォルダID。
+- `billing_account` (string, 必須): 請求先アカウントID。
 
 #### `project_mapping` (プロジェクト対応定義)
 - `host_project` (object, 必須): 共有VPCホストプロジェクト。
