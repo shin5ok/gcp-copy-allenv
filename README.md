@@ -20,8 +20,17 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
   ```bash
   curl -sSf https://rye.astral.sh/get | bash   # または pipx install uv
   ```
-- **`terraform`**（Step 4 のインフラ再現で使用）
+- **`terraform`**（**必須**: Step 4 のインフラ再現で使用）
+  ```bash
+  # 例: 公式バイナリを導入（Debian/Ubuntu）
+  terraform version   # 確認（バージョンが出れば OK）
+  # 未導入の場合: https://developer.hashicorp.com/terraform/install
+  ```
 - **`gcloud` / `bq`**（GCP CLI）
+
+> ✅ **前提チェック（fail-fast）**: `make plan` / `make run` は開始時に、有効化された
+> ステップが必要とする CLI（`gcloud` / `terraform` / `bq` / `config-connector`）の存在を確認します。
+> 不足しているとステップ途中で `not found` になる前に**即停止**します（Mock モードはスキップ）。
 - **Config Connector**（**必須**）: Step 3 の Terraform エクスポート
   (`gcloud beta resource-config bulk-export --resource-format=terraform`) が依存する gcloud コンポーネント。
   未インストールだと `make plan` / `make run` は前提チェックで**即停止**します（Mock モードを除く）。

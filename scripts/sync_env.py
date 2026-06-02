@@ -318,29 +318,65 @@ class MigrationOrchestrator:
 
     # ----- 前提コンポーネントの確認 -----
     def check_prerequisites(self):
-        """実行に必要な外部コンポーネントの存在を確認する。
+        """実行に必要な外部 CLI / コンポーネントの存在を確認する。
 
-        特に **Config Connector** は Step 3 (Terraform エクスポート) で使う
-        `gcloud beta resource-config bulk-export --resource-format=terraform`
-        の必須コンポーネント。未インストールだとエクスポートが失敗するため、
-        dry-run（make plan）を含め実行前に検出して停止する。
+        有効化されているステップが必要とするツールだけを検査し、未インストールなら
+        dry-run（make plan）を含め**実行前に**停止する。これにより、Step の途中で
+        `not found` (exit 127) になって中途半端な状態になるのを防ぐ。
         Mock モードでは実コマンドを叩かないためスキップする。
+
+        ステップ別の必須ツール:
+        - gcloud          … src/dst を操作するほぼ全ステップ
+        - config-connector … bulk_export (Step 3) の `gcloud ... bulk-export` が依存
+        - terraform       … terraform_apply (Step 4)
+        - bq              … data_sync (Step 6) の BigQuery 同期
         """
         if self.mock:
             self.org_logger.info("  [前提チェック] Mock モードのため外部コンポーネントのチェックをスキップ")
             return
 
         steps = self.config.get('steps', {})
-        bulk_export_enabled = steps.get('bulk_export', {}).get('enabled', False)
+
+        def enabled(name: str) -> bool:
+            return steps.get(name, {}).get('enabled', False)
+
+        gcloud_steps = ("cai_scan", "gce_snapshot", "bulk_export", "gce_restore", "data_sync")
+
+        # (ツール名, 必要か, 不足時の説明)
+        required = [
+            (
+                "gcloud",
+                any(enabled(s) for s in gcloud_steps),
+                "Google Cloud CLI。インストール: https://cloud.google.com/sdk/docs/install",
+            ),
+            (
+                "config-connector",
+                enabled("bulk_export"),
+                "Config Connector。`gcloud beta resource-config bulk-export` に必須。"
+                "インストール: `gcloud components install config-connector`",
+            ),
+            (
+                "terraform",
+                enabled("terraform_apply"),
+                "Terraform CLI。インストール: https://developer.hashicorp.com/terraform/install",
+            ),
+            (
+                "bq",
+                enabled("data_sync"),
+                "BigQuery CLI（Google Cloud CLI に同梱）。"
+                "インストール: https://cloud.google.com/sdk/docs/install",
+            ),
+        ]
 
         missing: List[str] = []
-        # Config Connector は bulk-export (Step 3) の必須コンポーネント
-        if bulk_export_enabled and shutil.which("config-connector") is None:
-            missing.append(
-                "config-connector (Config Connector) … `gcloud beta resource-config "
-                "bulk-export` に必須です。インストール: "
-                "`gcloud components install config-connector`"
-            )
+        ok: List[str] = []
+        for tool, needed, hint in required:
+            if not needed:
+                continue
+            if shutil.which(tool) is None:
+                missing.append(f"{tool} … {hint}")
+            else:
+                ok.append(tool)
 
         if missing:
             print("=" * 60, file=sys.stderr)
@@ -350,8 +386,8 @@ class MigrationOrchestrator:
             print("=" * 60, file=sys.stderr)
             sys.exit(1)
 
-        if bulk_export_enabled:
-            self.org_logger.info("  [前提チェック] config-connector OK")
+        if ok:
+            self.org_logger.info(f"  [前提チェック] OK: {', '.join(ok)}")
 
     # ----- 安全に外部コマンドを実行 -----
     def run_command(
