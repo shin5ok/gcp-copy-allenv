@@ -1,0 +1,86 @@
+# ==============================================================================
+# GCP Project "Marugoto Copy" Configuration Template
+# ==============================================================================
+# このファイルを `config.yaml` にコピーし、環境に合わせて値を編集してください。
+# 例: cp dst/config.yaml.template dst/config.yaml
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. 共通設定 (Global Settings)
+# ------------------------------------------------------------------------------
+global:
+  # ログの出力先ディレクトリ。
+  # 実行時に `org.log` と `dst.log` がこのディレクトリ内に作成されます。
+  log_dir: "./logs"
+
+  # 並列実行数。
+  # GCEのコピーやデータ移行など、並列処理が可能なステップで使用されます。
+  parallel_jobs: 4
+
+  # ドライランモード (デフォルト: true)
+  # true の場合、実際のリソース作成やデータのコピーは行わず、実行されるコマンドの表示のみ行います。
+  # 本番実行時は明示的に `false` に設定してください。
+  dry_run: true
+
+# ------------------------------------------------------------------------------
+# 2. プロジェクトマッピング定義 (Project Mapping)
+# ------------------------------------------------------------------------------
+# コピー元 (src) とコピー先 (dst) のプロジェクトIDを正確に指定してください。
+# 安全のため、サービスアカウントキー (JSON) は使用せず、サービスアカウントの権限借用 (Impersonation) を使用します。
+# コピー元 (src) には読み取り専用権限 (Viewer等) のサービスアカウントを、
+# コピー先 (dst) にはリソース作成権限 (Editor等) のサービスアカウントのメールアドレスを指定してください。
+# ※実行ユーザーが、対象SAに対して「サービス アカウント トークン作成者 (roles/iam.serviceAccountTokenCreator)」権限を持っている必要があります。
+project_mapping:
+  # 共有VPCホストプロジェクト
+  host_project:
+    src: "<SRC_HOST_PROJECT_ID>"
+    dst: "dst-sharedhost"
+    src_impersonate_service_account: "org-host-viewer@<SRC_HOST_PROJECT_ID>.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
+    dst_impersonate_service_account: "dst-host-owner@dst-sharedhost.iam.gserviceaccount.com"            # [必須] コピー先用 (作成/編集権限が必要)
+  
+  # サービスプロジェクトのリスト (複数指定可能)
+  service_projects:
+    - src: "<SRC_SERVICE_PROJECT_ID_1>"
+      dst: "dst-sharedservice-1"
+      src_impersonate_service_account: "org-svc1-viewer@<SRC_SERVICE_PROJECT_ID_1>.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
+      dst_impersonate_service_account: "dst-svc1-owner@dst-sharedservice-1.iam.gserviceaccount.com"            # [必須] コピー先用 (作成/編集権限が必要)
+    - src: "<SRC_SERVICE_PROJECT_ID_3>"
+      dst: "dst-sharedservice-3"
+      src_impersonate_service_account: "org-svc3-viewer@<SRC_SERVICE_PROJECT_ID_3>.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
+      dst_impersonate_service_account: "dst-svc3-owner@dst-sharedservice-3.iam.gserviceaccount.com"            # [必須] コピー先用 (作成/編集権限が必要)
+
+# ------------------------------------------------------------------------------
+# 3. ステップ制御 (Step Control)
+# ------------------------------------------------------------------------------
+# 各手順の実行有無 (enabled) および個別設定を行います。
+steps:
+  # [Step 1] Cloud Asset Inventory (CAI) での現状確認
+  cai_scan:
+    enabled: true
+    output_dir: "./cai_export"
+
+  # [Step 2] gcloud bulk-export によるIaC化 (Terraformコード生成)
+  bulk_export:
+    enabled: true
+    output_dir: "./terraform"
+
+  # [Step 3] GCE Snapshot の準備
+  gce_snapshot:
+    enabled: true
+    prefix: "migration-snap"
+
+  # [Step 4] dst へIaCでの再現 (Terraform適用)
+  terraform_apply:
+    enabled: true
+
+  # [Step 5] 共有VPCの設定
+  shared_vpc:
+    enabled: true
+
+  # [Step 6] dst へGCEのコピー (Snapshotからの復元)
+  gce_copy:
+    enabled: true
+
+  # [Step 7] データの移行 (GCS, BigQueryなど)
+  data_migration:
+    enabled: true

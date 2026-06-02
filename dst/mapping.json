@@ -1,0 +1,22 @@
+{
+  "original": {
+    "host_project": "<SRC_HOST_PROJECT_ID>",
+    "service_project_1": "<SRC_SERVICE_PROJECT_ID_1>",
+    "service_project_2": "<SRC_SERVICE_PROJECT_ID_3>"
+  },
+  "destination": {
+    "host_project": "<DST_HOST_PROJECT_ID>",
+    "service_project_1": "<DST_SERVICE_PROJECT_ID_1>",
+    "service_project_2": "<DST_SERVICE_PROJECT_ID_3>"
+  },
+  "gcs_buckets": [
+    {
+      "original": "<SRC_SERVICE_PROJECT_ID_3>",
+      "destination": "<DST_SERVICE_PROJECT_ID_3>"
+    },
+    {
+      "original": "<TEST_PROJECT_ID>",
+      "destination": "<DST_HOST_PROJECT_ID>"
+    }
+  ]
+}
