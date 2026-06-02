@@ -31,6 +31,14 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > ✅ **前提チェック（fail-fast）**: `make plan` / `make run` は開始時に、有効化された
 > ステップが必要とする CLI（`gcloud` / `terraform` / `bq` / `config-connector`）の存在を確認します。
 > 不足しているとステップ途中で `not found` になる前に**即停止**します（Mock モードはスキップ）。
+>
+> ✅ **SA 事前チェック（fail-fast）**: CLI 確認に続けて、`config.yaml` の借用 SA を実行前に検証します。
+> ① `gcloud auth print-access-token` でアクセストークン発行を試み、**SA の実在**と実行ユーザーの
+> **借用権限（`roles/iam.serviceAccountTokenCreator`）** を確認、② `gcloud projects test-iam-permissions`
+> で対象プロジェクトの**代表権限**（src=読取 / dst=書込）の有無を確認します。借用不可・権限不足を
+> 検出すると全件を列挙して**即停止**します（Mock モードはスキップ）。dry-run（`make plan`）でも実行され、
+> dst SA の不備もこの段階で検出できます。
+> ⚠️ 検証する権限は有効ステップに対応する**代表値**であり、全リソース種を網羅するものではありません。
 - **Config Connector**（**必須**）: Step 3 の Terraform エクスポート
   (`gcloud beta resource-config bulk-export --resource-format=terraform`) が依存する gcloud コンポーネント。
   未インストールだと `make plan` / `make run` は前提チェックで**即停止**します（Mock モードを除く）。
@@ -165,6 +173,7 @@ make run
 | **src は read-only 強制** | `side="src"` のコマンドに書き込み動詞（`create / delete / update / stop / start / attach / detach / mk / cp / rsync / apply` 等）が含まれていたら、**実行前に拒否**して停止します。 |
 | **借用 SA 必須** | `side="src"` で `impersonate_sa` が未指定の場合、実行ユーザー権限で ORG を叩くのを防ぐため即停止します。 |
 | **設定バリデーション** | `src == dst`、dst が他の src と衝突、借用 SA 未指定、`service_projects` が空 等を検出すると、処理を何もせずに停止します。 |
+| **SA 事前チェック** | 実行前に借用 SA の**実在・借用可否・代表権限**（src=読取 / dst=書込）を検証し、不足を検出したら全件列挙して停止します（`make plan` でも実行、Mock はスキップ）。 |
 | **Mock は fail-closed** | Mock モードで未対応のコマンドが来たら、本物実行に進ませず即停止します。 |
 
 これらにより、`config.yaml` の設定ミスやヒューマンエラーがあっても ORG への書き込みが発生しません。
