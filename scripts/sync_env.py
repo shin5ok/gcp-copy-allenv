@@ -66,6 +66,32 @@ _MOCK_KNOWN_PATTERNS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# SA プリフライト: 借用 SA に必要な代表権限（有効ステップごと）
+# ---------------------------------------------------------------------------
+# test-iam-permissions で検査する代表的な権限。全リソース種は網羅しないが、
+# 「Viewer/Editor 相当のロールが付いていない」ケースを実行前に検出するための
+# 最小セット。baseline は常に付与し、有効ステップ分を union する。
+_SRC_BASELINE_PERMS = ("resourcemanager.projects.get",)
+_SRC_PERMS_BY_STEP = {
+    "cai_scan":     ("cloudasset.assets.searchAllResources",),
+    "gce_snapshot": ("compute.instances.list", "compute.snapshots.list"),
+    "bulk_export":  ("cloudasset.assets.searchAllResources",
+                     "compute.instances.list", "storage.buckets.list"),
+    "gce_restore":  ("compute.instances.list", "compute.snapshots.list"),
+    "data_sync":    ("storage.buckets.list", "bigquery.datasets.get"),
+}
+_DST_BASELINE_PERMS = ("resourcemanager.projects.get",)
+_DST_PERMS_BY_STEP = {
+    "terraform_apply": ("compute.instances.create", "storage.buckets.create"),
+    "gce_restore":     ("compute.instances.start", "compute.instances.stop",
+                        "compute.disks.create", "compute.disks.delete",
+                        "compute.instances.attachDisk", "compute.instances.detachDisk"),
+    "data_sync":       ("storage.objects.create",
+                        "bigquery.datasets.create", "bigquery.tables.create"),
+}
+
+
 def is_src_read_only(cmd: str) -> bool:
     """src 側に対して安全（read-only）なコマンドかを判定する。
 
@@ -389,6 +415,143 @@ class MigrationOrchestrator:
         if ok:
             self.org_logger.info(f"  [前提チェック] OK: {', '.join(ok)}")
 
+    # ----- 借用 SA の事前検証 -----
+    def _sa_preflight_run(self, cmd: str) -> tuple:
+        """SA プリフライト専用の read-only コマンド実行ラッパ。
+
+        (returncode, stdout, stderr) を返す。run_command を使わない理由:
+        - run_command は side="dst" を dry-run でスキップしてしまう（SA 検証は
+          dry-run でも必ず実行したい）。
+        - verbose 時に stdout をログ出力するため、print-access-token の
+          アクセストークンが漏れてしまう。
+        ここで実行するのは print-access-token のみで read-only。
+        """
+        try:
+            res = subprocess.run(
+                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=os.environ.copy(),
+            )
+            return res.returncode, res.stdout, res.stderr
+        except Exception as e:
+            return 1, "", str(e)
+
+    def _test_iam_permissions(self, token: str, project: str, perms: set):
+        """resourcemanager の testIamPermissions REST を呼び、付与済み権限集合を返す。
+
+        検証できなかった場合（対象 API 未有効・ネットワーク不通など）は None を返し、
+        呼び出し側で「権限不足」とは区別して扱う（借用は確認済みのため警告に留める）。
+        gcloud に projects:testIamPermissions の CLI が無いため REST を直接叩く。
+        """
+        import urllib.request
+        import urllib.error
+        url = (
+            "https://cloudresourcemanager.googleapis.com/v1/"
+            f"projects/{project}:testIamPermissions"
+        )
+        body = json.dumps({"permissions": sorted(perms)}).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return set(data.get("permissions", []))
+        except Exception:
+            return None
+
+    def check_service_accounts(self):
+        """impersonate 対象 SA の実在性・借用可否・代表権限を実行前に検証する。
+
+        - dry-run / 本番のどちらでも実行する（mock モードではスキップ）。
+        - 各 SA についてアクセストークン発行を試み、SA の実在と実行ユーザーの
+          Token Creator 権限（roles/iam.serviceAccountTokenCreator）を確認する。
+          ここで失敗したら即停止（fail-fast）。
+        - 続けて借用トークンで testIamPermissions(REST) を呼び、有効ステップが必要と
+          する代表権限（src=読取 / dst=書込）の有無を確認する。権限が不足していたら
+          即停止。ただし API 未有効等で「検証できなかった」場合は警告に留め継続する
+          （借用は確認済みのため）。検証する権限は代表値であり全リソース種を網羅しない。
+        """
+        if self.mock:
+            self.org_logger.info("  [SA事前チェック] Mock モードのため SA 検証をスキップ")
+            return
+
+        steps = self.config.get('steps', {})
+
+        def enabled(name: str) -> bool:
+            return steps.get(name, {}).get('enabled', False)
+
+        def required_perms(perms_by_step: dict, baseline: tuple) -> set:
+            perms = set(baseline)
+            for step, plist in perms_by_step.items():
+                if enabled(step):
+                    perms.update(plist)
+            return perms
+
+        # 検証対象: (SA, project, side, 必要権限集合) を構築。
+        targets = []
+        src_perms = required_perms(_SRC_PERMS_BY_STEP, _SRC_BASELINE_PERMS)
+        dst_perms = required_perms(_DST_PERMS_BY_STEP, _DST_BASELINE_PERMS)
+        for src_proj, dst_proj, src_sa, dst_sa in self._iter_project_pairs():
+            targets.append((src_sa, src_proj, "src", src_perms))
+            targets.append((dst_sa, dst_proj, "dst", dst_perms))
+
+        errors: List[str] = []
+        ok_count = 0
+        checked_sas = set()
+        for sa, project, side, perms in targets:
+            label = f"{side} SA '{sa}' (project={project})"
+
+            # 1) 実在＋借用可否（アクセストークン発行）。stdout=token はログに出さない。
+            rc, token, err = self._sa_preflight_run(
+                f"gcloud auth print-access-token --impersonate-service-account={sa}"
+            )
+            if rc != 0 or not token.strip():
+                reason = err.strip().splitlines()[-1] if err.strip() else "原因不明"
+                errors.append(
+                    f"{label}: 借用（impersonate）できません。SA が存在しないか、"
+                    f"実行ユーザーに roles/iam.serviceAccountTokenCreator がありません。"
+                    f" 詳細: {reason[:300]}"
+                )
+                continue
+
+            # 2) 権限（借用トークンで testIamPermissions REST を実行）。
+            granted = self._test_iam_permissions(token.strip(), project, perms)
+            if granted is None:
+                # 検証不能（API 未有効・ネットワーク等）。借用は確認済みなので警告に留める。
+                self.org_logger.warning(
+                    f"  [SA事前チェック] {label}: 権限を検証できませんでした"
+                    f"（対象 API 未有効などの可能性）。借用は確認済みのため継続します。"
+                )
+                ok_count += 1
+                checked_sas.add(sa)
+                continue
+            missing = sorted(perms - granted)
+            if missing:
+                errors.append(
+                    f"{label}: 必要権限が不足しています: {', '.join(missing)}"
+                )
+                continue
+
+            ok_count += 1
+            checked_sas.add(sa)
+
+        if errors:
+            print("=" * 60, file=sys.stderr)
+            print(" [SA事前チェック] サービスアカウントに問題があります。処理を中止します:", file=sys.stderr)
+            for e in errors:
+                print(f"  - {e}", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            sys.exit(1)
+
+        self.org_logger.info(
+            f"  [SA事前チェック] OK: {len(checked_sas)} 個の SA で借用と代表権限を確認"
+            f"（検証は代表的な権限のみ）"
+        )
+
     # ----- 安全に外部コマンドを実行 -----
     def run_command(
         self,
@@ -587,6 +750,7 @@ resource "google_storage_bucket" "mock_bucket" {{
     def execute(self):
         self.load_config()
         self.check_prerequisites()
+        self.check_service_accounts()
 
         self.org_logger.info("=" * 60)
         self.org_logger.info(" copy-all-env  移行オーケストレータ  開始")
@@ -806,6 +970,12 @@ resource "google_storage_bucket" "mock_bucket" {{
         active_dir = os.path.join(output_dir_base, 'active')
 
         if not self.dry_run:
+            # raw 全体を作り直す。過去の mock ダミーや別 config の export 残骸
+            # （現 config に無い孤児プロジェクト dir 等）が混ざり、customize/terraform
+            # を汚すのを防ぐ。raw は毎回 bulk-export で再生成される派生物。
+            if os.path.isdir(raw_dir):
+                self.org_logger.info(f"  既存の raw を作り直し: {raw_dir}")
+                shutil.rmtree(raw_dir, ignore_errors=True)
             os.makedirs(raw_dir, exist_ok=True)
             os.makedirs(active_dir, exist_ok=True)
 
@@ -818,9 +988,12 @@ resource "google_storage_bucket" "mock_bucket" {{
             if self.mock and not self.dry_run:
                 self._write_dummy_tf_files(proj_raw_dir, proj_id)
             else:
+                # --quiet: bulk-export は対話プロンプト（continue? 等）を出すため、
+                # 非対話の subprocess 実行で EOF 中断（exit 1）になるのを防ぐ。
                 cmd = (
                     f"gcloud beta resource-config bulk-export "
-                    f"--project={proj_id} --resource-format=terraform --path={proj_raw_dir}"
+                    f"--project={proj_id} --resource-format=terraform "
+                    f"--path={proj_raw_dir} --quiet"
                 )
                 self.run_command(
                     cmd, side="src", logger=self.org_logger,
@@ -854,17 +1027,33 @@ resource "google_storage_bucket" "mock_bucket" {{
             self.org_logger.warning(f"  raw_dir が存在しないため HCL カスタマイズをスキップ: {raw_dir}")
             return
 
+        # active は raw から毎回再生成する派生ディレクトリ。過去の入れ子構造や
+        # mock 残骸が混ざって Terraform ルートが汚れるのを防ぐため、本番時は作り直す。
+        if not self.dry_run and os.path.isdir(active_dir):
+            self.org_logger.info(f"  既存の active を作り直し: {active_dir}")
+            shutil.rmtree(active_dir, ignore_errors=True)
+            os.makedirs(active_dir, exist_ok=True)
+
         for root, _, files in os.walk(raw_dir):
             for file in files:
                 if not file.endswith('.tf'):
                     continue
                 raw_path = os.path.join(root, file)
                 rel = os.path.relpath(raw_path, raw_dir)
-                active_path = os.path.join(active_dir, rel)
+                # Terraform は 1 つのディレクトリ直下の .tf しか読まない（再帰しない）。
+                # bulk-export はプロジェクト配下に深いサブディレクトリを作るため、
+                # プロジェクトごとに 1 つの平坦な Terraform ルート（active/<project>/）へ
+                # 集約する。サブパスは "__" で連結してファイル名衝突を防ぐ。
+                parts = rel.split(os.sep)
+                if len(parts) <= 1:
+                    active_rel = rel
+                else:
+                    active_rel = os.path.join(parts[0], "__".join(parts[1:]))
+                active_path = os.path.join(active_dir, active_rel)
                 if not self.dry_run:
                     os.makedirs(os.path.dirname(active_path), exist_ok=True)
 
-                self.org_logger.info(f"    処理中: {rel}")
+                self.org_logger.info(f"    処理中: {rel} → {active_rel}")
                 if self.dry_run:
                     continue
 
@@ -882,6 +1071,11 @@ resource "google_storage_bucket" "mock_bucket" {{
                             dst, content,
                         )
 
+                    # 1.5. Terraform のリソース/データ名（2 番目のラベル）を有効化。
+                    #    bulk-export はプロジェクト番号由来で数字始まりのラベルを
+                    #    生成することがあり、そのままでは構文エラーになる。
+                    content = self._sanitize_resource_names(content, rel)
+
                     # 2. google_storage_bucket リソース「ブロック内」の name のみリネーム。
                     #    以前のバグ: ファイル単位で全 name を書き換えていたため VM/FW 等も
                     #    suffix が付与されてしまっていた。
@@ -892,11 +1086,74 @@ resource "google_storage_bucket" "mock_bucket" {{
                     # 3. VM の boot_disk.source 行を削除（スナップショット復元前提）
                     content = self._strip_boot_disk_source(content, rel)
 
+                    # 4. Google 管理のデフォルト SA など、Terraform で作成不能な
+                    #    リソースはスキップ（account_id が GCP 命名規則違反のもの）。
+                    skip_reason = self._skip_reason_for_file(content)
+                    if skip_reason:
+                        self.org_logger.info(f"      スキップ（{skip_reason}）: {active_rel}")
+                        continue
+
+                    # 5. シェル変数 ${VAR} / Terraform ディレクティブ %{...} が
+                    #    起動スクリプト等の文字列に含まれると Terraform が補間として
+                    #    誤解釈するためエスケープ（最後に適用）。
+                    content = self._escape_interpolations(content)
+
                     with open(active_path, 'w', encoding='utf-8') as f:
                         f.write(content)
                 except Exception as e:
                     self.org_logger.error(f"    HCL カスタマイズ失敗 {raw_path}: {e}")
                     sys.exit(1)
+
+    def _escape_interpolations(self, content: str) -> str:
+        """Terraform が補間として解釈する `${...}` / `%{...}` をエスケープする。
+
+        bulk-export が出力する起動スクリプト等の文字列にはシェル変数 `${VAR}` が
+        そのまま含まれ、Terraform はこれを補間式として解釈してエラーになる。
+        bulk-export 出力に正規の Terraform 補間は無い（すべてリテラル）ため、
+        `${` → `$${`、`%{` → `%%{` に一括エスケープしてリテラル化する。
+        既にエスケープ済み（`$${` / `%%{`）は二重エスケープしない。
+        """
+        content = re.sub(r'(?<!\$)\$\{', '$${', content)
+        content = re.sub(r'(?<!%)%\{', '%%{', content)
+        return content
+
+    def _skip_reason_for_file(self, content: str) -> Optional[str]:
+        """Terraform で作成不能なリソースを含むファイルはスキップ理由を返す。
+
+        現状の対象: `google_service_account` のうち `account_id` が GCP の命名規則
+        `^[a-z]([-a-z0-9]*[a-z0-9])?$` に反するもの（プロジェクト番号始まりの
+        Google 管理デフォルト SA など）。これらは自動生成され Terraform では作れない。
+        """
+        if 'resource "google_service_account"' in content:
+            m = re.search(r'\baccount_id\s*=\s*"([^"]+)"', content)
+            if m and not re.match(r'^[a-z]([-a-z0-9]*[a-z0-9])?$', m.group(1)):
+                return f"作成不能なデフォルト SA: account_id={m.group(1)}"
+        return None
+
+    def _sanitize_resource_names(self, content: str, rel: str) -> str:
+        """Terraform のリソース/データ名（block の 2 番目のラベル）を有効化する。
+
+        Terraform では 2 番目のラベルは英字か `_` で始まる必要があるが、bulk-export は
+        プロジェクト番号などから数字始まりのラベル（例: "1007606807581_compute"）を
+        生成することがある。先頭が不正な場合は `_` を付与し、宣言・式中の参照・
+        `# terraform import` コメントを揃えて書き換える。
+        """
+        decl_re = re.compile(r'^\s*(?:resource|data)\s+"[^"]+"\s+"([^"]+)"\s*\{')
+        renames: Dict[str, str] = {}
+        for line in content.split('\n'):
+            m = decl_re.match(line)
+            if m:
+                label = m.group(1)
+                if label and not re.match(r'[A-Za-z_]', label[0]):
+                    renames[label] = '_' + label
+
+        for old, new in renames.items():
+            # 宣言の 2 番目ラベル "old" → "new"
+            content = re.sub(rf'("\s+)"{re.escape(old)}"(\s*\{{)', rf'\1"{new}"\2', content)
+            # 式中の参照および import コメントの .old → .new
+            content = re.sub(rf'\.{re.escape(old)}\b', f'.{new}', content)
+            self.org_logger.info(f"      リソース名を有効化: {old} → {new} ({rel})")
+        return content
 
     def _rename_bucket_names_in_blocks(
         self, content: str, method: Optional[str], value: str, overrides: Dict[str, str]
@@ -976,28 +1233,66 @@ resource "google_storage_bucket" "mock_bucket" {{
         if not os.path.isdir(active_dir):
             if self.dry_run or self.mock:
                 self.dst_logger.info(f"  active_dir が無いため計画のみログ表示: {active_dir}")
-            else:
-                self.dst_logger.error(f"  active_dir が無いため停止: {active_dir}")
-                sys.exit(1)
+                self.dst_logger.info("  ✓ Step 4 完了")
+                return
+            self.dst_logger.error(f"  active_dir が無いため停止: {active_dir}")
+            sys.exit(1)
 
-        self.run_command(
-            "terraform init", side="local", logger=self.dst_logger,
-            desc="TF Init", explanation="Terraform 初期化",
-            cwd=active_dir,
-        )
-        self.run_command(
-            "terraform plan -out=tfplan", side="local", logger=self.dst_logger,
-            desc="TF Plan", explanation="差分を tfplan に保存して内容を確認可能に",
-            cwd=active_dir,
-        )
-        self.dst_logger.info("  → tfplan を生成しました。dry_run でない場合のみ apply します。")
-        if not self.dry_run:
+        # Terraform はサブディレクトリを再帰しないため、active 直下ではなく
+        # プロジェクトごとの平坦なルート（customize_hcl が active/<project>/ に集約）で
+        # init → plan → apply を実行する。
+        project_dirs = self._collect_terraform_roots(active_dir)
+        if not project_dirs:
+            msg = f"  適用対象の .tf を直下に持つプロジェクトディレクトリが {active_dir} にありません"
+            if self.dry_run or self.mock:
+                self.dst_logger.info(msg + "（dry-run/mock のためスキップ）")
+                self.dst_logger.info("  ✓ Step 4 完了")
+                return
+            self.dst_logger.error(msg)
+            sys.exit(1)
+
+        self.dst_logger.info(f"  対象 Terraform ルート: {len(project_dirs)} 件")
+        for proj_dir in project_dirs:
+            self.dst_logger.info(f"  → Terraform ルート: {proj_dir}")
             self.run_command(
-                "terraform apply -auto-approve tfplan", side="local", logger=self.dst_logger,
-                desc="TF Apply", explanation="先ほど作成した tfplan を適用",
-                cwd=active_dir,
+                "terraform init", side="local", logger=self.dst_logger,
+                desc=f"TF Init {os.path.basename(proj_dir)}",
+                explanation="Terraform 初期化",
+                cwd=proj_dir,
             )
+            self.run_command(
+                "terraform plan -out=tfplan", side="local", logger=self.dst_logger,
+                desc=f"TF Plan {os.path.basename(proj_dir)}",
+                explanation="差分を tfplan に保存して内容を確認可能に",
+                cwd=proj_dir,
+            )
+            self.dst_logger.info("    → tfplan を生成しました。dry_run でない場合のみ apply します。")
+            if not self.dry_run:
+                self.run_command(
+                    "terraform apply -auto-approve tfplan", side="local", logger=self.dst_logger,
+                    desc=f"TF Apply {os.path.basename(proj_dir)}",
+                    explanation="先ほど作成した tfplan を適用",
+                    cwd=proj_dir,
+                )
         self.dst_logger.info("  ✓ Step 4 完了")
+
+    def _collect_terraform_roots(self, active_dir: str) -> List[str]:
+        """active 配下で「直下に .tf を持つ」プロジェクトディレクトリを列挙して返す。
+
+        customize_hcl により各プロジェクトの .tf は active/<project>/ 直下へ平坦化
+        されている前提。直下に .tf が無いディレクトリ（中間階層のみ）は除外する。
+        """
+        roots: List[str] = []
+        for name in sorted(os.listdir(active_dir)):
+            d = os.path.join(active_dir, name)
+            if not os.path.isdir(d):
+                continue
+            try:
+                if any(f.endswith('.tf') for f in os.listdir(d)):
+                    roots.append(d)
+            except OSError:
+                continue
+        return roots
 
     # ============================================================
     # Step 5: GCE VM 復元

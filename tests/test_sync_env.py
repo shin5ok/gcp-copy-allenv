@@ -1,5 +1,6 @@
 import pytest
 import os
+import json
 import tempfile
 import shutil
 import logging
@@ -228,6 +229,109 @@ class TestCheckPrerequisites:
         with pytest.raises(SystemExit) as ei:
             o.check_prerequisites()
         assert ei.value.code == 1
+
+
+# ============================================================
+# check_service_accounts: SA の実在・借用可否・代表権限を実行前に検証
+# ============================================================
+class TestCheckServiceAccounts:
+    def _setup(self, temp_dir, **steps):
+        cfg = _full_config(temp_dir)
+        cfg["steps"] = steps
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def _fake_token(self, *, token_rc=0):
+        """_sa_preflight_run（print-access-token）の差し替え。"""
+        calls = []
+
+        def runner(cmd):
+            calls.append(cmd)
+            if "print-access-token" in cmd:
+                return (token_rc, "" if token_rc else "ya29.fake-token", "" if token_rc else "denied")
+            return (0, "", "")
+
+        runner.calls = calls
+        return runner
+
+    def _fake_perms(self, *, granted=None, unverifiable=False):
+        """_test_iam_permissions の差し替え。granted は付与済み権限の集合。
+        unverifiable=True なら検証不能(None)を返す。"""
+        granted = set(granted or [])
+        calls = []
+
+        def checker(token, project, perms):
+            calls.append((project, set(perms)))
+            if unverifiable:
+                return None
+            return {p for p in perms if p in granted}
+
+        checker.calls = calls
+        return checker
+
+    def test_token_failure_exits(self, temp_dir, monkeypatch):
+        o = self._setup(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_token(token_rc=1)
+        o._test_iam_permissions = self._fake_perms(granted=[])
+        with pytest.raises(SystemExit) as ei:
+            o.check_service_accounts()
+        assert ei.value.code == 1
+
+    def test_missing_permission_exits(self, temp_dir, monkeypatch):
+        # cai_scan のみ有効。borrow は成功するが必要権限を一切返さない → 停止
+        o = self._setup(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_token()
+        o._test_iam_permissions = self._fake_perms(granted=[])
+        with pytest.raises(SystemExit) as ei:
+            o.check_service_accounts()
+        assert ei.value.code == 1
+
+    def test_all_permissions_present_passes(self, temp_dir, monkeypatch):
+        # src: projects.get + cloudasset、dst: projects.get（terraform/data_sync 無効）
+        granted = {
+            "resourcemanager.projects.get",
+            "cloudasset.assets.searchAllResources",
+        }
+        o = self._setup(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_token()
+        o._test_iam_permissions = self._fake_perms(granted=granted)
+        o.check_service_accounts()  # 例外なし
+
+    def test_unverifiable_permission_warns_and_continues(self, temp_dir, monkeypatch):
+        # 借用は成功、権限は検証不能(None) → 警告のみで停止しない
+        o = self._setup(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_token()
+        o._test_iam_permissions = self._fake_perms(unverifiable=True)
+        o.check_service_accounts()  # 例外なし
+
+    def test_skipped_in_mock_mode(self, temp_dir, monkeypatch):
+        o = self._setup(temp_dir, cai_scan={"enabled": True})
+        o.mock = True
+        runner = self._fake_token(token_rc=1)  # 呼ばれたら失敗するはず
+        o._sa_preflight_run = runner
+        o._test_iam_permissions = self._fake_perms(granted=[])
+        o.check_service_accounts()  # スキップされ例外なし
+        assert runner.calls == []  # ランナーは一度も呼ばれない
+
+    def test_disabled_step_perms_not_required(self, temp_dir, monkeypatch):
+        # data_sync 無効なので bigquery/storage 権限は要求されない。
+        # baseline(projects.get) と cai_scan の権限だけで通る。
+        granted = {
+            "resourcemanager.projects.get",
+            "cloudasset.assets.searchAllResources",
+        }
+        o = self._setup(temp_dir, cai_scan={"enabled": True}, data_sync={"enabled": False})
+        o._sa_preflight_run = self._fake_token()
+        checker = self._fake_perms(granted=granted)
+        o._test_iam_permissions = checker
+        o.check_service_accounts()  # 例外なし
+        # bigquery 権限が要求されていないことを確認
+        assert checker.calls and all(
+            not any("bigquery" in p for p in perms) for _proj, perms in checker.calls
+        )
 
 
 # ============================================================
