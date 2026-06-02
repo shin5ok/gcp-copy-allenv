@@ -7,3 +7,14 @@ __pycache__/
 .pytest_cache/
 *.pyc
 exports/
+
+# 生成物・ローカル設定（コミット対象外）
+logs/
+cai_export/
+terraform/
+dst/config.yaml
+
+# Node (claude-code CLI 等の付随ツール)
+node_modules/
+package.json
+package-lock.json
