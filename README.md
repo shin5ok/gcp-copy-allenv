@@ -15,12 +15,28 @@
   curl -sSf https://rye.astral.sh/get | bash  # または pipx install uv
   ```
 
-### 2. GCP 認証の実行
-デプロイやスキャンを実行する端末で、GCPへのアクセス権限を設定します。
+### 2. GCP 認証と安全なアクセス設定 (推奨)
+本ツールはセキュリティ向上のため、サービスアカウントキー (JSONファイル) は使用せず、**サービスアカウントの権限借用 (Impersonation)** を使用します。
+
+1. 実行ユーザーで gcloud にログインします。
+   ```bash
+   gcloud auth login
+   ```
+2. 実行ユーザーに対し、移行用サービスアカウントに対する「サービス アカウント トークン作成者 (`roles/iam.serviceAccountTokenCreator`)」ロールが付与されていることを確認してください。
+
+### 3. 設定ファイル (config.yaml) の準備
+移行の動作設定やプロジェクトのマッピングは `dst/config.yaml` で管理します。
+テンプレートからファイルをコピーし、お使いの環境に合わせて編集してください。
+
 ```bash
-gcloud auth login
-gcloud auth application-default login
+cp dst/config.yaml.template dst/config.yaml
 ```
+
+設定ファイルには以下を定義します：
+- コピー元とコピー先のプロジェクトIDマッピング
+- 各プロジェクト操作用の借用対象サービスアカウント (コピー元は読み取り専用推奨)
+- リソースのリネームルール (GCSバケット等)
+- 各ステップの有効/無効および個別設定 (スナップショットの期限など)
 
 ---
 
@@ -75,22 +91,12 @@ make snapshot-all ARGS="-y"
 
 取得したバックアップスナップショットを利用し、新しい別のコピー先（Destination）プロジェクト群に、データごと環境を完全クローンするシナリオです。
 
-#### 必要な情報（事前準備）
-複製を実行する前に、以下の「プロジェクトIDマッピング情報」を整理してください。
-- **コピー元プロジェクトID**: Host (`shingo-ar-sharedhost0926`), Service 1, Service 3
-
-#### 準備: コピー先プロジェクトIDを環境変数としてエクスポートする
-実機スキャン完了後、コピー先となる新しいプロジェクトID群を環境変数（シェル変数）として定義します。これにより、以降のコマンドをマッピング文字列を編集することなくコピペで実行できます。
-
-```bash
-# コピー先のGCPプロジェクトIDをそれぞれ設定します
-export DST_HOST_PROJECT_ID="your-destination-host-project-id"      # コピー先ホスト
-export DST_SVC1_PROJECT_ID="your-destination-service1-project-id"  # コピー先サービス1 (Debian)
-export DST_SVC3_PROJECT_ID="your-destination-service3-project-id"  # コピー先サービス3 (Ubuntu)
-```
+#### 準備: 設定ファイル (`dst/config.yaml`) の作成と編集
+実機スキャンを行う前に、`dst/config.yaml.template` から `dst/config.yaml` を作成し、コピー元とコピー先のプロジェクトIDマッピング、権限借用するサービスアカウント、およびGCSリネームルール等を適切に設定してください。
 
 #### Step 2.1: オリジナル実機環境の自動スキャン・分析 (`make scan-org`)
 静的定義ファイルに頼らず、現在実際にGCP上で稼働しているオリジナルインフラの実態を動的にディスカバー（探索）し、コピー先の設計図となる `dst/DST.md` を自動生成します。
+※この操作は `dst/config.yaml` に設定されたOriginal用サービスアカウント（読み取り専用推奨）の権限借用を用いて安全に実行されます。
 ```bash
 make scan-org
 ```
@@ -99,20 +105,21 @@ make scan-org
 
 #### Step 2.2: コピー先プロジェクトのAPI事前自動有効化 (`make prepare-dst`)
 コピー先でインフラ構築を走らせる前に、デプロイに必要な最小限のAPI（Compute Engine, Cloud DNS）を一撃で並列有効化し、構築エラーを完全に防止します。
+※設定はすべて `dst/config.yaml` から自動的に読み込まれます。
 ```bash
-make prepare-dst ARGS="--project-map shingo-ar-sharedhost0926=$DST_HOST_PROJECT_ID,shingo-ar-sharedservice0926-1=$DST_SVC1_PROJECT_ID,shingo-ar-sharedservice0926-3=$DST_SVC3_PROJECT_ID -y"
+make prepare-dst
 ```
 
 #### Step 2.3: 同期クローン（復元）のドライラン確認
-プロジェクトIDの置換およびスナップショットからクローン復元される実行計画を目視確認します。
+プロジェクトIDの置換、GCSバケットのリネームルール適用、および1ヶ月以内に作成された有効なスナップショットからクローン復元される実行計画を目視確認します。
 ```bash
-make sync-to-dst ARGS="--project-map shingo-ar-sharedhost0926=$DST_HOST_PROJECT_ID,shingo-ar-sharedservice0926-1=$DST_SVC1_PROJECT_ID,shingo-ar-sharedservice0926-3=$DST_SVC3_PROJECT_ID --dry-run"
+make sync-to-dst ARGS="--dry-run"
 ```
 
 #### Step 2.4: スナップショットからの完全同期複製の実行 (`make sync-to-dst`)
 クローンデプロイを実行します。
 ```bash
-make sync-to-dst ARGS="--project-map shingo-ar-sharedhost0926=$DST_HOST_PROJECT_ID,shingo-ar-sharedservice0926-1=$DST_SVC1_PROJECT_ID,shingo-ar-sharedservice0926-3=$DST_SVC3_PROJECT_ID -y"
+make sync-to-dst
 ```
 > 🚀 **完全同期クローンのメカニズム**
 > 1. 新しいコピー先ホストプロジェクトに、共有VPC、サブネット、NAT、IAP SSH FW等のネットワークインフラを自動構築。
