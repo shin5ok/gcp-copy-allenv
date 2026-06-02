@@ -26,14 +26,16 @@ set -euo pipefail
 CONFIG="dst/config.yaml"
 APPLY=false
 IMPERSONATOR=""
-ROLE="roles/editor"
+# 付与ロール。roles/editor は data-plane 権限（storage.objects.* / bigquery.tables.* 等）を
+# 含まないため、Step 6（GCS/BQ 同期）用に storage.admin / bigquery.admin も付与する。
+ROLES=("roles/editor" "roles/storage.admin" "roles/bigquery.admin")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply)        APPLY=true; shift ;;
     --config)       CONFIG="$2"; shift 2 ;;
     --impersonator) IMPERSONATOR="$2"; shift 2 ;;
-    --role)         ROLE="$2"; shift 2 ;;
+    --role)         ROLES=("$2"); shift 2 ;;
     -h|--help)
       sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "不明な引数: $1" >&2; exit 1 ;;
@@ -85,7 +87,7 @@ echo " copy-all-env  dst 借用SA ブートストラップ"
 echo "============================================================"
 echo "  config       = ${CONFIG}"
 echo "  impersonator = ${IMPERSONATOR}"
-echo "  role         = ${ROLE}"
+echo "  roles        = ${ROLES[*]}"
 echo "  mode         = $([[ "${APPLY}" == true ]] && echo APPLY || echo 'DRY-RUN（表示のみ。実行は --apply）')"
 echo "------------------------------------------------------------"
 
@@ -156,10 +158,12 @@ while IFS=$'\t' read -r PROJ EMAIL; do
     wait_for_sa "${EMAIL}" "${PROJ}"
   fi
 
-  # 2) 編集ロールを付与（伝播遅延に備えてリトライ）
-  run_retry gcloud projects add-iam-policy-binding "${PROJ}" \
-    --member="serviceAccount:${EMAIL}" \
-    --role="${ROLE}" --condition=None
+  # 2) 各ロールを付与（伝播遅延に備えてリトライ）
+  for ROLE in "${ROLES[@]}"; do
+    run_retry gcloud projects add-iam-policy-binding "${PROJ}" \
+      --member="serviceAccount:${EMAIL}" \
+      --role="${ROLE}" --condition=None
+  done
 
   # 3) 実行アカウントにこの SA の借用権限を付与
   run_retry gcloud iam service-accounts add-iam-policy-binding "${EMAIL}" \
