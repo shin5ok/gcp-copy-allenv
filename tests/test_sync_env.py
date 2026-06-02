@@ -1,137 +1,349 @@
 import pytest
-from scripts.sync_env import EnvConfig, SubnetConfig, VMConfig, GCPClonerGenerator, parse_project_map
+import os
+import tempfile
+import shutil
+import logging
+import yaml
+from scripts.sync_env import (
+    MigrationOrchestrator,
+    is_src_read_only,
+    is_known_mock_command,
+    validate_config,
+)
 
-def test_project_mapping_parser():
-    map_str = "src-host=dst-host,src-svc1=dst-svc1,src-svc3=dst-svc3"
-    proj_map = parse_project_map(map_str)
-    
-    assert len(proj_map) == 3
-    assert proj_map["src-host"] == "dst-host"
-    assert proj_map["src-svc1"] == "dst-svc1"
-    assert proj_map["src-svc3"] == "dst-svc3"
 
-def test_generator_apply_project_mapping():
-    config = EnvConfig(host_project="src-host")
-    config.service_projects = ["src-svc1", "src-svc3"]
-    config.subnets.append(SubnetConfig(name="subnet-1", ip_range="10.0.1.0/24", project="src-svc1"))
-    config.vms["src-svc1"] = [
-        VMConfig(name="vm-1", machine_type="e2-medium", image="debian-12", zone="asia-northeast1-a", subnet="subnet-1", ip_address="10.0.1.11")
-    ]
-    
-    proj_map = {
-        "src-host": "dst-host",
-        "src-svc1": "dst-svc1",
-        "src-svc3": "dst-svc3"
+@pytest.fixture
+def temp_dir():
+    dirpath = tempfile.mkdtemp()
+    yield dirpath
+    shutil.rmtree(dirpath)
+
+
+def _full_config(temp_dir, **overrides):
+    """テスト用に最小限正しい config を生成。"""
+    base = {
+        "global": {
+            "log_dir": os.path.join(temp_dir, "logs"),
+            "dry_run": True,
+            "verbose_logging": True,
+            "mock": False,
+            "parallel_jobs": 1,
+        },
+        "project_mapping": {
+            "host_project": {
+                "src": "src-host",
+                "dst": "dst-host",
+                "src_impersonate_service_account": "viewer@src-host.iam.gserviceaccount.com",
+                "dst_impersonate_service_account": "owner@dst-host.iam.gserviceaccount.com",
+            },
+            "service_projects": [
+                {
+                    "src": "src-svc-1",
+                    "dst": "dst-svc-1",
+                    "src_impersonate_service_account": "viewer@src-svc-1.iam.gserviceaccount.com",
+                    "dst_impersonate_service_account": "owner@dst-svc-1.iam.gserviceaccount.com",
+                },
+            ],
+        },
+        "rename_rules": {"gcs": {"method": "suffix", "value": "-dst-0602"}},
+        "steps": {},
     }
-    
-    cloner = GCPClonerGenerator(config, proj_map)
-    cloner.apply_project_mapping()
-    
-    # Verify mapped values
-    assert cloner.config.host_project == "dst-host"
-    assert cloner.config.service_projects == ["dst-svc1", "dst-svc3"]
-    assert cloner.config.subnets[0].project == "dst-svc1"
-    
-    # Verify VM map key substitution
-    assert "dst-svc1" in cloner.config.vms
-    assert "src-svc1" not in cloner.config.vms
-    assert cloner.config.vms["dst-svc1"][0].name == "vm-1"
+    # overrides で深いマージ
+    for k, v in overrides.items():
+        base[k] = v
+    return base
 
-def test_sync_generator_stages():
-    config = EnvConfig(host_project="src-host")
-    config.service_projects = ["src-svc1"]
-    
-    # Include both tool-defined subnet and a custom pre-existing subnet to verify filtering
-    config.subnets.append(SubnetConfig(name="subnet-svc1", ip_range="10.100.1.0/24", project="src-svc1"))
-    config.subnets.append(SubnetConfig(name="tokyo", ip_range="10.0.0.0/16", project="src-host"))
-    
-    config.vms["src-svc1"] = [
-        VMConfig(
-            name="org-svc1-deb-e2-std4-01",
-            machine_type="e2-standard-4",
-            image="debian-12",
-            zone="asia-northeast1-a",
-            subnet="subnet-svc1",
-            ip_address="10.100.1.11"
+
+def _write_yaml(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f)
+
+
+# ============================================================
+# ORG 保護: is_src_read_only
+# ============================================================
+class TestSrcReadOnlyGuard:
+    def test_list_describe_get_pass(self):
+        assert is_src_read_only("gcloud compute instances list --project=p")
+        assert is_src_read_only("gcloud compute snapshots describe foo --project=p")
+        assert is_src_read_only("gcloud asset search-all-resources --scope=projects/p")
+        assert is_src_read_only("bq ls --project_id=p")
+        assert is_src_read_only("bq show --project_id=p ds")
+
+    def test_bulk_export_is_read_only(self):
+        # bulk-export はローカルに HCL を書くだけで src は変更しない
+        assert is_src_read_only(
+            "gcloud beta resource-config bulk-export --project=p --path=./tf"
         )
-    ]
-    
-    proj_map = {
-        "src-host": "dst-host",
-        "src-svc1": "dst-svc1"
+
+    def test_write_verbs_blocked(self):
+        assert not is_src_read_only("gcloud compute instances create vm --project=p")
+        assert not is_src_read_only("gcloud compute disks delete d --project=p")
+        assert not is_src_read_only("gcloud compute instances stop vm --project=p")
+        assert not is_src_read_only("gcloud services enable compute.googleapis.com --project=p")
+        assert not is_src_read_only("bq mk --project_id=p ds")
+        assert not is_src_read_only("bq cp src:ds.t dst:ds.t")
+        assert not is_src_read_only("terraform apply -auto-approve")
+        assert not is_src_read_only("gcloud storage rsync gs://a gs://b")
+
+    def test_flag_values_not_false_positive(self):
+        # --format=value(creationTimestamp) には create が含まれるが、フラグ値は無視されるべき
+        assert is_src_read_only(
+            "gcloud compute snapshots list --project=p "
+            "--format='value(name,creationTimestamp)'"
+        )
+
+
+# ============================================================
+# Mock: 既知コマンドの判定
+# ============================================================
+class TestMockKnownCommand:
+    def test_known(self):
+        assert is_known_mock_command("gcloud compute instances list --project=p")
+        assert is_known_mock_command("bq mk --project_id=p ds")
+        assert is_known_mock_command("terraform apply -auto-approve")
+
+    def test_unknown_is_blocked(self):
+        # mock 時はこの種のコマンドは fail-closed されるべき
+        assert not is_known_mock_command("gcloud projects describe p")
+        assert not is_known_mock_command("gcloud iam policy-bindings list")
+
+
+# ============================================================
+# validate_config
+# ============================================================
+class TestValidateConfig:
+    def test_ok(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        assert validate_config(cfg) == []
+
+    def test_missing_mapping(self):
+        assert validate_config({}) == ["project_mapping が定義されていません"]
+
+    def test_src_eq_dst_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"]["host_project"]["dst"] = cfg["project_mapping"]["host_project"]["src"]
+        errors = validate_config(cfg)
+        assert any("src と dst が同一" in e for e in errors)
+
+    def test_dst_collides_with_src_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"]["service_projects"][0]["dst"] = "src-host"  # host の src と衝突
+        errors = validate_config(cfg)
+        assert any("dst" in e and "src" in e for e in errors)
+
+    def test_missing_impersonate_sa_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"]["host_project"]["src_impersonate_service_account"] = ""
+        errors = validate_config(cfg)
+        assert any("src_impersonate_service_account" in e for e in errors)
+
+    def test_empty_service_projects_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"]["service_projects"] = []
+        errors = validate_config(cfg)
+        assert any("service_projects" in e for e in errors)
+
+
+# ============================================================
+# load_config: バリデーション失敗で sys.exit
+# ============================================================
+class TestLoadConfigFailsFast:
+    def test_load_config_fails_on_bad_mapping(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"]["host_project"]["dst"] = cfg["project_mapping"]["host_project"]["src"]
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        with pytest.raises(SystemExit) as ei:
+            o.load_config()
+        assert ei.value.code == 1
+
+
+# ============================================================
+# run_command: ORG 保護
+# ============================================================
+class TestRunCommandSafety:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_src_without_sa_exits(self, temp_dir):
+        o = self._setup(temp_dir)
+        with pytest.raises(SystemExit):
+            o.run_command(
+                "gcloud compute instances list --project=src-host",
+                side="src", logger=o.org_logger,
+                impersonate_sa=None,  # ← これが原因で停止すべき
+            )
+
+    def test_src_write_verb_exits(self, temp_dir):
+        o = self._setup(temp_dir)
+        with pytest.raises(SystemExit):
+            o.run_command(
+                "gcloud compute instances create vm --project=src-host",
+                side="src", logger=o.org_logger,
+                impersonate_sa="viewer@src-host.iam.gserviceaccount.com",
+            )
+
+    def test_invalid_side_exits(self, temp_dir):
+        o = self._setup(temp_dir)
+        with pytest.raises(SystemExit):
+            o.run_command(
+                "anything", side="hacker", logger=o.org_logger,
+            )
+
+    def test_dst_dry_run_returns_empty(self, temp_dir):
+        o = self._setup(temp_dir)
+        # dry_run=True かつ side=dst なら実行されず空文字
+        ret = o.run_command(
+            "gcloud compute instances create vm --project=dst-host",
+            side="dst", logger=o.dst_logger,
+            impersonate_sa="owner@dst-host.iam.gserviceaccount.com",
+        )
+        assert ret == ""
+
+    def test_mock_unknown_command_exits(self, temp_dir):
+        cfg = _full_config(temp_dir, **{"global": {
+            "log_dir": os.path.join(temp_dir, "logs"),
+            "dry_run": False, "verbose_logging": False, "mock": True, "parallel_jobs": 1,
+        }})
+        # 必須キーを足す（_full_config が上書きされた global を更に補完）
+        cfg["global"]["org_log_file"] = "org.log"
+        cfg["global"]["dst_log_file"] = "dst.log"
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        assert o.mock is True
+        with pytest.raises(SystemExit):
+            o.run_command(
+                # _MOCK_KNOWN_PATTERNS にない gcloud projects describe
+                "gcloud projects describe dst-host",
+                side="dst", logger=o.dst_logger,
+                impersonate_sa="owner@dst-host.iam.gserviceaccount.com",
+            )
+
+
+# ============================================================
+# customize_hcl: name 置換が bucket ブロック内に限定されるか
+# ============================================================
+class TestCustomizeHcl:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_only_bucket_name_renamed_not_vm_name(self, temp_dir):
+        o = self._setup(temp_dir)
+        raw = os.path.join(temp_dir, "raw")
+        active = os.path.join(temp_dir, "active")
+        os.makedirs(raw)
+        sample = """
+resource "google_compute_instance" "vm" {
+  name = "org-vm-01"
+  project = "src-host"
+}
+
+resource "google_storage_bucket" "b" {
+  name = "src-bucket-data"
+  project = "src-svc-1"
+}
+"""
+        with open(os.path.join(raw, "mixed.tf"), "w", encoding="utf-8") as f:
+            f.write(sample)
+        o.customize_hcl(raw, active)
+        with open(os.path.join(active, "mixed.tf"), "r", encoding="utf-8") as f:
+            out = f.read()
+        # VM name は変えない
+        assert 'name = "org-vm-01"' in out
+        # bucket name は suffix が付く
+        assert 'name = "src-bucket-data-dst-0602"' in out
+        # project ID 置換は単語境界で正しく行われている
+        assert 'project = "dst-host"' in out
+        assert 'project = "dst-svc-1"' in out
+        assert "src-host" not in out
+        assert "src-svc-1" not in out
+
+    def test_project_id_word_boundary(self, temp_dir):
+        """src ID が他の単語と prefix 重複した場合に誤置換しないこと。"""
+        # config を src='proj' / dst='dest' に上書き
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        cfg["project_mapping"]["host_project"]["src"] = "proj"
+        cfg["project_mapping"]["host_project"]["dst"] = "dest"
+        cfg["project_mapping"]["service_projects"] = [
+            {"src": "proj-1", "dst": "dest-1",
+             "src_impersonate_service_account": "a@x", "dst_impersonate_service_account": "b@x"},
+        ]
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+
+        raw = os.path.join(temp_dir, "raw")
+        active = os.path.join(temp_dir, "active")
+        os.makedirs(raw)
+        sample = '''
+project_a = "proj"
+project_b = "proj-1"
+unrelated = "main-proj-2"
+'''
+        with open(os.path.join(raw, "ids.tf"), "w", encoding="utf-8") as f:
+            f.write(sample)
+        o.customize_hcl(raw, active)
+        with open(os.path.join(active, "ids.tf"), "r", encoding="utf-8") as f:
+            out = f.read()
+        assert 'project_a = "dest"' in out
+        assert 'project_b = "dest-1"' in out
+        # 'main-proj-2' の中の 'proj' は置換されないこと
+        assert 'unrelated = "main-proj-2"' in out
+
+    def test_boot_disk_source_removed(self, temp_dir):
+        o = self._setup(temp_dir)
+        raw = os.path.join(temp_dir, "raw")
+        active = os.path.join(temp_dir, "active")
+        os.makedirs(raw)
+        sample = """
+resource "google_compute_instance" "v" {
+  name = "vm"
+  boot_disk {
+    auto_delete = true
+    device_name = "disk-0"
+    initialize_params {
+      image = "debian-12"
     }
-    
-    cloner = GCPClonerGenerator(config, proj_map, network_name="dst-vpc", region="asia-northeast1")
-    cloner.apply_project_mapping()
-    stages = cloner.generate_sync_stages()
-    
-    # Expected 4 replication stages
-    assert len(stages) == 4
-    
-    # Stage 1: VPC & Host Setup (Sequential)
-    assert stages[0].name == "VPC & Host Setup"
-    assert not stages[0].is_parallel
-    assert len(stages[0].steps) == 9
-    # Assert destination host project substitution in VPC network step
-    assert stages[0].steps[0].resource_type == "VPC Network"
-    assert stages[0].steps[0].check_cmd == "gcloud compute networks describe dst-vpc --project=dst-host --format='value(name)'"
-    assert stages[0].steps[0].create_cmd == "gcloud compute networks create dst-vpc --subnet-mode=custom --project=dst-host"
-    
-    # Stage 2: Subnet Creation (Parallel)
-    assert stages[1].name == "Subnet Creation"
-    assert stages[1].is_parallel
-    # Verify that 'tokyo' subnet is filtered out because it doesn't start with 'subnet-'
-    assert len(stages[1].steps) == 1
-    assert stages[1].steps[0].resource_type == "Subnet"
-    assert stages[1].steps[0].resource_name == "subnet-svc1"
-    assert stages[1].steps[0].check_cmd == "gcloud compute networks subnets describe subnet-svc1 --region=asia-northeast1 --project=dst-host --format='value(name)'"
-    assert stages[1].steps[0].create_cmd == "gcloud compute networks subnets create subnet-svc1 --network=dst-vpc --range=10.100.1.0/24 --region=asia-northeast1 --project=dst-host"
+    source = "https://www.googleapis.com/compute/v1/projects/src-host/zones/asia-northeast1-a/disks/vm"
+  }
+}
+"""
+        with open(os.path.join(raw, "vm.tf"), "w", encoding="utf-8") as f:
+            f.write(sample)
+        o.customize_hcl(raw, active)
+        with open(os.path.join(active, "vm.tf"), "r", encoding="utf-8") as f:
+            out = f.read()
+        assert "source =" not in out
+        assert "device_name = " in out
 
-    # Stage 3: Disk Cloning from Snapshot (Parallel) - RESTORE STAGE
-    assert stages[2].name == "Disk Cloning from Snapshot"
-    assert stages[2].is_parallel
-    assert len(stages[2].steps) == 1
-    
-    # Disk restore command must point to ORIGINAL snapshot path but create disk in DESTINATION project
-    assert stages[2].steps[0].resource_type == "Disk"
-    assert stages[2].steps[0].resource_name == "org-svc1-deb-e2-std4-01-disk"
-    assert stages[2].steps[0].check_cmd == "gcloud compute disks describe org-svc1-deb-e2-std4-01-disk --zone=asia-northeast1-a --project=dst-svc1 --format='value(name)'"
-    # source-snapshot points to global path in original 'src-svc1' project, while project is destination 'dst-svc1'
-    assert stages[2].steps[0].create_cmd == "gcloud compute disks create org-svc1-deb-e2-std4-01-disk --source-snapshot=projects/src-svc1/global/snapshots/org-svc1-deb-e2-std4-01 --zone=asia-northeast1-a --project=dst-svc1 --quiet"
 
-    # Stage 4: VM Cloned Provisioning (Parallel) - LAUNCH STAGE
-    assert stages[3].name == "VM Cloned Provisioning"
-    assert stages[3].is_parallel
-    assert len(stages[3].steps) == 1
-    
-    assert stages[3].steps[0].resource_type == "VM Instance"
-    assert stages[3].steps[0].resource_name == "org-svc1-deb-e2-std4-01"
-    assert stages[3].steps[0].check_cmd == "gcloud compute instances describe org-svc1-deb-e2-std4-01 --zone=asia-northeast1-a --project=dst-svc1 --format='value(name)'"
-    # Launches from restored boot disk 'org-svc1-deb-e2-std4-01-disk', auto-delete=yes, no metadata startup-script
-    subnet_path = "projects/dst-host/regions/asia-northeast1/subnetworks/subnet-svc1"
-    assert stages[3].steps[0].create_cmd == f"gcloud compute instances create org-svc1-deb-e2-std4-01 --disk=name=org-svc1-deb-e2-std4-01-disk,boot=yes,auto-delete=yes --subnet={subnet_path} --private-network-ip=10.100.1.11 --zone=asia-northeast1-a --project=dst-svc1 --no-address --quiet --machine-type=e2-standard-4"
-
-def test_build_api_enablement_stage_from_projects():
-    from scripts.sync_env import build_api_enablement_stage_from_projects
-    
-    projects = ["dst-host", "dst-svc1"]
-    stage = build_api_enablement_stage_from_projects(projects)
-    
-    assert stage.name == "API Enablement"
-    assert stage.is_parallel
-    assert len(stage.steps) == 2
-    
-    # Assert Step 1: dst-host
-    assert stage.steps[0].resource_type == "API"
-    assert stage.steps[0].resource_name == "dst-host"
-    assert stage.steps[0].project == "dst-host"
-    assert stage.steps[0].check_cmd == "gcloud services list --enabled --project=dst-host --format='value(config.name)' | grep -w compute.googleapis.com"
-    assert stage.steps[0].create_cmd == "gcloud services enable compute.googleapis.com dns.googleapis.com --project=dst-host --quiet"
-    
-    # Assert Step 2: dst-svc1
-    assert stage.steps[1].resource_type == "API"
-    assert stage.steps[1].resource_name == "dst-svc1"
-    assert stage.steps[1].project == "dst-svc1"
-    assert stage.steps[1].check_cmd == "gcloud services list --enabled --project=dst-svc1 --format='value(config.name)' | grep -w compute.googleapis.com"
-    assert stage.steps[1].create_cmd == "gcloud services enable compute.googleapis.com dns.googleapis.com --project=dst-svc1 --quiet"
-
+# ============================================================
+# ログディレクトリ: 実行ごとに新規作成
+# ============================================================
+class TestLogging:
+    def test_per_run_dir_created(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        assert os.path.isdir(o.run_dir)
+        assert os.path.exists(os.path.join(o.run_dir, "org.log"))
+        assert os.path.exists(os.path.join(o.run_dir, "dst.log"))
