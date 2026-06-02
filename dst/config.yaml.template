@@ -1,0 +1,124 @@
+# ==============================================================================
+# GCP Project "Marugoto Copy" Configuration Template
+# ==============================================================================
+# このファイルを `config.yaml` にコピーし、環境に合わせて値を編集してください。
+# 例: cp dst/config.yaml.template dst/config.yaml
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. 共通設定 (Global Settings)
+# ------------------------------------------------------------------------------
+global:
+  # ログの出力先ディレクトリ。
+  log_dir: "./logs"
+
+  # コピー元（Original）の作業ログファイル名（log_dir内）
+  # コピー元からの情報取得やスナップショット確認などのログが記録されます。
+  org_log_file: "org.log"
+
+  # コピー先（Destination）の作業ログファイル名（log_dir内）
+  # コピー先でのリソース作成やデータ移行などのログが記録されます。
+  dst_log_file: "dst.log"
+
+  # 並列実行数。
+  # GCEのコピーやデータ移行など、並列処理が可能なステップで使用されます。
+  parallel_jobs: 4
+
+  # ドライランモード (デフォルト: true)
+  # true の場合、実際のリソース作成やデータのコピーは行わず、実行されるコマンドの表示のみ行います。
+  # 本番実行時は明示的に `false` に設定してください。
+  dry_run: true
+
+  # 詳細ログの出力 (デフォルト: true)
+  # true の場合、実行された生の gcloud/terraform コマンド文字列と、
+  # 人間が理解しやすい実行目的の補足説明がログに詳細に出力されます。
+  verbose_logging: true
+
+# ------------------------------------------------------------------------------
+# 1.5. 事前準備設定 (Provisioning / Bootstrap Settings)
+# ------------------------------------------------------------------------------
+# コピー先プロジェクトを新規作成する場合に必要な設定です。
+# make コマンドによる事前準備（プロジェクト作成）時に使用されます。
+bootstrap:
+  # 組織ID (Organization ID)
+  org_id: "123456789012"
+  # フォルダID (Folder ID) - 任意。指定された場合はフォルダ配下にプロジェクトを作成します。
+  # folder_id: "987654321098"
+  # 請求先アカウントID (Billing Account ID) - 必須。作成したプロジェクトに紐付けます。
+  billing_account: "012345-6789AB-CDEF01"
+
+# ------------------------------------------------------------------------------
+# 2. プロジェクトマッピング定義 (Project Mapping)
+# ------------------------------------------------------------------------------
+# コピー元 (src) とコピー先 (dst) のプロジェクトIDを正確に指定してください。
+# 安全のため、サービスアカウントキー (JSON) は使用せず、サービスアカウントの権限借用 (Impersonation) を使用します。
+# コピー元 (src) には読み取り専用権限 (Viewer等) のサービスアカウントを、
+# コピー先 (dst) にはリソース作成権限 (Editor等) のサービスアカウントのメールアドレスを指定してください。
+# ※実行ユーザーが、対象SAに対して「サービス アカウント トークン作成者 (roles/iam.serviceAccountTokenCreator)」権限を持っている必要があります。
+project_mapping:
+  # 共有VPCホストプロジェクト
+  host_project:
+    src: "shingo-ar-sharedhost0926"
+    dst: "dst-sharedhost"
+    src_impersonate_service_account: "org-host-viewer@shingo-ar-sharedhost0926.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
+    dst_impersonate_service_account: "dst-host-owner@dst-sharedhost.iam.gserviceaccount.com"            # [必須] コピー先用 (作成/編集権限が必要)
+  
+  # サービスプロジェクトのリスト (複数指定可能)
+  service_projects:
+    - src: "shingo-ar-sharedservice0926-1"
+      dst: "dst-sharedservice-1"
+      src_impersonate_service_account: "org-svc1-viewer@shingo-ar-sharedservice0926-1.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
+      dst_impersonate_service_account: "dst-svc1-owner@dst-sharedservice-1.iam.gserviceaccount.com"            # [必須] コピー先用 (作成/編集権限が必要)
+    - src: "shingo-ar-sharedservice0926-3"
+      dst: "dst-sharedservice-3"
+      src_impersonate_service_account: "org-svc3-viewer@shingo-ar-sharedservice0926-3.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
+      dst_impersonate_service_account: "dst-svc3-owner@dst-sharedservice-3.iam.gserviceaccount.com"            # [必須] コピー先用 (作成/編集権限が必要)
+
+# ------------------------------------------------------------------------------
+# 3. リネームルール設定 (Rename Rules)
+# ------------------------------------------------------------------------------
+# グローバルユニークである必要があるリソース（GCSバケット等）のリネーム規則を定義します。
+# コピー先環境での名前衝突を避けるために使用されます。
+rename_rules:
+  # GCSバケットのリネーム設定
+  gcs:
+    method: "suffix"                  # 'suffix' (接尾辞追加), 'prefix' (接頭辞追加), または 'custom'
+    value: "-dst-0602"                # methodが 'suffix' または 'prefix' の場合に付与する文字列
+    # 個別マッピング (特定のバケット名を明示的に指定したい場合に使用)
+    # overrides:
+    #   "original-bucket-name": "exact-destination-bucket-name"
+
+# ------------------------------------------------------------------------------
+# 4. ステップ制御 (Step Control)
+# ------------------------------------------------------------------------------
+# 各手順の実行有無 (enabled) および個別設定を行います。
+steps:
+  # [Step 1] Cloud Asset Inventory (CAI) での現状確認
+  cai_scan:
+    enabled: true
+    output_dir: "./cai_export"
+
+  # [Step 2] GCE Snapshot の準備
+  gce_snapshot:
+    enabled: true
+    prefix: "migration-snap"
+    # 許容するスナップショットの最大作成経過日数 (デフォルト: 30日)
+    # データの新鮮さを保証するため、この期間内に作成されたスナップショットがない場合はエラーにします。
+    max_age_days: 30
+
+  # [Step 3] gcloud bulk-export によるIaC化 (Terraformコード生成)
+  bulk_export:
+    enabled: true
+    output_dir: "./terraform"
+
+  # [Step 4] dst へIaCでの再現 (Terraform適用)
+  terraform_apply:
+    enabled: true
+
+  # [Step 5] GCE VM 復元 (スナップショットから復元したディスクをVMに紐付け起動)
+  gce_restore:
+    enabled: true
+
+  # [Step 6] データの移行 (GCS, BigQueryなど)
+  data_sync:
+    enabled: true

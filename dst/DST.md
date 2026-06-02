@@ -52,11 +52,11 @@ OSはすべて **Debian 12** (`debian-12`) を使用します。
 
 | インスタンス名 | マシンタイプ | OSイメージ | ゾーン | サブネット | 内部固定IPアドレス |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `org-svc1-deb-e2-std4-01` | `e2-standard-4` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.11` |
-| `org-svc1-deb-e2-std4-02` | `e2-standard-4` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.12` |
-| `org-svc1-deb-e2-std4-03` | `e2-standard-4` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.13` |
-| `org-svc1-deb-n2-std4-01` | `n2-standard-4` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.14` |
-| `org-svc1-deb-n2-std4-02` | `n2-standard-4` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.15` |
+| `org-svc1-deb-e2-mic-01` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.11` |
+| `org-svc1-deb-e2-mic-02` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.12` |
+| `org-svc1-deb-e2-mic-03` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.13` |
+| `org-svc1-deb-n2-std2-01` | `n2-standard-2` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.14` |
+| `org-svc1-deb-n2-std2-02` | `n2-standard-2` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.15` |
 
 ### 3.2. Service Project 2 (`shingo-ar-sharedservice0926-3`)
 
