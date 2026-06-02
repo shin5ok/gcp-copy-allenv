@@ -37,6 +37,19 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 3. **コピー元 (src) には読み取り専用 (Viewer 等)**、**コピー先 (dst) には編集権限 (Editor 等)** の
    SA を指定します（後述の `config.yaml`）。
 
+> 🧰 **コピー元 (src) の借用 SA を一括セットアップ**
+> `config.yaml` の `src_impersonate_service_account` に指定した読み取り専用 SA を、各 src プロジェクトに
+> 作成・権限付与するヘルパースクリプトを用意しています。**この処理だけは ORG (src) への書き込みを伴う**ため、
+> `sync_env.py` の ORG 保護とは意図的に分離した手動セットアップ用です（既定は dry-run）。
+> ```bash
+> scripts/bootstrap_src_sa.sh                          # dry-run（実行されるコマンドの表示のみ）
+> scripts/bootstrap_src_sa.sh --apply                  # 実際に SA 作成・ロール付与
+> scripts/bootstrap_src_sa.sh --apply --impersonator user:foo@example.com
+> ```
+> 付与内容（各 src プロジェクトごと）: `roles/viewer`（compute / GCS / BigQuery の read）、
+> `roles/cloudasset.viewer`（CAI スキャン・bulk-export 用）、および実行アカウントへの
+> `roles/iam.serviceAccountTokenCreator`（= SA 借用権限）。
+
 ### 3. 設定ファイル (config.yaml) の準備
 テンプレートからコピーして、環境に合わせて編集します。
 
@@ -45,11 +58,12 @@ cp dst/config.yaml.template dst/config.yaml
 ```
 
 `dst/config.yaml` で定義する主な項目:
-- **`project_mapping`**: コピー元 (src) とコピー先 (dst) のプロジェクト ID、および借用 SA。
+- **`project_mapping`**: コピー元 (src) とコピー先 (dst) のプロジェクト ID、および借用 SA
+  (`src_impersonate_service_account` / `dst_impersonate_service_account`)。`host_project` と `service_projects` を定義します。
 - **`rename_rules`**: GCS バケット等のグローバルユニークなリソースのリネーム規則。
 - **`steps`**: 各ステップ (1〜6) の有効/無効と個別設定（スナップショット期限など）。
-- **`global`**: `dry_run` / `verbose_logging` / `mock` / `parallel_jobs` / `log_dir`。
-- **`bootstrap`**: コピー先プロジェクトを新規作成する場合の組織 ID / 請求先アカウント。
+- **`global`**: `dry_run` / `verbose_logging` / `parallel_jobs` / `log_dir` / `org_log_file` / `dst_log_file`。
+- **`bootstrap`**: コピー先プロジェクトを新規作成する場合の組織 ID / フォルダ ID（任意） / 請求先アカウント。
 
 ---
 
