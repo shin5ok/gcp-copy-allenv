@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *)",
+      "Bash(make *)",
+      "Bash(uv *)",
+      "Bash(terraform *)",
+      "Bash(gcloud *)",
+      "Bash(bq *)",
+      "Bash(python3 *)",
+      "Bash(PYTHONPATH=. *)",
+      "Bash(CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=* *)",
+      "Bash(scripts/*.sh *)",
+      "Bash(chmod +x *)",
+      "Bash(nohup *)",
+      "Bash(bash -n *)",
+      "Bash(cat *)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(ls *)",
+      "Bash(tail *)",
+      "Bash(head *)",
+      "Bash(wc *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(rm -rf terraform/raw/* terraform/active/*)",
+      "Bash(sleep *)",
+      "Bash(pgrep *)",
+      "Bash(curl *)",
+      "Read(/tmp/**)",
+      "Read(terraform/**)",
+      "Read(logs/**)"
+    ]
+  }
+}

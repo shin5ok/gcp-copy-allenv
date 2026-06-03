@@ -1069,10 +1069,8 @@ resource "google_storage_bucket" "mock_bucket" {{
                     f"番号置換をスキップします。"
                 )
 
-    # ----- HCL のカスタマイズ（バグ修正版） -----
-    def customize_hcl(self, raw_dir: str, active_dir: str):
-        self.org_logger.info(f"  HCL カスタマイズ: {raw_dir} → {active_dir}")
-
+    def _build_proj_id_map(self) -> Dict[str, str]:
+        """src プロジェクト ID → dst プロジェクト ID の対応を config から作る。"""
         mapping = self.config.get('project_mapping', {})
         proj_map: Dict[str, str] = {}
         host = mapping.get('host_project', {})
@@ -1081,6 +1079,13 @@ resource "google_storage_bucket" "mock_bucket" {{
         for svc in mapping.get('service_projects', []):
             if svc.get('src') and svc.get('dst'):
                 proj_map[svc['src']] = svc['dst']
+        return proj_map
+
+    # ----- HCL のカスタマイズ（バグ修正版） -----
+    def customize_hcl(self, raw_dir: str, active_dir: str):
+        self.org_logger.info(f"  HCL カスタマイズ: {raw_dir} → {active_dir}")
+
+        proj_map = self._build_proj_id_map()
 
         rename_gcs = self.config.get('rename_rules', {}).get('gcs', {})
         gcs_method = rename_gcs.get('method')
@@ -1238,6 +1243,15 @@ resource "google_storage_bucket" "mock_bucket" {{
             m = re.search(r'\baccount_id\s*=\s*"([^"]+)"', content)
             if m and not re.match(r'^[a-z]([-a-z0-9]*[a-z0-9])?$', m.group(1)):
                 return f"作成不能なデフォルト SA: account_id={m.group(1)}"
+
+        # VM とディスクは Step 5（スナップショット復元）が管理する。
+        # terraform での create/replace は Step 5 の復元と衝突するためスキップ。
+        # Step 4 は VPC/サービス/SA 等のインフラを担当し、VM 実体は Step 5 任せ。
+        if 'resource "google_compute_instance"' in content:
+            return "VM は Step5（スナップショット復元）が管理するため除外"
+        if 'resource "google_compute_disk"' in content and \
+                re.search(r'\bsource_snapshot\b', content):
+            return "スナップショット起源の disk は Step5 が管理するため除外"
 
         # NAT 用に自動払い出しされる外部 IP は手動作成できない。
         if 'resource "google_compute_address"' in content and \
@@ -1668,15 +1682,26 @@ resource "google_storage_bucket" "mock_bucket" {{
         if not buckets_str:
             self.dst_logger.info("    バケット無し / 取得失敗")
             return
+        # customize_hcl と同じ規則で dst バケット名を算出する:
+        #   1) バケット名に含まれる src プロジェクト ID を dst ID に置換（単語境界）
+        #   2) override / suffix / prefix のリネーム規則を適用
+        # （Step 4 が作る dst バケット名と一致させないと rsync 先が 404 になる）
+        proj_map = self._build_proj_id_map()
         for orig in [b.strip() for b in buckets_str.split('\n') if b.strip()]:
-            if orig in overrides:
-                dst_bucket = overrides[orig]
+            base = orig
+            for s in sorted(proj_map.keys(), key=len, reverse=True):
+                base = re.sub(
+                    rf'(?<![A-Za-z0-9_-]){re.escape(s)}(?![A-Za-z0-9_-])',
+                    proj_map[s], base,
+                )
+            if base in overrides:
+                dst_bucket = overrides[base]
             elif method == 'suffix':
-                dst_bucket = f"{orig}{value}"
+                dst_bucket = f"{base}{value}"
             elif method == 'prefix':
-                dst_bucket = f"{value}{orig}"
+                dst_bucket = f"{value}{base}"
             else:
-                dst_bucket = orig
+                dst_bucket = base
             self.dst_logger.info(f"    gs://{orig} → gs://{dst_bucket}")
             self.run_command(
                 f"gcloud storage rsync gs://{orig} gs://{dst_bucket} --recursive --project={dst_proj}",
