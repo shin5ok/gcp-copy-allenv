@@ -83,7 +83,11 @@ rename_rules:
   # GCSバケットのリネーム設定
   gcs:
     method: "suffix"                  # 'suffix' (接尾辞追加), 'prefix' (接頭辞追加), または 'custom'
-    value: "-dst-0602"                # methodが 'suffix' または 'prefix' の場合に付与する文字列
+    value: "auto"                     # 付与文字列。固定文字列を指定するか、"auto" にすると
+                                      # 日付ベースの一意値を自動生成 (suffix例: "-dst-MMDDHHMM")。
+                                      # 生成値は terraform/.gcs_rename_value に保存され、
+                                      # plan/run・skip_on_run 間で同じ値が再利用される。
+                                      # 別名で作り直したい場合はこのファイルを削除する。
     # 個別マッピング (特定のバケット名を明示的に指定したい場合に使用)
     # overrides:
     #   "original-bucket-name": "exact-destination-bucket-name"
@@ -110,6 +114,11 @@ steps:
   bulk_export:
     enabled: true
     output_dir: "./terraform"
+    # true にすると本番実行 (`make run` = --no-dry-run) では bulk-export と
+    # customize を**スキップ**し、既存の terraform/active/ を再利用する。
+    # `make plan` (dry-run) には影響しない（plan では常に最新を取り直す）。
+    # 用途: make plan で生成済みの active をそのまま使って run を高速化したいとき。
+    skip_on_run: false
 
   # [Step 4] dst へIaCでの再現 (Terraform適用)
   terraform_apply:

@@ -993,9 +993,30 @@ resource "google_storage_bucket" "mock_bucket" {{
         projects = list(self._iter_src_projects())
         log_stage_header(self.org_logger, 3, "Terraform エクスポートと HCL カスタマイズ", len(projects))
 
-        output_dir_base = self.config.get('steps', {}).get('bulk_export', {}).get('output_dir', './terraform')
+        bulk_cfg = self.config.get('steps', {}).get('bulk_export', {})
+        output_dir_base = bulk_cfg.get('output_dir', './terraform')
         raw_dir = os.path.join(output_dir_base, 'raw')
         active_dir = os.path.join(output_dir_base, 'active')
+
+        # `make run` 時のみ skip。`make plan` (dry-run) と mock では従来どおり実行し、
+        # active が無い・空の場合は安全側で実行する。
+        if bulk_cfg.get('skip_on_run') and not self.dry_run and not self.mock:
+            has_active = os.path.isdir(active_dir) and any(
+                any(f.endswith('.tf') for f in os.listdir(os.path.join(active_dir, d)))
+                for d in os.listdir(active_dir)
+                if os.path.isdir(os.path.join(active_dir, d))
+            )
+            if has_active:
+                self.org_logger.info(
+                    f"  skip_on_run=true: bulk-export と customize をスキップし、既存 {active_dir} を再利用"
+                )
+                # apply 時に proj_num_map が空だと数字置換できないため、ここで構築する。
+                self._build_project_number_map()
+                self.org_logger.info("  ✓ Step 3 完了（スキップ）")
+                return
+            self.org_logger.warning(
+                f"  skip_on_run=true だが {active_dir} に .tf が無いため、安全側で通常実行"
+            )
 
         if not self.dry_run:
             # raw 全体を作り直す。過去の mock ダミーや別 config の export 残骸
@@ -1090,15 +1111,131 @@ resource "google_storage_bucket" "mock_bucket" {{
                 proj_map[svc['src']] = svc['dst']
         return proj_map
 
+    def _resolve_gcs_rename_value(self, rename_gcs: Dict) -> str:
+        """rename_rules.gcs.value を解決する。
+
+        value が 'auto'（大文字小文字無視）のときは日付ベースの一意な値を生成する。
+        - suffix:  "-dst-MMDDHHMM"
+        - prefix:  "dst-MMDDHHMM-"
+        生成値は output_dir 配下の .gcs_rename_value に永続化し、`make plan` と
+        `make run`、および skip_on_run で別プロセスにまたがっても **同じ値**を使う。
+        ファイルが既にあればそれを再利用する（移行ごとに変えたい場合は削除する）。
+        非 auto の場合は設定値をそのまま返す。
+        """
+        raw = (rename_gcs.get('value') or '')
+        if raw.strip().lower() != 'auto':
+            return raw
+        method = rename_gcs.get('method', 'suffix')
+        out_base = self.config.get('steps', {}).get('bulk_export', {}).get('output_dir', './terraform')
+        marker = os.path.join(out_base, '.gcs_rename_value')
+
+        # 既存の生成値があれば再利用（plan→run / skip_on_run の整合）。
+        try:
+            with open(marker, encoding='utf-8') as f:
+                cached = f.read().strip()
+            if cached:
+                return cached
+        except OSError:
+            pass
+
+        import datetime
+        stamp = datetime.datetime.now().strftime('%m%d%H%M')
+        token = f"dst-{stamp}"
+        value = f"-{token}" if method == 'suffix' else f"{token}-"
+
+        if not self.mock:
+            try:
+                os.makedirs(out_base, exist_ok=True)
+                with open(marker, 'w', encoding='utf-8') as f:
+                    f.write(value)
+                self.org_logger.info(f"  GCS リネーム値を自動生成: '{value}'（{marker} に保存）")
+            except OSError as e:
+                self.org_logger.warning(f"  GCS リネーム値の保存に失敗（継続）: {e}")
+        else:
+            self.org_logger.info(f"  GCS リネーム値を自動生成（mock・非永続）: '{value}'")
+        return value
+
+    def _build_network_label_map(
+        self, raw_dir: str, proj_map: Dict[str, str]
+    ) -> Dict[tuple, str]:
+        """raw 配下の全 .tf を走査し、google_compute_network を
+        {(dst_project, network_name): resource_label} で返す。
+        後段の URL → terraform 参照書き換えで使う。
+        """
+        result: Dict[tuple, str] = {}
+        if not os.path.isdir(raw_dir):
+            return result
+        # resource "google_compute_network" "<label>" { ... project = "<p>" ... name = "<n>" ... }
+        block_re = re.compile(
+            r'resource\s+"google_compute_network"\s+"([A-Za-z_][\w-]*)"\s*\{([^}]*)\}',
+            re.DOTALL,
+        )
+        for root, _dirs, files in os.walk(raw_dir):
+            for file in files:
+                if not file.endswith('.tf'):
+                    continue
+                try:
+                    with open(os.path.join(root, file), encoding='utf-8') as f:
+                        content = f.read()
+                except OSError:
+                    continue
+                if 'google_compute_network' not in content:
+                    continue
+                for m in block_re.finditer(content):
+                    label = m.group(1)
+                    body = m.group(2)
+                    pm = re.search(r'\bproject\s*=\s*"([^"]+)"', body)
+                    nm = re.search(r'\bname\s*=\s*"([^"]+)"', body)
+                    if not pm or not nm:
+                        continue
+                    src_proj = pm.group(1)
+                    dst_proj = proj_map.get(src_proj, src_proj)
+                    result[(dst_proj, nm.group(1))] = label
+        return result
+
+    def _rewrite_network_refs(self, content: str, net_map: Dict[tuple, str]) -> str:
+        """同一プロジェクト内の network URL を terraform 参照 (self_link) に変換する。
+
+        - ファイルが属する project を判定するため `project = "..."` を読む
+          （customize の ID 置換後なので dst プロジェクト ID になっている）。
+        - そのプロジェクト直下の `.../projects/<proj>/global/networks/<name>` 文字列を
+          `google_compute_network.<label>.self_link` に置換する。
+        - 他プロジェクトの network URL（クロスプロジェクト Shared VPC 参照など）は
+          別 root module に居るためここでは触らない。
+        """
+        if 'networks/' not in content or 'google_compute_network' in content and 'resource ' in content:
+            # 自プロジェクトの project = を取得（複数あっても同一前提）
+            pass
+        pm = re.search(r'\bproject\s*=\s*"([^"]+)"', content)
+        if not pm:
+            return content
+        proj = pm.group(1)
+        url_pat = re.compile(
+            r'"https://www\.googleapis\.com/compute/v1/projects/'
+            + re.escape(proj)
+            + r'/global/networks/([A-Za-z0-9_.-]+)"'
+        )
+
+        def repl(m: re.Match) -> str:
+            label = net_map.get((proj, m.group(1)))
+            if not label:
+                return m.group(0)
+            return f"google_compute_network.{label}.self_link"
+
+        return url_pat.sub(repl, content)
+
     # ----- HCL のカスタマイズ（バグ修正版） -----
     def customize_hcl(self, raw_dir: str, active_dir: str):
         self.org_logger.info(f"  HCL カスタマイズ: {raw_dir} → {active_dir}")
 
         proj_map = self._build_proj_id_map()
+        # 同プロジェクト内 network 参照を terraform 参照に変えるためのマップ
+        # {(dst_project, network_name): resource_label}
+        net_label_map = self._build_network_label_map(raw_dir, proj_map)
 
         rename_gcs = self.config.get('rename_rules', {}).get('gcs', {})
         gcs_method = rename_gcs.get('method')
-        gcs_val = rename_gcs.get('value', '')
+        gcs_val = self._resolve_gcs_rename_value(rename_gcs)
         gcs_overrides = rename_gcs.get('overrides', {}) or {}
 
         if not os.path.isdir(raw_dir):
@@ -1176,6 +1313,15 @@ resource "google_storage_bucket" "mock_bucket" {{
                     #    bulk-export はプロジェクト番号由来で数字始まりのラベルを
                     #    生成することがあり、そのままでは構文エラーになる。
                     content = self._sanitize_resource_names(content, rel)
+
+                    # 1.7. 同プロジェクト内の network URL を terraform 参照に変換。
+                    #    bulk-export は network = "https://.../networks/<name>" の
+                    #    ハードコード URL を出すため、firewall/subnetwork からの
+                    #    暗黙の depends_on が効かず apply 順で network より先に
+                    #    firewall を作ろうとして 404 になる。同 root module 内に
+                    #    定義された google_compute_network を参照表記に書き換え、
+                    #    Terraform に依存関係を理解させる。
+                    content = self._rewrite_network_refs(content, net_label_map)
 
                     # 2. google_storage_bucket リソース「ブロック内」の name のみリネーム。
                     #    以前のバグ: ファイル単位で全 name を書き換えていたため VM/FW 等も
@@ -1442,9 +1588,17 @@ resource "google_storage_bucket" "mock_bucket" {{
             self.dst_logger.error(msg)
             sys.exit(1)
 
+        proj_map = self._build_proj_id_map()
         self.dst_logger.info(f"  対象 Terraform ルート: {len(project_dirs)} 件")
         for proj_dir in project_dirs:
             self.dst_logger.info(f"  → Terraform ルート: {proj_dir}")
+            # dst プロジェクトが前回と変わった（= 別環境への移行）場合、前回の
+            # terraform.tfstate は旧プロジェクトのリソースを指したままで、import が
+            # 「既に state にある」と誤判定し、plan で新プロジェクトへ再作成 → 既存と
+            # 衝突（409）する。dst が変わっていれば state を破棄して import からやり直す。
+            dst_proj = proj_map.get(os.path.basename(proj_dir))
+            if not self.dry_run and not self.mock and dst_proj:
+                self._reset_stale_state_if_needed(proj_dir, dst_proj)
             self.run_command(
                 "terraform init", side="local", logger=self.dst_logger,
                 desc=f"TF Init {os.path.basename(proj_dir)}",
@@ -1471,6 +1625,49 @@ resource "google_storage_bucket" "mock_bucket" {{
                 )
         self.dst_logger.info("  ✓ Step 4 完了")
 
+    def _reset_stale_state_if_needed(self, proj_dir: str, dst_proj: str):
+        """active/<src> の terraform state が現在の dst プロジェクト用でなければ破棄する。
+
+        - `.dst_project` マーカーがあり中身が現 dst と異なる → stale。
+        - マーカーが無い旧 state は、state 本文に現 dst プロジェクト ID が一度も
+          現れない（=別プロジェクト用）なら stale とみなす。
+        stale なら terraform.tfstate（+backup）、.terraform、lock を削除し、
+        import からクリーンにやり直せるようにする。最後にマーカーを現 dst で更新。
+        """
+        marker = os.path.join(proj_dir, ".dst_project")
+        state = os.path.join(proj_dir, "terraform.tfstate")
+        stale = False
+        if os.path.exists(marker):
+            try:
+                stale = open(marker, encoding="utf-8").read().strip() != dst_proj
+            except OSError:
+                stale = False
+        elif os.path.exists(state):
+            try:
+                txt = open(state, encoding="utf-8").read()
+            except OSError:
+                txt = ""
+            # リソースを持つ state なのに現 dst プロジェクトを一切参照していない＝旧環境用。
+            if '"resources"' in txt and len(txt) > 200 and dst_proj not in txt:
+                stale = True
+
+        if stale:
+            self.dst_logger.warning(
+                f"    stale state を検出（dst={dst_proj} 用ではない）。state を破棄して再取り込み: {proj_dir}"
+            )
+            for f in (state, state + ".backup", os.path.join(proj_dir, ".terraform.lock.hcl")):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            shutil.rmtree(os.path.join(proj_dir, ".terraform"), ignore_errors=True)
+
+        try:
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(dst_proj)
+        except OSError:
+            pass
+
     def _terraform_import_existing(self, proj_dir: str):
         """apply 前に既存リソースを terraform state へ取り込み、再実行を冪等にする。
 
@@ -1479,20 +1676,29 @@ resource "google_storage_bucket" "mock_bucket" {{
         実在しないリソースの import 失敗は無視（best-effort）。
         - 一部リソースは comment の id 形式が古い/不正なので補正する:
           * google_project_iam_custom_role は `proj##role` → `projects/proj/roles/role`
-        - google_storage_bucket は名前変更しており comment の id が一致しないため除外
-          （存在しなければ新規作成、存在すれば apply で衝突しないよう別途リネーム済み）。
+        - google_storage_bucket は名前変更しているため comment の id は使わず、.tf 本体の
+          実際の `name`（リネーム後）を import id にして adopt する。これにより前回 run で
+          作成済みのバケットも state に取り込まれ、再 apply が冪等になる。
         """
         import glob
         pairs: List[tuple] = []
         for tf in sorted(glob.glob(os.path.join(proj_dir, "*.tf"))):
             try:
                 with open(tf, encoding="utf-8") as f:
-                    for line in f:
-                        m = re.match(r'#\s*terraform import\s+(\S+)\s+(.+?)\s*$', line)
-                        if m:
-                            pairs.append((m.group(1), m.group(2)))
+                    content = f.read()
             except OSError:
                 continue
+            cm = re.search(r'#\s*terraform import\s+(\S+)\s+(.+?)\s*$', content, re.MULTILINE)
+            if not cm:
+                continue
+            addr, imp_id = cm.group(1), cm.group(2)
+            if addr.startswith("google_storage_bucket."):
+                # リネーム後の実名を本体から取得して import id にする。
+                nm = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+                if not nm:
+                    continue
+                imp_id = nm.group(1)
+            pairs.append((addr, imp_id))
         if not pairs:
             return
         self.dst_logger.info(f"    既存リソースの取り込みを試行: {len(pairs)} 件")
@@ -1500,8 +1706,6 @@ resource "google_storage_bucket" "mock_bucket" {{
         skipped_already = 0
         failed: List[tuple] = []
         for addr, imp_id in pairs:
-            if addr.startswith("google_storage_bucket."):
-                continue  # リネーム済みのため comment id は不一致。新規作成に任せる。
             if addr.startswith("google_project_iam_custom_role.") and "##" in imp_id:
                 proj, role = imp_id.split("##", 1)
                 imp_id = f"projects/{proj}/roles/{role}"
@@ -1685,7 +1889,7 @@ resource "google_storage_bucket" "mock_bucket" {{
 
         rename_gcs = self.config.get('rename_rules', {}).get('gcs', {})
         gcs_method = rename_gcs.get('method')
-        gcs_val = rename_gcs.get('value', '')
+        gcs_val = self._resolve_gcs_rename_value(rename_gcs)
         gcs_overrides = rename_gcs.get('overrides', {}) or {}
 
         for src_proj, dst_proj, src_sa, dst_sa in pairs:
