@@ -421,30 +421,33 @@ class TestCustomizeHcl:
         raw = os.path.join(temp_dir, "raw")
         active = os.path.join(temp_dir, "active")
         os.makedirs(raw)
-        sample = """
+        # VM は Step5 が管理するため terraform からスキップ → 別ファイルにする
+        vm_sample = """
 resource "google_compute_instance" "vm" {
   name = "org-vm-01"
   project = "src-host"
 }
-
+"""
+        bucket_sample = """
 resource "google_storage_bucket" "b" {
   name = "src-bucket-data"
   project = "src-svc-1"
 }
 """
-        with open(os.path.join(raw, "mixed.tf"), "w", encoding="utf-8") as f:
-            f.write(sample)
+        with open(os.path.join(raw, "vm.tf"), "w", encoding="utf-8") as f:
+            f.write(vm_sample)
+        with open(os.path.join(raw, "bucket.tf"), "w", encoding="utf-8") as f:
+            f.write(bucket_sample)
         o.customize_hcl(raw, active)
-        with open(os.path.join(active, "mixed.tf"), "r", encoding="utf-8") as f:
+        # VM ファイルは Step5 管理のためスキップ（active に生成されない）
+        assert not os.path.exists(os.path.join(active, "vm.tf"))
+        # bucket は生成される
+        with open(os.path.join(active, "bucket.tf"), "r", encoding="utf-8") as f:
             out = f.read()
-        # VM name は変えない
-        assert 'name = "org-vm-01"' in out
         # bucket name は suffix が付く
         assert 'name = "src-bucket-data-dst-0602"' in out
-        # project ID 置換は単語境界で正しく行われている
-        assert 'project = "dst-host"' in out
+        # project ID 置換
         assert 'project = "dst-svc-1"' in out
-        assert "src-host" not in out
         assert "src-svc-1" not in out
 
     def test_project_id_word_boundary(self, temp_dir):
@@ -482,6 +485,9 @@ unrelated = "main-proj-2"
         assert 'unrelated = "main-proj-2"' in out
 
     def test_boot_disk_source_removed(self, temp_dir):
+        # VM は Step5 管理のため customize でスキップされる。
+        # boot_disk.source 除去のロジックは _strip_boot_disk_source で引き続き存在するが
+        # VM ファイル自体が active に書き出されないことを確認する。
         o = self._setup(temp_dir)
         raw = os.path.join(temp_dir, "raw")
         active = os.path.join(temp_dir, "active")
@@ -502,10 +508,8 @@ resource "google_compute_instance" "v" {
         with open(os.path.join(raw, "vm.tf"), "w", encoding="utf-8") as f:
             f.write(sample)
         o.customize_hcl(raw, active)
-        with open(os.path.join(active, "vm.tf"), "r", encoding="utf-8") as f:
-            out = f.read()
-        assert "source =" not in out
-        assert "device_name = " in out
+        # VM は Step5 管理のためスキップ → active に出力されない
+        assert not os.path.exists(os.path.join(active, "vm.tf"))
 
 
 # ============================================================
