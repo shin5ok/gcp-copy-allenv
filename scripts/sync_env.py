@@ -1249,9 +1249,8 @@ resource "google_storage_bucket" "mock_bucket" {{
         # Step 4 は VPC/サービス/SA 等のインフラを担当し、VM 実体は Step 5 任せ。
         if 'resource "google_compute_instance"' in content:
             return "VM は Step5（スナップショット復元）が管理するため除外"
-        if 'resource "google_compute_disk"' in content and \
-                re.search(r'\bsource_snapshot\b', content):
-            return "スナップショット起源の disk は Step5 が管理するため除外"
+        if 'resource "google_compute_disk"' in content:
+            return "disk は Step5（スナップショット復元）が管理するため除外"
 
         # NAT 用に自動払い出しされる外部 IP は手動作成できない。
         if 'resource "google_compute_address"' in content and \
@@ -1489,19 +1488,35 @@ resource "google_storage_bucket" "mock_bucket" {{
             return
         self.dst_logger.info(f"    既存リソースの取り込みを試行: {len(pairs)} 件")
         imported = 0
+        skipped_already = 0
+        failed: List[tuple] = []
         for addr, imp_id in pairs:
             if addr.startswith("google_storage_bucket."):
                 continue  # リネーム済みのため comment id は不一致。新規作成に任せる。
             if addr.startswith("google_project_iam_custom_role.") and "##" in imp_id:
                 proj, role = imp_id.split("##", 1)
                 imp_id = f"projects/{proj}/roles/{role}"
-            rc, _o, _e = self._sa_preflight_run(
+            rc, _o, err = self._sa_preflight_run(
                 f"terraform -chdir={proj_dir} import -input=false -lock=false "
                 f"'{addr}' '{imp_id}'"
             )
             if rc == 0:
                 imported += 1
-        self.dst_logger.info(f"    取り込み成功: {imported} 件（既存 state / 不在は無視）")
+                continue
+            # "Resource already managed by Terraform" は state に既にあるだけなので無視
+            low = (err or "").lower()
+            if "already managed by terraform" in low or "resource address" in low and "already" in low:
+                skipped_already += 1
+                continue
+            # 存在しないリソースの import は無視（dst にまだ無いだけ＝apply で作成）
+            if "cannot import non-existent remote object" in low or "status code: 404" in low:
+                continue
+            failed.append((addr, imp_id, (err or "").strip().splitlines()[-1] if err else ""))
+        self.dst_logger.info(
+            f"    取り込み結果: 成功={imported} 件 / 既存スキップ={skipped_already} 件 / 失敗={len(failed)} 件"
+        )
+        for addr, imp_id, last in failed[:10]:
+            self.dst_logger.warning(f"      import 失敗: {addr} ← {imp_id} : {last}")
 
     def _collect_terraform_roots(self, active_dir: str) -> List[str]:
         """active 配下で「直下に .tf を持つ」プロジェクトディレクトリを列挙して返す。
