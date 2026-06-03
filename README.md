@@ -75,6 +75,26 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > `roles/cloudasset.viewer`（CAI スキャン・bulk-export 用）、および実行アカウントへの
 > `roles/iam.serviceAccountTokenCreator`（= SA 借用権限）。
 
+> 🧰 **コピー先 (dst) 側の一括ブートストラップ（`make bootstrap` / `make bootstrap-apply`）**
+> 新しい dst プロジェクト群を用意した直後は、(a) dst SA、(b) dst SA に対する src 読取権限、
+> (c) Shared VPC 構成 の 3 点が未整備で `make plan` の SA 事前チェックが落ちます。これらを
+> まとめてセットアップする Make ターゲットを用意しています（既定は dry-run）。
+> ```bash
+> make bootstrap          # 3 つを順に dry-run（実行されるコマンドの表示のみ）
+> make bootstrap-apply    # 3 つを --apply で実行（dst と src(ORG) に IAM/構成を書き込みます）
+> # 個別に流したい場合
+> make bootstrap-dst-sa-apply           # dst SA 作成 + editor/storage.admin/bigquery.admin + tokenCreator
+> make bootstrap-cross-project-apply    # dst SA に src の migrationSrcReader + bigquery.dataViewer
+> make bootstrap-shared-vpc-apply       # host を Shared VPC 化、svc をアタッチ、networkUser 付与
+> ```
+> 中身（呼び出されるスクリプト）:
+> - `scripts/bootstrap_dst_sa.sh` … dst SA を各 dst プロジェクトに作成し、`roles/editor`・`roles/storage.admin`・`roles/bigquery.admin` と、実行アカウントへの `roles/iam.serviceAccountTokenCreator` を付与。
+> - `scripts/bootstrap_cross_project.sh` … 各 src プロジェクトに read-only カスタムロール `migrationSrcReader` を作成し、対応する dst SA に付与（さらに `roles/bigquery.dataViewer`）。**src(ORG) への read-only IAM 付与**を伴うため、`sync_env.py` の ORG 保護から意図的に分離されています。
+> - `scripts/bootstrap_shared_vpc.sh` … dst host を Shared VPC ホストにし、dst svc プロジェクトをアタッチ、各 svc の cloudservices/compute SA と svc 借用 SA に `roles/compute.networkUser` を付与。
+>
+> SA 事前チェックで dst SA の借用に失敗した場合、`make plan` / `make run` の停止メッセージに
+> 上記コマンドが自動表示されます。
+
 ### 3. 設定ファイル (config.yaml) の準備
 テンプレートからコピーして、環境に合わせて編集します。
 
@@ -99,6 +119,11 @@ cp dst/config.yaml.template dst/config.yaml
 | `make setup` | uv 仮想環境の同期・セットアップ |
 | `make projects-plan` | コピー先プロジェクト作成の **ドライラン** |
 | `make projects` | コピー先プロジェクトを実際に作成（請求紐付け + API 有効化） |
+| `make bootstrap` | dst SA / src 読取権限 / Shared VPC を順に **ドライラン** で表示 |
+| `make bootstrap-apply` | 上記 3 つを `--apply` で実行（dst と src(ORG) に IAM/構成を書き込み） |
+| `make bootstrap-dst-sa-apply` | dst SA 作成 + ロール付与のみ実行 |
+| `make bootstrap-cross-project-apply` | dst SA → src の読取権限のみ実行 |
+| `make bootstrap-shared-vpc-apply` | Shared VPC 化のみ実行 |
 | `make plan` | 移行処理の **ドライラン**（実行計画の表示のみ。ORG 書き込みなし） |
 | `make mock` | **Mock モード** でローカル試走（GCP 未接続でも動作） |
 | `make run` | 移行処理の **本番実行**（dst への書き込みを伴う） |
@@ -113,7 +138,8 @@ cp dst/config.yaml.template dst/config.yaml
 ```mermaid
 graph TD
     A[dst/config.yaml を準備] --> B[make projects-plan / projects]
-    B --> C[make plan: 計画をドライラン確認]
+    B --> B2[make bootstrap / bootstrap-apply]
+    B2 --> C[make plan: 計画をドライラン確認]
     C --> D[make mock: ローカル試走で動作検証]
     D --> E[make run: 本番クローン実行]
     E --> F[logs/<timestamp>/ をレビュー]
@@ -123,6 +149,13 @@ graph TD
 ```bash
 make projects-plan   # 何が作成されるか確認
 make projects        # 実際に作成（org_id / billing_account が必要）
+```
+
+### Step 0.5: SA / IAM / Shared VPC のブートストラップ
+新規 dst プロジェクトでは、続けて以下を実行して SA・読取権限・Shared VPC を整えます。
+```bash
+make bootstrap         # 3 スクリプトを順に dry-run（内容を確認）
+make bootstrap-apply   # 確認できたら --apply で実行
 ```
 
 ### Step 1: 実行計画のドライラン確認

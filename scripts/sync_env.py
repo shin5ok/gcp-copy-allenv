@@ -542,11 +542,20 @@ class MigrationOrchestrator:
             checked_sas.add(sa)
 
         if errors:
+            has_dst_impersonate_failure = any(
+                ("dst SA" in e) and ("借用（impersonate）できません" in e) for e in errors
+            )
             print("=" * 60, file=sys.stderr)
             print(" [SA事前チェック] サービスアカウントに問題があります。処理を中止します:", file=sys.stderr)
             for e in errors:
                 print(f"  - {e}", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
+            if has_dst_impersonate_failure:
+                print(" 対処: dst SA がまだ作成されていない可能性があります。", file=sys.stderr)
+                print("   まず dry-run で内容確認:  make bootstrap", file=sys.stderr)
+                print("   実際に作成/付与:         make bootstrap-apply", file=sys.stderr)
+                print("   個別:  make bootstrap-dst-sa-apply / bootstrap-cross-project-apply / bootstrap-shared-vpc-apply", file=sys.stderr)
+                print("=" * 60, file=sys.stderr)
             sys.exit(1)
 
         self.org_logger.info(
