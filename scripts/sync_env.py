@@ -46,6 +46,17 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud asset search-all-resources",
     "gcloud beta resource-config bulk-export",
     "gcloud compute instances list",
+    "gcloud compute instances describe",
+    "gcloud compute instances create",
+    "gcloud compute disks describe",
+    "gcloud compute networks list",
+    "gcloud compute networks describe",
+    "gcloud compute networks create",
+    "gcloud compute networks subnets list",
+    "gcloud compute networks subnets describe",
+    "gcloud compute networks subnets create",
+    "gcloud storage buckets describe",
+    "gcloud storage buckets create",
     "gcloud compute instances stop",
     "gcloud compute instances start",
     "gcloud compute instances detach-disk",
@@ -714,9 +725,27 @@ class MigrationOrchestrator:
                  "creationTimestamp": now},
             ])
 
+        if cmd.strip().startswith("gcloud compute networks subnets list"):
+            logger.info(f"{tag}[MOCK] サブネット一覧をシミュレート ({proj_id})")
+            return json.dumps([
+                {"name": "subnet-svc1", "region": f"projects/{proj_id}/regions/asia-northeast1",
+                 "ipCidrRange": "10.100.1.0/24",
+                 "network": f"projects/{proj_id}/global/networks/shared-vpc"},
+            ])
+
+        if cmd.strip().startswith("gcloud compute networks list"):
+            logger.info(f"{tag}[MOCK] VPC 一覧をシミュレート ({proj_id})")
+            return json.dumps([
+                {"name": "default", "autoCreateSubnetworks": True},
+                {"name": "shared-vpc", "autoCreateSubnetworks": False},
+            ])
+
         if cmd.strip().startswith("gcloud storage buckets list"):
             logger.info(f"{tag}[MOCK] バケット一覧をシミュレート ({proj_id})")
-            return "org-bucket-shared-data\norg-assets-bucket\n"
+            return json.dumps([
+                {"name": "org-bucket-shared-data", "location": "US"},
+                {"name": "org-assets-bucket", "location": "US"},
+            ])
 
         if cmd.strip().startswith("bq ls"):
             logger.info(f"{tag}[MOCK] BigQuery 一覧をシミュレート ({proj_id})")
@@ -1007,16 +1036,58 @@ resource "google_storage_bucket" "mock_bucket" {{
                 if os.path.isdir(os.path.join(active_dir, d))
             )
             if has_active:
-                self.org_logger.info(
-                    f"  skip_on_run=true: bulk-export と customize をスキップし、既存 {active_dir} を再利用"
+                # active/<src>/.dst_project と現 config の dst を突き合わせ、
+                # dst プロジェクトが変わっていれば古い番号/ID 置換結果が残った
+                # active を再利用するわけにはいかない（apply で 403 になる）。
+                # その場合は raw が残っていれば bulk-export だけ省略し、
+                # customize_hcl を必ず再実行する。
+                proj_map = self._build_proj_id_map()
+                stale_projects: List[str] = []
+                for src_name in os.listdir(active_dir):
+                    d = os.path.join(active_dir, src_name)
+                    if not os.path.isdir(d):
+                        continue
+                    expected_dst = proj_map.get(src_name)
+                    if not expected_dst:
+                        continue
+                    marker = os.path.join(d, ".dst_project")
+                    cur = ""
+                    if os.path.exists(marker):
+                        try:
+                            cur = open(marker, encoding="utf-8").read().strip()
+                        except OSError:
+                            cur = ""
+                    if cur != expected_dst:
+                        stale_projects.append(f"{src_name}({cur or '不明'}→{expected_dst})")
+
+                if stale_projects:
+                    self.org_logger.warning(
+                        "  skip_on_run=true だが dst プロジェクトが変わっています: "
+                        + ", ".join(stale_projects)
+                    )
+                    if os.path.isdir(raw_dir):
+                        self.org_logger.info(
+                            f"  raw を再利用し customize_hcl のみ再実行: {raw_dir}"
+                        )
+                        self._build_project_number_map()
+                        self.customize_hcl(raw_dir, active_dir)
+                        self.org_logger.info("  ✓ Step 3 完了（customize のみ再実行）")
+                        return
+                    self.org_logger.warning(
+                        f"  raw も無いため bulk-export から通常実行: {raw_dir}"
+                    )
+                else:
+                    self.org_logger.info(
+                        f"  skip_on_run=true: bulk-export と customize をスキップし、既存 {active_dir} を再利用"
+                    )
+                    # apply 時に proj_num_map が空だと数字置換できないため、ここで構築する。
+                    self._build_project_number_map()
+                    self.org_logger.info("  ✓ Step 3 完了（スキップ）")
+                    return
+            else:
+                self.org_logger.warning(
+                    f"  skip_on_run=true だが {active_dir} に .tf が無いため、安全側で通常実行"
                 )
-                # apply 時に proj_num_map が空だと数字置換できないため、ここで構築する。
-                self._build_project_number_map()
-                self.org_logger.info("  ✓ Step 3 完了（スキップ）")
-                return
-            self.org_logger.warning(
-                f"  skip_on_run=true だが {active_dir} に .tf が無いため、安全側で通常実行"
-            )
 
         if not self.dry_run:
             # raw 全体を作り直す。過去の mock ダミーや別 config の export 残骸
@@ -1110,6 +1181,18 @@ resource "google_storage_bucket" "mock_bucket" {{
             if svc.get('src') and svc.get('dst'):
                 proj_map[svc['src']] = svc['dst']
         return proj_map
+
+    def _build_dst_sa_map(self) -> Dict[str, str]:
+        """src プロジェクト ID → dst impersonate SA メールアドレス の対応を作る。
+
+        active/<src>/ ディレクトリに置く provider.tf の impersonate_service_account
+        を解決するため、step_terraform_apply から参照する。
+        """
+        out: Dict[str, str] = {}
+        for src, _dst, _src_sa, dst_sa in self._iter_project_pairs():
+            if src and dst_sa:
+                out[src] = dst_sa
+        return out
 
     def _resolve_gcs_rename_value(self, rename_gcs: Dict) -> str:
         """rename_rules.gcs.value を解決する。
@@ -1495,46 +1578,90 @@ resource "google_storage_bucket" "mock_bucket" {{
     def _rename_bucket_names_in_blocks(
         self, content: str, method: Optional[str], value: str, overrides: Dict[str, str]
     ) -> str:
-        """`resource "google_storage_bucket" ...` ブロックの内側にある name 値だけを置換する。"""
+        """`resource "google_storage_bucket" ...` ブロックの内側にある name 値だけを置換する。
+
+        GCS バケット名はグローバル名前空間で一意。複数の src プロジェクトに同名
+        バケット（例: org-bucket-shared-data）があると、共通サフィックスを付けても
+        dst 側で同名になり 409 conflict になる。これを避けるため、ブロック内の
+        project（ID 置換後＝dst プロジェクト）を読み取り、name に dst 固有トークンを
+        混ぜて一意化する。override で明示された名前はそのまま尊重する。
+        """
         lines = content.split('\n')
         out: List[str] = []
+        block: List[str] = []
         in_bucket_block = False
         depth = 0
         bucket_block_re = re.compile(r'^\s*resource\s+"google_storage_bucket"')
-        name_re = re.compile(r'^(\s*name\s*=\s*)"([^"]+)"\s*$')
 
         for line in lines:
             if not in_bucket_block:
                 if bucket_block_re.search(line):
                     in_bucket_block = True
                     depth = line.count('{') - line.count('}')
-                    out.append(line)
+                    block = [line]
+                    if depth <= 0:
+                        out.extend(self._rewrite_bucket_block(block, method, value, overrides))
+                        in_bucket_block = False
                     continue
                 out.append(line)
                 continue
 
             # ブロック内
-            m = name_re.match(line)
-            if m:
-                prefix, orig_name = m.group(1), m.group(2)
-                if orig_name in overrides:
-                    new_name = overrides[orig_name]
-                elif method == 'suffix':
-                    new_name = f"{orig_name}{value}"
-                elif method == 'prefix':
-                    new_name = f"{value}{orig_name}"
-                else:
-                    new_name = orig_name
-                self.org_logger.info(f"      bucket リネーム: {orig_name} → {new_name}")
-                out.append(f'{prefix}"{new_name}"')
-            else:
-                out.append(line)
-
+            block.append(line)
             depth += line.count('{') - line.count('}')
             if depth <= 0:
+                out.extend(self._rewrite_bucket_block(block, method, value, overrides))
                 in_bucket_block = False
 
+        if in_bucket_block:  # 閉じ括弧が無い不正ブロックはそのまま出力
+            out.extend(block)
         return '\n'.join(out)
+
+    def _rewrite_bucket_block(
+        self, block_lines: List[str], method: Optional[str],
+        value: str, overrides: Dict[str, str],
+    ) -> List[str]:
+        """単一の google_storage_bucket ブロックの name 行を一意な dst 名に書き換える。"""
+        text = '\n'.join(block_lines)
+        pm = re.search(r'\bproject\s*=\s*"([^"]+)"', text)
+        dst_proj = pm.group(1) if pm else ''
+        name_re = re.compile(r'^(\s*name\s*=\s*)"([^"]+)"\s*$')
+        out: List[str] = []
+        for line in block_lines:
+            m = name_re.match(line)
+            if not m:
+                out.append(line)
+                continue
+            prefix, orig_name = m.group(1), m.group(2)
+            if orig_name in overrides:
+                new_name = overrides[orig_name]
+            else:
+                if method == 'suffix':
+                    base = f"{orig_name}{value}"
+                elif method == 'prefix':
+                    base = f"{value}{orig_name}"
+                else:
+                    base = orig_name
+                new_name = self._uniquify_bucket_name(base, dst_proj)
+            self.org_logger.info(f"      bucket リネーム: {orig_name} → {new_name}")
+            out.append(f'{prefix}"{new_name}"')
+        return out
+
+    def _uniquify_bucket_name(self, base: str, dst_proj: str) -> str:
+        """base に dst プロジェクト由来の短いハッシュを付けてグローバル一意にする。
+
+        dst_proj が空（project 行が無い）の場合は base をそのまま返す。
+        GCS バケット名は 63 文字以内のため、超過時は base を切り詰める。
+        """
+        if not dst_proj:
+            return base
+        import hashlib
+        h = hashlib.sha1(dst_proj.encode('utf-8')).hexdigest()[:6]
+        name = f"{base}-{h}"
+        if len(name) > 63:
+            keep = max(1, 63 - 1 - len(h))
+            name = f"{base[:keep]}-{h}"
+        return name
 
     def _strip_boot_disk_source(self, content: str, rel: str) -> str:
         if 'google_compute_instance' not in content or 'boot_disk' not in content:
@@ -1589,6 +1716,7 @@ resource "google_storage_bucket" "mock_bucket" {{
             sys.exit(1)
 
         proj_map = self._build_proj_id_map()
+        sa_map = self._build_dst_sa_map()
         self.dst_logger.info(f"  対象 Terraform ルート: {len(project_dirs)} 件")
         for proj_dir in project_dirs:
             self.dst_logger.info(f"  → Terraform ルート: {proj_dir}")
@@ -1599,6 +1727,18 @@ resource "google_storage_bucket" "mock_bucket" {{
             dst_proj = proj_map.get(os.path.basename(proj_dir))
             if not self.dry_run and not self.mock and dst_proj:
                 self._reset_stale_state_if_needed(proj_dir, dst_proj)
+                # google_project_service / data.google_project などは Cloud Resource
+                # Manager / Service Usage / IAM API に依存する。dst プロジェクトでこれらが
+                # 無効だと apply 中に「<api> has not been used in project ... before」の
+                # 403 で止まる。bootstrap で漏れていても自動で復旧できるよう init 前に
+                # 必ず有効化する（冪等）。
+                self._ensure_dst_prereq_apis(dst_proj, sa_map.get(os.path.basename(proj_dir)))
+                # bulk-export は provider 設定を生成しないため init は通るが import/plan で
+                # "Invalid provider configuration" になる。dst プロジェクトと借用 SA を
+                # 明示した provider.tf を毎回書き出して回避する（冪等）。
+                self._write_provider_tf(
+                    proj_dir, dst_proj, sa_map.get(os.path.basename(proj_dir))
+                )
             self.run_command(
                 "terraform init", side="local", logger=self.dst_logger,
                 desc=f"TF Init {os.path.basename(proj_dir)}",
@@ -1667,6 +1807,99 @@ resource "google_storage_bucket" "mock_bucket" {{
                 f.write(dst_proj)
         except OSError:
             pass
+
+    def _ensure_dst_prereq_apis(self, dst_proj: str, dst_sa: Optional[str]):
+        """terraform 実行前に dst プロジェクトの基盤 API を有効化する（冪等）。
+
+        google_project_service / data.google_project 等が依存する API。
+        既に有効なら gcloud は no-op で成功する。借用 SA を経由するため
+        SA に serviceusage.services.enable 権限（roles/editor 等に含む）が必要。
+
+        有効化直後は反映遅延（伝播）で terraform plan が
+        「<API> has not been used in project ... before or it is disabled」と
+        403 を返すことがある。enable 後に `services list --enabled` をポーリングし、
+        必須 API が全部 enabled として見えるまで（最大 120 秒）待つ。
+        """
+        prereq = [
+            "cloudresourcemanager.googleapis.com",
+            "serviceusage.googleapis.com",
+            "iam.googleapis.com",
+            "iamcredentials.googleapis.com",
+        ]
+        self.run_command(
+            f"gcloud services enable {' '.join(prereq)} --project={dst_proj}",
+            side="dst", logger=self.dst_logger,
+            desc=f"Prereq APIs {dst_proj}",
+            explanation=f"{dst_proj} で Terraform 必須 API（CRM/ServiceUsage/IAM）を有効化",
+            impersonate_sa=dst_sa, allow_fail=True,
+        )
+        self._wait_for_apis_enabled(dst_proj, dst_sa, prereq, timeout_sec=120, interval_sec=8)
+
+    def _wait_for_apis_enabled(
+        self, dst_proj: str, dst_sa: Optional[str],
+        apis: List[str], timeout_sec: int = 120, interval_sec: int = 8,
+    ):
+        """`gcloud services list --enabled` をポーリングし、apis 全てが有効と見えるまで待機。
+
+        gcloud services enable は有効化を要求するが、後続 API 呼び出しに反映するまで
+        数秒〜数十秒のラグがある（Google 側エラーメッセージにも propagate の注記あり）。
+        timeout を超えても見えない API は警告ログのみで続行（terraform 側のエラーで露見）。
+        """
+        env = os.environ.copy()
+        if dst_sa:
+            env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = dst_sa
+        deadline = time.monotonic() + timeout_sec
+        need = set(apis)
+        last_seen: set = set()
+        while time.monotonic() < deadline:
+            try:
+                res = subprocess.run(
+                    f"gcloud services list --enabled --project={dst_proj} "
+                    f"--format='value(config.name)'",
+                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env=env, timeout=30,
+                )
+            except Exception:
+                time.sleep(interval_sec)
+                continue
+            if res.returncode == 0:
+                enabled = {line.strip() for line in res.stdout.splitlines() if line.strip()}
+                last_seen = enabled
+                missing = need - enabled
+                if not missing:
+                    self.dst_logger.info(
+                        f"    必須 API は全て有効化済み（{dst_proj}）"
+                    )
+                    return
+            time.sleep(interval_sec)
+        missing = need - last_seen
+        if missing:
+            self.dst_logger.warning(
+                f"    必須 API が timeout 内に有効化を確認できませんでした: "
+                f"{sorted(missing)}（plan で失敗する場合は数分待って再実行）"
+            )
+
+    def _write_provider_tf(self, proj_dir: str, dst_proj: str, dst_sa: Optional[str]):
+        """active/<src>/ に provider.tf を書き出して認証/プロジェクトを明示する。
+
+        bulk-export 出力には provider 設定が無いため、ADC 未設定環境では plan が
+        "Invalid provider configuration" / "Application Default Credentials" で落ちる。
+        dst プロジェクト ID と借用 SA を入れた provider ブロックを毎回書き出して
+        冪等にする（ファイル名は他の .tf より先に読まれる "_provider.tf"）。
+        """
+        lines = [
+            'provider "google" {',
+            f'  project = "{dst_proj}"',
+        ]
+        if dst_sa:
+            lines.append(f'  impersonate_service_account = "{dst_sa}"')
+        lines.append("}")
+        path = os.path.join(proj_dir, "_provider.tf")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError as e:
+            self.dst_logger.warning(f"    provider.tf 書込失敗: {path}: {e}")
 
     def _terraform_import_existing(self, proj_dir: str):
         """apply 前に既存リソースを terraform state へ取り込み、再実行を冪等にする。
@@ -1757,6 +1990,11 @@ resource "google_storage_bucket" "mock_bucket" {{
         log_stage_header(self.dst_logger, 5, "GCE VM 復元（スナップショット → ディスク差し替え）", len(pairs))
 
         max_age_days = self.config.get('steps', {}).get('gce_snapshot', {}).get('max_age_days', 30)
+        proj_map = self._build_proj_id_map()
+
+        # bulk-export は Shared VPC のネットワーク定義を出力しないため、VM を共有
+        # サブネットに作成する前に src host の VPC/subnet を dst host へ複製する。
+        self._replicate_host_networks()
 
         for src_proj, dst_proj, src_sa, dst_sa in pairs:
             self.dst_logger.info(f"  → src '{src_proj}' → dst '{dst_proj}'")
@@ -1796,6 +2034,7 @@ resource "google_storage_bucket" "mock_bucket" {{
                     self.dst_logger.info(f"    管理対象外 VM をスキップ: {vm_name}")
                     continue
                 zone = vm.get('zone', '').split('/')[-1]
+                machine_type = vm.get('machineType', '').split('/')[-1] or 'e2-micro'
                 boot_disk = next((d for d in vm.get('disks', []) if d.get('boot')), None)
                 if not boot_disk:
                     continue
@@ -1809,11 +2048,37 @@ resource "google_storage_bucket" "mock_bucket" {{
                     sys.exit(1)
 
                 dst_disk_name = vm_name
-                self.dst_logger.info(
-                    f"    {vm_name} を復元 (zone={zone}, snap={snap_name})"
+                snap_path = f"projects/{src_proj}/global/snapshots/{snap_name}"
+
+                # VM/disk は Terraform(Step4) では作らず Step5 で管理する。dst に VM が
+                # 既にあるかで分岐: 無ければ snapshot 復元ディスクで新規作成、あれば
+                # ブートディスクを復元ディスクに差し替える（どちらも冪等）。
+                vm_exists = self._gcloud_exists(
+                    f"gcloud compute instances describe {vm_name} --zone={zone} "
+                    f"--project={dst_proj} --format='value(name)'",
+                    dst_sa,
                 )
 
-                # 既存 VM の停止・既存ディスクのデタッチと削除
+                if not vm_exists:
+                    self.dst_logger.info(
+                        f"    {vm_name} を新規作成して復元 (zone={zone}, type={machine_type}, snap={snap_name})"
+                    )
+                    self._create_disk_from_snapshot(dst_disk_name, snap_path, zone, dst_proj, dst_sa)
+                    nic = self._build_restore_nic(vm, proj_map)
+                    self.run_command(
+                        f"gcloud compute instances create {vm_name} --zone={zone} "
+                        f"--project={dst_proj} --machine-type={machine_type} {nic} "
+                        f"--disk=name={dst_disk_name},boot=yes,auto-delete=yes --quiet",
+                        side="dst", logger=self.dst_logger,
+                        desc=f"Create VM {vm_name}",
+                        explanation="復元ディスクをブートに指定して dst VM を新規作成",
+                        impersonate_sa=dst_sa,
+                    )
+                    continue
+
+                self.dst_logger.info(
+                    f"    {vm_name} は既存。ブートディスクを復元ディスクに差し替え (snap={snap_name})"
+                )
                 self.run_command(
                     f"gcloud compute instances stop {vm_name} --zone={zone} --project={dst_proj} --quiet",
                     side="dst", logger=self.dst_logger,
@@ -1833,20 +2098,10 @@ resource "google_storage_bucket" "mock_bucket" {{
                     f"gcloud compute disks delete {dst_disk_name} --zone={zone} --project={dst_proj} --quiet",
                     side="dst", logger=self.dst_logger,
                     desc=f"Delete placeholder disk {dst_disk_name}",
-                    explanation="Terraform で作成した空ディスクを削除",
+                    explanation="差し替え前の旧ブートディスクを削除",
                     impersonate_sa=dst_sa, allow_fail=True,
                 )
-
-                # スナップショットからディスクを復元（src snapshot を read で参照）
-                snap_path = f"projects/{src_proj}/global/snapshots/{snap_name}"
-                self.run_command(
-                    f"gcloud compute disks create {dst_disk_name} "
-                    f"--source-snapshot={snap_path} --zone={zone} --project={dst_proj} --quiet",
-                    side="dst", logger=self.dst_logger,
-                    desc=f"Create disk {dst_disk_name}",
-                    explanation=f"src snapshot {snap_name} から dst にクローンディスクを作成",
-                    impersonate_sa=dst_sa,
-                )
+                self._create_disk_from_snapshot(dst_disk_name, snap_path, zone, dst_proj, dst_sa)
                 self.run_command(
                     f"gcloud compute instances attach-disk {vm_name} --disk={dst_disk_name} "
                     f"--boot --zone={zone} --project={dst_proj} --quiet",
@@ -1864,6 +2119,158 @@ resource "google_storage_bucket" "mock_bucket" {{
                 )
 
         self.dst_logger.info("  ✓ Step 5 完了")
+
+    def _gcloud_exists(self, cmd: str, impersonate_sa: Optional[str]) -> bool:
+        """read-only な describe 等で対象リソースの存在を確認する（stats を汚さない）。
+
+        run_command は失敗を failed カウントに含め、dst の dry-run をスキップする。
+        存在確認の 404 を「失敗」と数えないよう、専用に subprocess を直接叩く。
+        mock/dry-run では実 GCP を叩かず「存在しない」とみなす（作成パスを通す）。
+        """
+        if self.mock or self.dry_run:
+            return False
+        env = os.environ.copy()
+        if impersonate_sa:
+            env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = impersonate_sa
+        try:
+            res = subprocess.run(
+                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env, timeout=60,
+            )
+            return res.returncode == 0 and bool(res.stdout.strip())
+        except Exception:
+            return False
+
+    def _create_disk_from_snapshot(
+        self, disk_name: str, snap_path: str, zone: str,
+        dst_proj: str, dst_sa: Optional[str],
+    ):
+        """snapshot から dst ディスクを作成する。既存なら再利用（冪等）。"""
+        if self._gcloud_exists(
+            f"gcloud compute disks describe {disk_name} --zone={zone} "
+            f"--project={dst_proj} --format='value(name)'",
+            dst_sa,
+        ):
+            self.dst_logger.info(f"      復元ディスク {disk_name} は既存。再利用")
+            return
+        self.run_command(
+            f"gcloud compute disks create {disk_name} --source-snapshot={snap_path} "
+            f"--zone={zone} --project={dst_proj} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"Create disk {disk_name}",
+            explanation="src snapshot から dst にクローンディスクを作成",
+            impersonate_sa=dst_sa,
+        )
+
+    def _build_restore_nic(self, vm: Dict, proj_map: Dict[str, str]) -> str:
+        """src VM の networkInterfaces から dst 用の --network-interface 引数を組む。
+
+        Shared VPC の network/subnet は host プロジェクトに属するため、URL 内の
+        プロジェクト ID を proj_map で dst host にマップする。外部 IP は付けない。
+        """
+        ni = (vm.get('networkInterfaces') or [{}])[0]
+        parts: List[str] = []
+        m_net = re.search(r'projects/([^/]+)/global/networks/([^/]+)', ni.get('network', '') or '')
+        if m_net:
+            host = proj_map.get(m_net.group(1), m_net.group(1))
+            parts.append(f"network=projects/{host}/global/networks/{m_net.group(2)}")
+        m_sub = re.search(
+            r'projects/([^/]+)/regions/([^/]+)/subnetworks/([^/]+)',
+            ni.get('subnetwork', '') or '',
+        )
+        if m_sub:
+            host = proj_map.get(m_sub.group(1), m_sub.group(1))
+            parts.append(
+                f"subnet=projects/{host}/regions/{m_sub.group(2)}/subnetworks/{m_sub.group(3)}"
+            )
+        parts.append("no-address")
+        return "--network-interface=" + ",".join(parts)
+
+    def _replicate_host_networks(self):
+        """src host の custom VPC ネットワークとサブネットを dst host に複製する（冪等）。
+
+        bulk-export は Shared VPC のネットワーク定義を出力しないため、Step5 で VM を
+        共有サブネットに作成する前にここで dst host の VPC topology を src に合わせて
+        用意する。default ネットワークは対象外。Shared VPC ホスト化・サービス
+        プロジェクト関連付け・networkUser 付与は bootstrap_shared_vpc.sh の担当。
+        """
+        host = self.config.get('project_mapping', {}).get('host_project', {})
+        src_host = host.get('src')
+        dst_host = host.get('dst')
+        src_sa = host.get('src_impersonate_service_account')
+        dst_sa = host.get('dst_impersonate_service_account')
+        if not src_host or not dst_host:
+            return
+        self.dst_logger.info(f"  [Network] src host '{src_host}' → dst host '{dst_host}' VPC 複製")
+
+        nets_json = self.run_command(
+            f"gcloud compute networks list --project={src_host} --format=json",
+            side="src", logger=self.org_logger,
+            desc=f"List Src Networks {src_host}",
+            explanation=f"{src_host} の VPC 一覧を取得（dst host に複製）",
+            impersonate_sa=src_sa, allow_fail=True,
+        )
+        subs_json = self.run_command(
+            f"gcloud compute networks subnets list --project={src_host} --format=json",
+            side="src", logger=self.org_logger,
+            desc=f"List Src Subnets {src_host}",
+            explanation=f"{src_host} のサブネット一覧を取得（dst host に複製）",
+            impersonate_sa=src_sa, allow_fail=True,
+        )
+        try:
+            nets = json.loads(nets_json) if nets_json else []
+        except Exception:
+            nets = []
+        try:
+            all_subs = json.loads(subs_json) if subs_json else []
+        except Exception:
+            all_subs = []
+
+        for net in nets:
+            name = net.get('name')
+            if not name or name == 'default':
+                continue
+            mode = 'auto' if net.get('autoCreateSubnetworks') else 'custom'
+            if self._gcloud_exists(
+                f"gcloud compute networks describe {name} --project={dst_host} "
+                f"--format='value(name)'",
+                dst_sa,
+            ):
+                self.dst_logger.info(f"    VPC {name} は dst host に既存。再利用")
+            else:
+                self.run_command(
+                    f"gcloud compute networks create {name} --subnet-mode={mode} "
+                    f"--project={dst_host} --quiet",
+                    side="dst", logger=self.dst_logger,
+                    desc=f"Create Network {name}",
+                    explanation=f"dst host {dst_host} に VPC {name}（{mode}）を作成",
+                    impersonate_sa=dst_sa,
+                )
+            if mode != 'custom':
+                continue
+            for sub in all_subs:
+                if (sub.get('network') or '').split('/')[-1] != name:
+                    continue
+                sname = sub.get('name')
+                region = (sub.get('region') or '').split('/')[-1]
+                cidr = sub.get('ipCidrRange')
+                if not sname or not region or not cidr:
+                    continue
+                if self._gcloud_exists(
+                    f"gcloud compute networks subnets describe {sname} --region={region} "
+                    f"--project={dst_host} --format='value(name)'",
+                    dst_sa,
+                ):
+                    self.dst_logger.info(f"      サブネット {sname}({region}) は既存。再利用")
+                    continue
+                self.run_command(
+                    f"gcloud compute networks subnets create {sname} --network={name} "
+                    f"--region={region} --range={cidr} --project={dst_host} --quiet",
+                    side="dst", logger=self.dst_logger,
+                    desc=f"Create Subnet {sname}",
+                    explanation=f"dst host に サブネット {sname}（{region},{cidr}）を作成",
+                    impersonate_sa=dst_sa,
+                )
 
     def _find_valid_snapshot(self, snapshots: List[Dict], disk_name: str, max_age_days: int) -> Optional[str]:
         for snap in snapshots:
@@ -1900,22 +2307,33 @@ resource "google_storage_bucket" "mock_bucket" {{
 
     def _sync_gcs(self, src_proj, dst_proj, src_sa, dst_sa, method, value, overrides):
         self.dst_logger.info("  [GCS] バケット同期")
-        buckets_str = self.run_command(
-            f"gcloud storage buckets list --project={src_proj} --format='value(name)'",
+        buckets_json = self.run_command(
+            f"gcloud storage buckets list --project={src_proj} --format=json",
             side="src", logger=self.org_logger,
             desc=f"List Src Buckets {src_proj}",
             explanation=f"{src_proj} のバケット一覧を取得",
             impersonate_sa=src_sa, allow_fail=True,
         )
-        if not buckets_str:
+        try:
+            buckets = json.loads(buckets_json) if buckets_json else []
+        except Exception:
+            buckets = []
+        if not buckets:
             self.dst_logger.info("    バケット無し / 取得失敗")
             return
-        # customize_hcl と同じ規則で dst バケット名を算出する:
+        # dst バケット名を算出する:
         #   1) バケット名に含まれる src プロジェクト ID を dst ID に置換（単語境界）
         #   2) override / suffix / prefix のリネーム規則を適用
-        # （Step 4 が作る dst バケット名と一致させないと rsync 先が 404 になる）
+        #   3) dst プロジェクト固有トークンで一意化（customize_hcl と同一規則）
+        # Terraform は bulk-export の .tf にあるバケットしか作らないため、実在する
+        # src バケットに対応する dst バケットが無いことがある。rsync 前に dst バケットを
+        # 無ければ作成して同期先を保証する（location は src を維持・冪等）。
         proj_map = self._build_proj_id_map()
-        for orig in [b.strip() for b in buckets_str.split('\n') if b.strip()]:
+        for b in buckets:
+            orig = (b.get('name') or '').replace('gs://', '').strip('/')
+            if not orig:
+                continue
+            location = b.get('location') or 'US'
             base = orig
             for s in sorted(proj_map.keys(), key=len, reverse=True):
                 base = re.sub(
@@ -1924,13 +2342,28 @@ resource "google_storage_bucket" "mock_bucket" {{
                 )
             if base in overrides:
                 dst_bucket = overrides[base]
-            elif method == 'suffix':
-                dst_bucket = f"{base}{value}"
-            elif method == 'prefix':
-                dst_bucket = f"{value}{base}"
             else:
-                dst_bucket = base
-            self.dst_logger.info(f"    gs://{orig} → gs://{dst_bucket}")
+                if method == 'suffix':
+                    renamed = f"{base}{value}"
+                elif method == 'prefix':
+                    renamed = f"{value}{base}"
+                else:
+                    renamed = base
+                dst_bucket = self._uniquify_bucket_name(renamed, dst_proj)
+            self.dst_logger.info(f"    gs://{orig} → gs://{dst_bucket} (loc={location})")
+            if not self._gcloud_exists(
+                f"gcloud storage buckets describe gs://{dst_bucket} --format='value(name)'",
+                dst_sa,
+            ):
+                self.run_command(
+                    f"gcloud storage buckets create gs://{dst_bucket} "
+                    f"--project={dst_proj} --location={location} "
+                    f"--uniform-bucket-level-access",
+                    side="dst", logger=self.dst_logger,
+                    desc=f"Create dst Bucket {dst_bucket}",
+                    explanation="同期先 dst バケットを作成（無い場合）",
+                    impersonate_sa=dst_sa, allow_fail=True,
+                )
             self.run_command(
                 f"gcloud storage rsync gs://{orig} gs://{dst_bucket} --recursive --project={dst_proj}",
                 side="dst", logger=self.dst_logger,

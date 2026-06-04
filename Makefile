@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: setup run plan mock test projects projects-plan help \
+.PHONY: setup run plan mock test projects projects-plan help clean clean-all \
         bootstrap bootstrap-apply \
         bootstrap-dst-sa bootstrap-dst-sa-apply \
         bootstrap-cross-project bootstrap-cross-project-apply \
@@ -16,8 +16,8 @@ help:
 setup:
 	uv sync
 
-## plan: ドライランで実行計画を表示します（ORG への書き込みは発生しません）
-plan: setup
+## plan: ドライランで実行計画を表示します（ORG への書き込みは発生しません / 先に clean 実施）
+plan: setup clean
 	uv run python3 scripts/sync_env.py --dry-run $(ARGS)
 
 ## mock: Mock モードで一連の処理をローカル試走（GCP 未接続でも動きます）
@@ -31,6 +31,25 @@ run: setup
 ## test: 単体テスト（pytest）を実行
 test:
 	PYTHONPATH=. uv run pytest
+
+## clean: 前回 run のゴミ（terraform active/raw/state、GCS rename 値）を削除して初期化
+clean:
+	@echo "===== terraform/ 配下の生成物を削除 ====="
+	@rm -rf terraform/active terraform/raw
+	@rm -f  terraform/.gcs_rename_value
+	@find terraform -name '.terraform' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+	@find terraform -name '.terraform.lock.hcl' -type f -delete 2>/dev/null || true
+	@find terraform -name 'terraform.tfstate*' -type f -delete 2>/dev/null || true
+	@find terraform -name 'tfplan' -type f -delete 2>/dev/null || true
+	@find terraform -name '.dst_project' -type f -delete 2>/dev/null || true
+	@echo "  ✓ terraform/active, raw, state, lock, tfplan を削除しました"
+	@echo "  ※ logs/ と cai_export/ は保持（消したい場合は make clean-all）"
+
+## clean-all: clean に加えて logs/ と cai_export/ も削除（完全初期化）
+clean-all: clean
+	@echo "===== logs/ と cai_export/ も削除 ====="
+	@rm -rf logs cai_export
+	@echo "  ✓ logs と cai_export を削除しました"
 
 ## projects-plan: コピー先プロジェクト作成のドライラン
 projects-plan: setup

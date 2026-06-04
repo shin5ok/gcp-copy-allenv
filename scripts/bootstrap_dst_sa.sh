@@ -28,7 +28,9 @@ APPLY=false
 IMPERSONATOR=""
 # 付与ロール。roles/editor は data-plane 権限（storage.objects.* / bigquery.tables.* 等）を
 # 含まないため、Step 6（GCS/BQ 同期）用に storage.admin / bigquery.admin も付与する。
-ROLES=("roles/editor" "roles/storage.admin" "roles/bigquery.admin")
+# iam.roleAdmin は Terraform で google_project_iam_custom_role を作成するために必須
+# （editor には iam.roles.create が含まれない）。
+ROLES=("roles/editor" "roles/storage.admin" "roles/bigquery.admin" "roles/iam.roleAdmin")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

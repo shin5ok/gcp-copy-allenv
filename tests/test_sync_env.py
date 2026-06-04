@@ -444,8 +444,10 @@ resource "google_storage_bucket" "b" {
         # bucket は生成される
         with open(os.path.join(active, "bucket.tf"), "r", encoding="utf-8") as f:
             out = f.read()
-        # bucket name は suffix が付く
-        assert 'name = "src-bucket-data-dst-0602"' in out
+        # bucket name は suffix + dst プロジェクト固有ハッシュで一意化される
+        import hashlib
+        h = hashlib.sha1("dst-svc-1".encode("utf-8")).hexdigest()[:6]
+        assert f'name = "src-bucket-data-dst-0602-{h}"' in out
         # project ID 置換
         assert 'project = "dst-svc-1"' in out
         assert "src-svc-1" not in out
