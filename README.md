@@ -175,7 +175,7 @@ make plan
 > 🔍 **ドライランで計画・検証される項目**
 > 1. **CAI 現状確認** (`cai_scan`): コピー元の有効なリソース一覧を探索。
 > 2. **GCE スナップショット検証** (`gce_snapshot`): 各 VM に期限内（既定 30 日）の有効なスナップショットがあるか確認。なければエラー。
-> 3. **Terraform コード生成** (`bulk_export`): Original リソースを HCL としてエクスポートし、プロジェクト ID 置換・GCS バケットのリネーム・`boot_disk.source` 行の削除を実施。
+> 3. **Terraform コード生成** (`bulk_export`): Original リソースを HCL としてエクスポートし、プロジェクト ID 置換・GCS バケットのリネーム・同一プロジェクト内 network 参照の `self_link` 化・`boot_disk.source` 行の削除を実施。
 > 4. **インフラ再現** (`terraform_apply`): `terraform plan -out=tfplan` を生成（本番時のみ apply）。
 > 5. **VM データ復元** (`gce_restore`): スナップショットから復元したディスクの差し替え計画。
 > 6. **データ移行** (`data_sync`): GCS バケット（リネーム後）・BigQuery（location 継承）の同期計画。
