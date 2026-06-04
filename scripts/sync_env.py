@@ -665,8 +665,10 @@ class MigrationOrchestrator:
                         time.sleep(min(5 * attempt, 30))
                         continue
                     logger.error(f"{tag}✗ 失敗 (exit={result.returncode})")
-                    if result.stderr:
-                        logger.error(f"      理由: {result.stderr.strip()[:600]}")
+                    if result.stderr and result.stderr.strip():
+                        logger.error(f"      理由(stderr): {result.stderr.strip()[:2000]}")
+                    if result.stdout and result.stdout.strip():
+                        logger.error(f"      理由(stdout): {result.stdout.strip()[:2000]}")
                     self.stats.incr("failed")
                     if not allow_fail:
                         sys.exit(result.returncode)
