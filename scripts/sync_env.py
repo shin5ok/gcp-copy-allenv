@@ -1089,21 +1089,22 @@ resource "google_storage_bucket" "mock_bucket" {{
                     f"  skip_on_run=true だが {active_dir} に .tf が無いため、安全側で通常実行"
                 )
 
-        if not self.dry_run:
-            # raw 全体を作り直す。過去の mock ダミーや別 config の export 残骸
-            # （現 config に無い孤児プロジェクト dir 等）が混ざり、customize/terraform
-            # を汚すのを防ぐ。raw は毎回 bulk-export で再生成される派生物。
-            if os.path.isdir(raw_dir):
-                self.org_logger.info(f"  既存の raw を作り直し: {raw_dir}")
-                shutil.rmtree(raw_dir, ignore_errors=True)
-            os.makedirs(raw_dir, exist_ok=True)
-            os.makedirs(active_dir, exist_ok=True)
+        # raw 全体を作り直す。過去の mock ダミーや別 config の export 残骸
+        # （現 config に無い孤児プロジェクト dir 等）が混ざり、customize/terraform
+        # を汚すのを防ぐ。raw は毎回 bulk-export で再生成される派生物。
+        # bulk-export は dry_run でも実コマンドが走るため（src は変更しない読み取り系）、
+        # 出力先ディレクトリは dry_run でも先に作っておかないと
+        # `--path` 先が存在せず "is not a directory" で失敗する。
+        if not self.dry_run and os.path.isdir(raw_dir):
+            self.org_logger.info(f"  既存の raw を作り直し: {raw_dir}")
+            shutil.rmtree(raw_dir, ignore_errors=True)
+        os.makedirs(raw_dir, exist_ok=True)
+        os.makedirs(active_dir, exist_ok=True)
 
         for proj_id, sa in projects:
             self.org_logger.info(f"  → src '{proj_id}' をエクスポート")
             proj_raw_dir = os.path.join(raw_dir, proj_id)
-            if not self.dry_run:
-                os.makedirs(proj_raw_dir, exist_ok=True)
+            os.makedirs(proj_raw_dir, exist_ok=True)
 
             if self.mock and not self.dry_run:
                 self._write_dummy_tf_files(proj_raw_dir, proj_id)
