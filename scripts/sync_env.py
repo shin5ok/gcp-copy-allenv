@@ -586,6 +586,7 @@ class MigrationOrchestrator:
         cwd: Optional[str] = None,
         impersonate_sa: Optional[str] = None,
         retries: int = 0,
+        expect_not_found_ok: bool = False,
     ) -> Optional[str]:
         """外部コマンドを安全に実行する。
 
@@ -594,6 +595,9 @@ class MigrationOrchestrator:
             impersonate_sa: 借用 SA。side="src" では必須。
             retries: 失敗時の追加リトライ回数（config-connector 等のフレーキー対策）。
                      リトライ中の失敗は失敗カウントに含めない。
+            expect_not_found_ok: True の場合、stdout/stderr に "Not found" を含む失敗は
+                                 「存在しない」を意味する正常系として扱い、ERROR/失敗カウントせず None を返す。
+                                 bq show / gcloud ... describe 等の存在確認に使う。
         """
         tag = f"[{desc}] " if desc else ""
 
@@ -664,6 +668,10 @@ class MigrationOrchestrator:
                         )
                         time.sleep(min(5 * attempt, 30))
                         continue
+                    combined = f"{result.stdout or ''}\n{result.stderr or ''}"
+                    if expect_not_found_ok and "Not found" in combined:
+                        logger.info(f"{tag}存在しません（Not Found）")
+                        return None
                     logger.error(f"{tag}✗ 失敗 (exit={result.returncode})")
                     if result.stderr and result.stderr.strip():
                         logger.error(f"      理由(stderr): {result.stderr.strip()[:2000]}")
@@ -2421,6 +2429,7 @@ resource "google_storage_bucket" "mock_bucket" {{
                 desc=f"Show dst DS {ds_id}",
                 explanation="dst にデータセットが既にあるか確認",
                 impersonate_sa=dst_sa, allow_fail=True,
+                expect_not_found_ok=True,
             )
             if not dst_show:
                 loc_flag = f" --location={location}" if location else ""
@@ -2454,7 +2463,7 @@ resource "google_storage_bucket" "mock_bucket" {{
                     continue
                 self.dst_logger.info(f"      Table: {ds_id}.{t_id}")
                 self.run_command(
-                    f"bq cp --force {src_proj}:{ds_id}.{t_id} {dst_proj}:{ds_id}.{t_id}",
+                    f"bq --project_id={dst_proj} cp --force {src_proj}:{ds_id}.{t_id} {dst_proj}:{ds_id}.{t_id}",
                     side="dst", logger=self.dst_logger,
                     desc=f"BQ Cp {ds_id}.{t_id}",
                     explanation=f"テーブルを src → dst にコピー（同一 location 必要）",

@@ -12,7 +12,7 @@ exports/
 logs/
 cai_export/
 terraform/
-dst/config.yaml
+# dst/config.yaml
 
 # Node (claude-code CLI 等の付随ツール)
 node_modules/
