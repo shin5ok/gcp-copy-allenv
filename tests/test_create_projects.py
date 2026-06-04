@@ -124,4 +124,14 @@ def test_provision_production(mock_run, temp_dir):
     assert "gcloud projects describe dst-host --format=json" in cmds[0]
     assert "gcloud projects create dst-host --organization=111122223333" in cmds[1]
     assert "gcloud beta billing projects link dst-host --billing-account=AAAA-BBBB-CCCC" in cmds[2]
-    assert "gcloud services enable compute.googleapis.com dns.googleapis.com --project=dst-host" in cmds[3]
+    assert cmds[3].startswith("gcloud services enable ")
+    assert "--project=dst-host" in cmds[3]
+    for api in (
+        "compute.googleapis.com",
+        "dns.googleapis.com",
+        "cloudresourcemanager.googleapis.com",
+        "serviceusage.googleapis.com",
+        "iam.googleapis.com",
+        "iamcredentials.googleapis.com",
+    ):
+        assert api in cmds[3], f"missing prereq API in enable command: {api}"

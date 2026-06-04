@@ -221,10 +221,22 @@ class ProjectProvisioner:
                 desc=f"Link billing {pid}",
                 explanation=f"請求アカウント {billing} を {pid} に紐付け",
             )
+            # Terraform の google_project_service / data ソースが依存する基盤 API も
+            # 必ず有効化する。CRM/ServiceUsage が無効だと sync_env.py の Step 4 で
+            # "Cloud Resource Manager API has not been used in project ... before" の
+            # 403 が出て apply が止まる。
+            prereq_apis = " ".join([
+                "compute.googleapis.com",
+                "dns.googleapis.com",
+                "cloudresourcemanager.googleapis.com",
+                "serviceusage.googleapis.com",
+                "iam.googleapis.com",
+                "iamcredentials.googleapis.com",
+            ])
             self.run_command(
-                f"gcloud services enable compute.googleapis.com dns.googleapis.com --project={pid}",
+                f"gcloud services enable {prereq_apis} --project={pid}",
                 desc=f"Enable APIs {pid}",
-                explanation=f"{pid} で Compute / DNS API を有効化",
+                explanation=f"{pid} で Terraform 必須 API を有効化",
             )
 
         # サマリ
