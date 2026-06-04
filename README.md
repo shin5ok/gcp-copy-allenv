@@ -106,7 +106,14 @@ cp dst/config.yaml.template dst/config.yaml
 - **`project_mapping`**: コピー元 (src) とコピー先 (dst) のプロジェクト ID、および借用 SA
   (`src_impersonate_service_account` / `dst_impersonate_service_account`)。`host_project` と `service_projects` を定義します。
 - **`rename_rules`**: GCS バケット等のグローバルユニークなリソースのリネーム規則。
+  `gcs.value` に固定文字列を指定するか、`"auto"` にすると日付ベースの一意 suffix
+  （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に
+  永続化され、`make plan` / `make run` / `skip_on_run` 間で同じ値が再利用されます
+  （別名で作り直す場合はこのファイルを削除）。
 - **`steps`**: 各ステップ (1〜6) の有効/無効と個別設定（スナップショット期限など）。
+  `bulk_export.skip_on_run: true` にすると本番実行 (`make run`) では export/customize を
+  スキップし、`make plan` で生成済みの `terraform/active/` を再利用して高速化します
+  （`make plan` 自体は常に最新を取り直します）。
 - **`global`**: `dry_run` / `verbose_logging` / `parallel_jobs` / `log_dir` / `org_log_file` / `dst_log_file`。
 - **`bootstrap`**: コピー先プロジェクトを新規作成する場合の組織 ID / フォルダ ID（任意） / 請求先アカウント。
 
@@ -193,6 +200,12 @@ make run
 > 3. 復元したブートディスクを VM に差し替えて起動（OS 状態・データごと完全復元）。
 > 4. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
 > 5. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
+
+> ♻️ **Terraform 適用の冪等性**（再実行しても 409/404 で落ちないための仕組み）
+> - dst プロジェクトが前回と変わった場合、stale な `terraform.tfstate` を破棄して import からやり直します（`active/<src>/.dst_project` マーカーで判定）。
+> - `google_storage_bucket` はリネーム後の実名で import し、作成済みバケットを adopt して再 apply を冪等化。
+> - 同一プロジェクト内の network URL を `google_compute_network.<label>.self_link` 参照へ書き換え、firewall/subnetwork が network より先に作られて 404 になるのを防止。
+> - VM/disk は Step 4 ではなく Step 5 (`gce_restore`) 側で管理し、`make run` の失敗を抑制。
 
 ---
 
