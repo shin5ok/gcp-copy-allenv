@@ -2272,7 +2272,17 @@ resource "google_storage_bucket" "mock_bucket" {{
             self._reserve_internal_ip(dst_proj, dst_sa, region, subnet_uri, ip_addr, addr_name)
             parts.append(f"private-network-ip={ip_addr}")
 
-        parts.append("no-address")
+        # 外部 IP: src に accessConfigs があれば dst でも付与（ephemeral）。
+        # global IP はユニークなので src が static でも dst では auto-assign に変換。
+        # network tier は src の設定を引き継ぐ。
+        ext_configs = ni.get('accessConfigs') or []
+        if ext_configs:
+            tier = ext_configs[0].get('networkTier')
+            if tier:
+                parts.append(f"network-tier={tier}")
+            # no-address を付けない → gcloud は ephemeral 外部 IP を自動採番する
+        else:
+            parts.append("no-address")
         return "--network-interface=" + ",".join(parts)
 
     def _build_vm_create_extra_args(self, vm: Dict, tmpdir: str) -> str:
