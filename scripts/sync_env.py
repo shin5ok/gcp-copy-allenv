@@ -2117,7 +2117,7 @@ resource "google_storage_bucket" "mock_bucket" {{
                         f"    {vm_name} を新規作成して復元 (zone={zone}, type={machine_type}, snap={snap_name})"
                     )
                     self._create_disk_from_snapshot(dst_disk_name, snap_path, zone, dst_proj, dst_sa)
-                    nic = self._build_restore_nic(vm, proj_map)
+                    nic = self._build_restore_nic(vm, proj_map, dst_proj, dst_sa)
                     self.run_command(
                         f"gcloud compute instances create {vm_name} --zone={zone} "
                         f"--project={dst_proj} --machine-type={machine_type} {nic} "
@@ -2218,13 +2218,16 @@ resource "google_storage_bucket" "mock_bucket" {{
             impersonate_sa=dst_sa,
         )
 
-    def _build_restore_nic(self, vm: Dict, proj_map: Dict[str, str]) -> str:
+    def _build_restore_nic(self, vm: Dict, proj_map: Dict[str, str],
+                           dst_proj: str, dst_sa: Optional[str]) -> str:
         """src VM の networkInterfaces から dst 用の --network-interface 引数を組む。
 
         Shared VPC の network/subnet は host プロジェクトに属するため、URL 内の
         プロジェクト ID を proj_map で dst host にマップする。
-        src VM の内部 IP (networkIP) は dst host project の subnet に
-        静的内部 IP として予約してから引き継ぐ。外部 IP は付けない。
+        src VM の内部 IP (networkIP) は **service project (dst_proj) 側** で静的予約し、
+        subnet 参照は host project の subnet URL とする（共有 VPC の正しい構成）。
+        host project に予約すると "reserved by another project" で VM 作成に失敗するため。
+        外部 IP は付けない。
         """
         ni = (vm.get('networkInterfaces') or [{}])[0]
         parts: List[str] = []
@@ -2251,7 +2254,9 @@ resource "google_storage_bucket" "mock_bucket" {{
         vm_name = vm.get('name') or 'vm'
         if ip_addr and dst_host and region and subnet:
             addr_name = self._internal_addr_name(vm_name, ip_addr)
-            self._reserve_internal_ip(dst_host, region, subnet, ip_addr, addr_name)
+            # 共有 VPC: service project (dst_proj) で予約、subnet は host を指す
+            subnet_uri = f"projects/{dst_host}/regions/{region}/subnetworks/{subnet}"
+            self._reserve_internal_ip(dst_proj, dst_sa, region, subnet_uri, ip_addr, addr_name)
             parts.append(f"private-network-ip={ip_addr}")
 
         parts.append("no-address")
@@ -2297,26 +2302,26 @@ resource "google_storage_bucket" "mock_bucket" {{
         raw = re.sub(r'[^a-z0-9-]', '-', raw)
         return raw[:63].rstrip('-') or "mig-ip"
 
-    def _reserve_internal_ip(self, host_proj: str, region: str, subnet: str,
+    def _reserve_internal_ip(self, svc_proj: str, svc_sa: Optional[str],
+                             region: str, subnet_uri: str,
                              ip_addr: str, addr_name: str):
-        """dst host project の subnet に静的内部 IP を予約する（冪等）。
+        """共有 VPC の service project (svc_proj) 側に静的内部 IP を予約する（冪等）。
 
-        既に同名 address が存在し IP が一致すれば再利用。違う IP なら警告のみ。
+        共有 VPC では host project に IP を予約すると service project の VM から参照したとき
+        "reserved by another project" で拒否される。正しい構成は:
+          - subnet は host project のものを URI で指定（compute.networkUser 権限で借りる）
+          - address は service project 側に作成
+        既存 address があり IP 一致なら再利用、IP 不一致なら警告のみ。
         """
-        host_sa = (
-            self.config.get('project_mapping', {})
-            .get('host_project', {})
-            .get('dst_impersonate_service_account')
-        )
         # 既存チェック（read-only: stats を汚さない）
         if not (self.mock or self.dry_run):
             env = os.environ.copy()
-            if host_sa:
-                env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = host_sa
+            if svc_sa:
+                env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = svc_sa
             try:
                 res = subprocess.run(
                     f"gcloud compute addresses describe {addr_name} "
-                    f"--region={region} --project={host_proj} --format='value(address)'",
+                    f"--region={region} --project={svc_proj} --format='value(address)'",
                     shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, env=env, timeout=60,
                 )
@@ -2337,12 +2342,12 @@ resource "google_storage_bucket" "mock_bucket" {{
 
         self.run_command(
             f"gcloud compute addresses create {addr_name} "
-            f"--region={region} --project={host_proj} "
-            f"--subnet={subnet} --addresses={ip_addr} --quiet",
+            f"--region={region} --project={svc_proj} "
+            f"--subnet={subnet_uri} --addresses={ip_addr} --quiet",
             side="dst", logger=self.dst_logger,
             desc=f"Reserve internal IP {addr_name}",
-            explanation=f"共有VPC host {host_proj} に静的内部IP {ip_addr} を予約 (subnet={subnet})",
-            impersonate_sa=host_sa, allow_fail=True,
+            explanation=f"service project {svc_proj} に静的内部IP {ip_addr} を予約 (共有 VPC subnet={subnet_uri})",
+            impersonate_sa=svc_sa, allow_fail=True,
         )
 
     def _replicate_host_networks(self):
