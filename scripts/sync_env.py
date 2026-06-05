@@ -2132,6 +2132,9 @@ resource "google_storage_bucket" "mock_bucket" {{
                 self.dst_logger.info(
                     f"    {vm_name} は既存。ブートディスクを復元ディスクに差し替え (snap={snap_name})"
                 )
+                src_ip = ((vm.get('networkInterfaces') or [{}])[0]).get('networkIP')
+                if src_ip:
+                    self._warn_if_dst_internal_ip_mismatch(vm_name, zone, dst_proj, dst_sa, src_ip)
                 self.run_command(
                     f"gcloud compute instances stop {vm_name} --zone={zone} --project={dst_proj} --quiet",
                     side="dst", logger=self.dst_logger,
@@ -2219,7 +2222,9 @@ resource "google_storage_bucket" "mock_bucket" {{
         """src VM の networkInterfaces から dst 用の --network-interface 引数を組む。
 
         Shared VPC の network/subnet は host プロジェクトに属するため、URL 内の
-        プロジェクト ID を proj_map で dst host にマップする。外部 IP は付けない。
+        プロジェクト ID を proj_map で dst host にマップする。
+        src VM の内部 IP (networkIP) は dst host project の subnet に
+        静的内部 IP として予約してから引き継ぐ。外部 IP は付けない。
         """
         ni = (vm.get('networkInterfaces') or [{}])[0]
         parts: List[str] = []
@@ -2227,17 +2232,118 @@ resource "google_storage_bucket" "mock_bucket" {{
         if m_net:
             host = proj_map.get(m_net.group(1), m_net.group(1))
             parts.append(f"network=projects/{host}/global/networks/{m_net.group(2)}")
+        dst_host = None
+        region = None
+        subnet = None
         m_sub = re.search(
             r'projects/([^/]+)/regions/([^/]+)/subnetworks/([^/]+)',
             ni.get('subnetwork', '') or '',
         )
         if m_sub:
-            host = proj_map.get(m_sub.group(1), m_sub.group(1))
+            dst_host = proj_map.get(m_sub.group(1), m_sub.group(1))
+            region = m_sub.group(2)
+            subnet = m_sub.group(3)
             parts.append(
-                f"subnet=projects/{host}/regions/{m_sub.group(2)}/subnetworks/{m_sub.group(3)}"
+                f"subnet=projects/{dst_host}/regions/{region}/subnetworks/{subnet}"
             )
+
+        ip_addr = ni.get('networkIP')
+        vm_name = vm.get('name') or 'vm'
+        if ip_addr and dst_host and region and subnet:
+            addr_name = self._internal_addr_name(vm_name, ip_addr)
+            self._reserve_internal_ip(dst_host, region, subnet, ip_addr, addr_name)
+            parts.append(f"private-network-ip={ip_addr}")
+
         parts.append("no-address")
         return "--network-interface=" + ",".join(parts)
+
+    def _warn_if_dst_internal_ip_mismatch(self, vm_name: str, zone: str,
+                                          dst_proj: str, dst_sa: Optional[str],
+                                          expected_ip: str):
+        """既存 dst VM の内部 IP が src と異なる場合に警告（ゴール: IP 引き継ぎ）。
+
+        差し替えパスでは NIC を触らず IP は変わらない。再作成すれば引き継げる旨を案内。
+        """
+        if self.mock or self.dry_run:
+            return
+        env = os.environ.copy()
+        if dst_sa:
+            env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = dst_sa
+        try:
+            res = subprocess.run(
+                f"gcloud compute instances describe {vm_name} --zone={zone} "
+                f"--project={dst_proj} "
+                f"--format='value(networkInterfaces[0].networkIP)'",
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env, timeout=60,
+            )
+        except Exception:
+            return
+        if res.returncode != 0:
+            return
+        cur = res.stdout.strip()
+        if cur and cur != expected_ip:
+            self.dst_logger.warning(
+                f"      ⚠ {vm_name} の内部IPが src と異なります "
+                f"(dst={cur}, src={expected_ip})。"
+                f"src の IP を引き継ぐには dst VM をいったん削除して再作成してください: "
+                f"gcloud compute instances delete {vm_name} --zone={zone} --project={dst_proj}"
+            )
+
+    def _internal_addr_name(self, vm_name: str, ip_addr: str) -> str:
+        """共有VPC host で予約する static internal address のリソース名（冪等な命名）。"""
+        ip_part = ip_addr.replace('.', '-').replace(':', '-')
+        raw = f"mig-{vm_name}-{ip_part}".lower()
+        raw = re.sub(r'[^a-z0-9-]', '-', raw)
+        return raw[:63].rstrip('-') or "mig-ip"
+
+    def _reserve_internal_ip(self, host_proj: str, region: str, subnet: str,
+                             ip_addr: str, addr_name: str):
+        """dst host project の subnet に静的内部 IP を予約する（冪等）。
+
+        既に同名 address が存在し IP が一致すれば再利用。違う IP なら警告のみ。
+        """
+        host_sa = (
+            self.config.get('project_mapping', {})
+            .get('host_project', {})
+            .get('dst_impersonate_service_account')
+        )
+        # 既存チェック（read-only: stats を汚さない）
+        if not (self.mock or self.dry_run):
+            env = os.environ.copy()
+            if host_sa:
+                env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = host_sa
+            try:
+                res = subprocess.run(
+                    f"gcloud compute addresses describe {addr_name} "
+                    f"--region={region} --project={host_proj} --format='value(address)'",
+                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env=env, timeout=60,
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    existing_ip = res.stdout.strip()
+                    if existing_ip == ip_addr:
+                        self.dst_logger.info(
+                            f"      内部IP予約 {addr_name}={ip_addr} は既存。再利用"
+                        )
+                        return
+                    self.dst_logger.warning(
+                        f"      内部IP予約 {addr_name} は既存ですが IP が異なります "
+                        f"(existing={existing_ip}, expected={ip_addr})。手動で確認してください"
+                    )
+                    return
+            except Exception:
+                pass
+
+        self.run_command(
+            f"gcloud compute addresses create {addr_name} "
+            f"--region={region} --project={host_proj} "
+            f"--subnet={subnet} --addresses={ip_addr} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"Reserve internal IP {addr_name}",
+            explanation=f"共有VPC host {host_proj} に静的内部IP {ip_addr} を予約 (subnet={subnet})",
+            impersonate_sa=host_sa, allow_fail=True,
+        )
 
     def _replicate_host_networks(self):
         """src host の custom VPC ネットワークとサブネットを dst host に複製する（冪等）。
