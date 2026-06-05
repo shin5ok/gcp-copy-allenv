@@ -2088,8 +2088,7 @@ resource "google_storage_bucket" "mock_bucket" {{
 
             for vm in vms:
                 vm_name = vm.get('name')
-                if not vm_name or not vm_name.startswith('org-'):
-                    self.dst_logger.info(f"    管理対象外 VM をスキップ: {vm_name}")
+                if not vm_name:
                     continue
                 zone = vm.get('zone', '').split('/')[-1]
                 machine_type = vm.get('machineType', '').split('/')[-1] or 'e2-micro'
