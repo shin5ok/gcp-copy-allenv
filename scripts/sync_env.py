@@ -1152,28 +1152,31 @@ resource "google_storage_bucket" "mock_bucket" {{
         os.makedirs(raw_dir, exist_ok=True)
         os.makedirs(active_dir, exist_ok=True)
 
-        for proj_id, sa in projects:
+        def bulk_export_worker(item):
+            proj_id, sa = item
             self.org_logger.info(f"  → src '{proj_id}' をエクスポート")
             proj_raw_dir = os.path.join(raw_dir, proj_id)
             os.makedirs(proj_raw_dir, exist_ok=True)
 
             if self.mock and not self.dry_run:
                 self._write_dummy_tf_files(proj_raw_dir, proj_id)
-            else:
-                # --quiet: bulk-export は対話プロンプト（continue? 等）を出すため、
-                # 非対話の subprocess 実行で EOF 中断（exit 1）になるのを防ぐ。
-                cmd = (
-                    f"gcloud beta resource-config bulk-export "
-                    f"--project={proj_id} --resource-format=terraform "
-                    f"--path={proj_raw_dir} --quiet"
-                )
-                self.run_command(
-                    cmd, side="src", logger=self.org_logger,
-                    desc=f"Bulk Export {proj_id}",
-                    explanation=f"{proj_id} のリソース定義を Terraform HCL としてエクスポート",
-                    impersonate_sa=sa, allow_fail=True,
-                    retries=3,  # config-connector は時々フレーキーに失敗するため再試行
-                )
+                return
+            # --quiet: bulk-export は対話プロンプト（continue? 等）を出すため、
+            # 非対話の subprocess 実行で EOF 中断（exit 1）になるのを防ぐ。
+            cmd = (
+                f"gcloud beta resource-config bulk-export "
+                f"--project={proj_id} --resource-format=terraform "
+                f"--path={proj_raw_dir} --quiet"
+            )
+            self.run_command(
+                cmd, side="src", logger=self.org_logger,
+                desc=f"Bulk Export {proj_id}",
+                explanation=f"{proj_id} のリソース定義を Terraform HCL としてエクスポート",
+                impersonate_sa=sa, allow_fail=True,
+                retries=3,  # config-connector は時々フレーキーに失敗するため再試行
+            )
+
+        self._parallel_for_each(projects, bulk_export_worker, "bulk-export")
 
         # プロジェクト番号マップを構築（customize で number 置換に使う）。
         # bulk-export は project = "<番号>" や "<番号>-compute@developer" を出力するが、
