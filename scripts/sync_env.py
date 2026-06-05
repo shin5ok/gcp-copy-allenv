@@ -16,6 +16,8 @@ import logging
 import subprocess
 import json
 import shutil
+import shlex
+import tempfile
 import time
 import datetime
 import threading
@@ -2118,14 +2120,20 @@ resource "google_storage_bucket" "mock_bucket" {{
                     )
                     self._create_disk_from_snapshot(dst_disk_name, snap_path, zone, dst_proj, dst_sa)
                     nic = self._build_restore_nic(vm, proj_map, dst_proj, dst_sa)
-                    self.run_command(
-                        f"gcloud compute instances create {vm_name} --zone={zone} "
-                        f"--project={dst_proj} --machine-type={machine_type} {nic} "
-                        f"--disk=name={dst_disk_name},boot=yes,auto-delete=yes --quiet",
-                        side="dst", logger=self.dst_logger,
-                        desc=f"Create VM {vm_name}",
-                        explanation="復元ディスクをブートに指定して dst VM を新規作成",
-                        impersonate_sa=dst_sa,
+                    with tempfile.TemporaryDirectory(prefix=f"vm-{vm_name}-") as tmpdir:
+                        extra = self._build_vm_create_extra_args(vm, tmpdir)
+                        self.run_command(
+                            f"gcloud compute instances create {vm_name} --zone={zone} "
+                            f"--project={dst_proj} --machine-type={machine_type} {nic} "
+                            f"--disk=name={dst_disk_name},boot=yes,auto-delete=yes "
+                            f"{extra} --quiet",
+                            side="dst", logger=self.dst_logger,
+                            desc=f"Create VM {vm_name}",
+                            explanation="復元ディスクをブートに指定して dst VM を新規作成（metadata/tags/labels/SA/scheduling 引き継ぎ）",
+                            impersonate_sa=dst_sa,
+                        )
+                    self._attach_secondary_disks(
+                        vm, vm_name, zone, src_proj, dst_proj, dst_sa, snapshots, max_age_days
                     )
                     continue
 
@@ -2172,6 +2180,9 @@ resource "google_storage_bucket" "mock_bucket" {{
                     desc=f"Start VM {vm_name}",
                     explanation="復元ディスクで VM を起動",
                     impersonate_sa=dst_sa,
+                )
+                self._attach_secondary_disks(
+                    vm, vm_name, zone, src_proj, dst_proj, dst_sa, snapshots, max_age_days
                 )
 
         self.dst_logger.info("  ✓ Step 5 完了")
@@ -2261,6 +2272,111 @@ resource "google_storage_bucket" "mock_bucket" {{
 
         parts.append("no-address")
         return "--network-interface=" + ",".join(parts)
+
+    def _build_vm_create_extra_args(self, vm: Dict, tmpdir: str) -> str:
+        """src VM の追加属性（metadata/tags/labels/SA/scheduling 等）を
+        gcloud compute instances create の引数文字列に変換する。
+
+        - metadata は値に , や = や改行を含むため `--metadata-from-file key=path` で渡す
+        - compute 既定 SA（プロジェクト番号始まり）は dst で別 ID になるため SA 指定しない
+        - 値は shlex.quote でエスケープ
+        """
+        args: List[str] = []
+
+        tags = (vm.get('tags') or {}).get('items') or []
+        if tags:
+            args.append("--tags=" + ",".join(shlex.quote(t) for t in tags))
+
+        labels = vm.get('labels') or {}
+        if labels:
+            # `--labels=k=v,k=v` 形式（key/value は英数 + _ - のみのため quote 不要）
+            args.append("--labels=" + ",".join(f"{k}={v}" for k, v in labels.items()))
+
+        sa = (vm.get('serviceAccounts') or [{}])[0]
+        sa_email = sa.get('email') or ''
+        sa_scopes = sa.get('scopes') or []
+        # `<project-number>-compute@developer.gserviceaccount.com` は dst で番号違いとなり
+        # 借用不可。dst の compute 既定 SA を使わせるため email は付けない。
+        if sa_email and not re.match(r'^\d+-compute@developer\.gserviceaccount\.com$', sa_email):
+            args.append(f"--service-account={shlex.quote(sa_email)}")
+            if sa_scopes:
+                args.append("--scopes=" + ",".join(sa_scopes))
+
+        sched = vm.get('scheduling') or {}
+        if sched.get('preemptible'):
+            args.append("--preemptible")
+        pm = (sched.get('provisioningModel') or '').upper()
+        if pm == 'SPOT' and not sched.get('preemptible'):
+            args.append("--provisioning-model=SPOT")
+        ohm = sched.get('onHostMaintenance')
+        if ohm:
+            args.append(f"--maintenance-policy={ohm}")
+        if sched.get('automaticRestart') is False:
+            args.append("--no-restart-on-failure")
+
+        if vm.get('minCpuPlatform'):
+            args.append(f"--min-cpu-platform={shlex.quote(vm['minCpuPlatform'])}")
+        if vm.get('canIpForward'):
+            args.append("--can-ip-forward")
+        if vm.get('deletionProtection'):
+            args.append("--deletion-protection")
+
+        md_items = (vm.get('metadata') or {}).get('items') or []
+        for it in md_items:
+            key = it.get('key')
+            val = it.get('value')
+            if not key or val is None:
+                continue
+            # 安全な key 名のみ（gcloud は英数/-/_）
+            safe_key = re.sub(r'[^A-Za-z0-9_-]', '_', key)
+            fpath = os.path.join(tmpdir, f"md_{safe_key}.txt")
+            try:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(val if isinstance(val, str) else str(val))
+                args.append(f"--metadata-from-file={key}={fpath}")
+            except OSError as e:
+                self.dst_logger.warning(f"      metadata 書込失敗 ({key}): {e}")
+
+        return " ".join(args)
+
+    def _attach_secondary_disks(self, vm: Dict, vm_name: str, zone: str,
+                                src_proj: str, dst_proj: str, dst_sa: Optional[str],
+                                snapshots: List[Dict], max_age_days: int):
+        """src VM のセカンダリ（boot 以外）ディスクを snapshot から復元して attach する。
+
+        - boot ディスクは Step5 メインフローが扱うのでスキップ
+        - 各セカンダリは src 名と同じ disk 名で dst に作成
+        - attach は冪等性のため allow_fail（既 attach は再 attach で失敗するのを許容）
+        """
+        for d in vm.get('disks', []) or []:
+            if d.get('boot'):
+                continue
+            src_disk_name = (d.get('source') or '').split('/')[-1]
+            if not src_disk_name:
+                continue
+            snap_name = self._find_valid_snapshot(snapshots, src_disk_name, max_age_days)
+            if not snap_name:
+                self.dst_logger.warning(
+                    f"      ⚠ セカンダリディスク {src_disk_name}: 有効スナップショットが無いためスキップ"
+                )
+                continue
+            snap_path = f"projects/{src_proj}/global/snapshots/{snap_name}"
+            self.dst_logger.info(
+                f"      セカンダリディスク復元: {src_disk_name} (snap={snap_name})"
+            )
+            self._create_disk_from_snapshot(src_disk_name, snap_path, zone, dst_proj, dst_sa)
+            device_name = d.get('deviceName') or src_disk_name
+            mode = d.get('mode') or 'READ_WRITE'
+            mode_flag = "--mode=ro" if mode == 'READ_ONLY' else "--mode=rw"
+            self.run_command(
+                f"gcloud compute instances attach-disk {vm_name} --disk={src_disk_name} "
+                f"--device-name={device_name} {mode_flag} "
+                f"--zone={zone} --project={dst_proj} --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Attach secondary disk {src_disk_name}",
+                explanation=f"セカンダリディスク {src_disk_name} を {vm_name} に attach",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
 
     def _warn_if_dst_internal_ip_mismatch(self, vm_name: str, zone: str,
                                           dst_proj: str, dst_sa: Optional[str],
