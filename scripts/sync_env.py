@@ -189,6 +189,34 @@ def log_stage_header(logger: logging.Logger, step_no: int, title: str, count: Op
     logger.info(bar)
 
 
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def _first_meaningful_line(stderr: Optional[str], stdout: Optional[str], limit: int = 200) -> str:
+    """サマリー用に、stderr/stdout から最も情報量の多い1行を抽出する。
+
+    WARNING / impersonation 警告 / 装飾用の空行や枠線は飛ばし、
+    "Error:" を含む行があれば優先する。なければ最初の非空行を返す。
+    """
+    for src in (stderr, stdout):
+        if not src:
+            continue
+        text = _ANSI_RE.sub('', src)
+        lines = [ln.strip(' │╷╵') for ln in text.splitlines() if ln.strip(' │╷╵')]
+        # Error: を含む行を優先
+        for ln in lines:
+            if 'Error' in ln and 'WARNING' not in ln:
+                return ln[:limit]
+        # それ以外は WARNING / impersonation を除いた最初の行
+        for ln in lines:
+            if ln.upper().startswith('WARNING'):
+                continue
+            if 'impersonation' in ln.lower():
+                continue
+            return ln[:limit]
+    return "(理由不明)"
+
+
 # ---------------------------------------------------------------------------
 # 統計（スレッドセーフ）
 # ---------------------------------------------------------------------------
@@ -200,6 +228,7 @@ class StageStats:
         self.skipped = 0    # 既存のためスキップ
         self.failed = 0
         self.mocked = 0
+        self.failures: List[tuple] = []  # [(desc, reason_one_line), ...]
 
     def incr(self, kind: str):
         with self.lock:
@@ -213,6 +242,10 @@ class StageStats:
                 self.failed += 1
             elif kind == "mocked":
                 self.mocked += 1
+
+    def add_failure(self, desc: str, reason: str):
+        with self.lock:
+            self.failures.append((desc or "(no desc)", reason or "(no reason)"))
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +711,7 @@ class MigrationOrchestrator:
                     if result.stdout and result.stdout.strip():
                         logger.error(f"      理由(stdout): {result.stdout.strip()[:2000]}")
                     self.stats.incr("failed")
+                    self.stats.add_failure(desc, _first_meaningful_line(result.stderr, result.stdout))
                     if not allow_fail:
                         sys.exit(result.returncode)
                     return None
@@ -697,6 +731,7 @@ class MigrationOrchestrator:
                     continue
                 logger.error(f"{tag}例外発生: {e}")
                 self.stats.incr("failed")
+                self.stats.add_failure(desc, f"例外: {e}")
                 if not allow_fail:
                     sys.exit(1)
                 return None
@@ -869,6 +904,10 @@ resource "google_storage_bucket" "mock_bucket" {{
             logger.info(f"  失敗     : {self.stats.failed} 件")
             logger.info(f"  Mock実行 : {self.stats.mocked} 件")
             logger.info(f"  ログ     : {self.run_dir}")
+            if self.stats.failures:
+                logger.info("  失敗詳細:")
+                for desc, reason in self.stats.failures:
+                    logger.info(f"    - [{desc}] {reason}")
             logger.info(bar)
 
     # ----- マッピングからプロジェクト一覧を作るヘルパ -----
@@ -1744,9 +1783,12 @@ resource "google_storage_bucket" "mock_bucket" {{
                 # 403 で止まる。bootstrap で漏れていても自動で復旧できるよう init 前に
                 # 必ず有効化する（冪等）。
                 self._ensure_dst_prereq_apis(dst_proj, sa_map.get(os.path.basename(proj_dir)))
-                # bulk-export は provider 設定を生成しないため init は通るが import/plan で
-                # "Invalid provider configuration" になる。dst プロジェクトと借用 SA を
-                # 明示した provider.tf を毎回書き出して回避する（冪等）。
+            # bulk-export は provider 設定を生成しないため init は通るが import/plan で
+            # "Invalid provider configuration" になる。dst プロジェクトと借用 SA を
+            # 明示した provider.tf を毎回書き出して回避する（冪等）。
+            # ローカルファイル書きのみで dst への副作用は無いため dry_run でも実施し、
+            # plan が "Invalid provider configuration" で落ちるのを防ぐ。
+            if not self.mock and dst_proj:
                 self._write_provider_tf(
                     proj_dir, dst_proj, sa_map.get(os.path.basename(proj_dir))
                 )
@@ -2340,10 +2382,11 @@ resource "google_storage_bucket" "mock_bucket" {{
         # src バケットに対応する dst バケットが無いことがある。rsync 前に dst バケットを
         # 無ければ作成して同期先を保証する（location は src を維持・冪等）。
         proj_map = self._build_proj_id_map()
-        for b in buckets:
+
+        def bucket_worker(b):
             orig = (b.get('name') or '').replace('gs://', '').strip('/')
             if not orig:
-                continue
+                return
             location = b.get('location') or 'US'
             base = orig
             for s in sorted(proj_map.keys(), key=len, reverse=True):
@@ -2382,6 +2425,8 @@ resource "google_storage_bucket" "mock_bucket" {{
                 explanation=f"src バケットから dst バケットにデータ同期",
                 impersonate_sa=dst_sa,
             )
+
+        self._parallel_for_each(buckets, bucket_worker, "gcs-rsync")
 
     def _sync_bq(self, src_proj, dst_proj, src_sa, dst_sa):
         self.dst_logger.info("  [BQ] BigQuery 同期")
@@ -2457,10 +2502,10 @@ resource "google_storage_bucket" "mock_bucket" {{
                 tables = json.loads(tables_json)
             except Exception:
                 continue
-            for t in tables:
+            def table_worker(t):
                 t_id = t.get('tableReference', {}).get('tableId')
                 if not t_id:
-                    continue
+                    return
                 self.dst_logger.info(f"      Table: {ds_id}.{t_id}")
                 self.run_command(
                     f"bq --project_id={dst_proj} cp --force {src_proj}:{ds_id}.{t_id} {dst_proj}:{ds_id}.{t_id}",
@@ -2469,6 +2514,8 @@ resource "google_storage_bucket" "mock_bucket" {{
                     explanation=f"テーブルを src → dst にコピー（同一 location 必要）",
                     impersonate_sa=dst_sa,
                 )
+
+            self._parallel_for_each(tables, table_worker, f"bq-cp-{ds_id}")
 
 
 def main():
@@ -2491,6 +2538,8 @@ def main():
         mock_override=args.mock,
     )
     orchestrator.execute()
+    if orchestrator.stats.failed > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
