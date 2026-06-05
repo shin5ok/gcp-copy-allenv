@@ -2332,6 +2332,31 @@ resource "google_storage_bucket" "mock_bucket" {{
             args.append("--can-ip-forward")
         if vm.get('deletionProtection'):
             args.append("--deletion-protection")
+        if vm.get('description'):
+            args.append(f"--description={shlex.quote(vm['description'])}")
+        if vm.get('hostname'):
+            args.append(f"--hostname={shlex.quote(vm['hostname'])}")
+
+        # Shielded VM 設定（true のときだけ付ける。false はデフォルトなので無指定）
+        sh = vm.get('shieldedInstanceConfig') or {}
+        if sh.get('enableSecureBoot'):
+            args.append("--shielded-secure-boot")
+        if sh.get('enableVtpm'):
+            args.append("--shielded-vtpm")
+        if sh.get('enableIntegrityMonitoring'):
+            args.append("--shielded-integrity-monitoring")
+
+        # Confidential VM
+        conf = vm.get('confidentialInstanceConfig') or {}
+        if conf.get('enableConfidentialCompute'):
+            args.append("--confidential-compute")
+
+        # GPU / アクセラレータ
+        for a in vm.get('guestAccelerators') or []:
+            t = (a.get('acceleratorType') or '').split('/')[-1]
+            c = a.get('acceleratorCount') or 1
+            if t:
+                args.append(f"--accelerator=type={t},count={c}")
 
         md_items = (vm.get('metadata') or {}).get('items') or []
         for it in md_items:
