@@ -4,11 +4,11 @@
 サブコマンド:
   setup   : ターゲット project の事前準備
               - 必要な API の有効化 (compute, storage, vmmigration, iam)
-              - 内部 IP の予約 (network.internal_ip.address_name)
-  import  : source.disks[] を `gcloud migration vms image-imports` でカスタムイメージ化
-  start   : 取得済みカスタムイメージから GCE インスタンスを作成
-              - 追加ディスクが必要な場合は disk create → attach
-              - 内部 IP は static / external IP は config に従う
+              - Migrate to VMs の TargetProject 登録
+              - vmmigration SA への source bucket 権限付与
+              - 各 VM の内部 IP / 外部 static IP 予約
+  import  : vms[].source.disks[] を `gcloud migration vms image-imports` でカスタムイメージ化 (非同期)
+  start   : 各 VM のカスタムイメージから GCE インスタンスを作成・起動
 
 挙動:
   - 既定では config.global.dry_run の値に従う (template 既定は true)。
@@ -74,6 +74,13 @@ def load_ctx(path: Path, apply_flag: bool | None) -> Ctx:
     return Ctx(cfg=cfg, cfg_path=path, apply=apply)
 
 
+def _vms(ctx: Ctx) -> list[dict[str, Any]]:
+    vms = ctx.cfg.get("vms") or []
+    if not vms:
+        sys.exit("エラー: config に vms[] が定義されていません。")
+    return vms
+
+
 # --------------------------------------------------------------------------- #
 # Logging / command runner
 # --------------------------------------------------------------------------- #
@@ -128,22 +135,42 @@ def run_capture(ctx: Ctx, argv: list[str]) -> tuple[int, str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# helpers: naming
+# helpers: per-VM
 # --------------------------------------------------------------------------- #
-def image_name(ctx: Ctx, disk_name: str) -> str:
-    prefix = ctx.cfg["image_import"]["image_name_prefix"]
+def image_name(vm_cfg: dict[str, Any], disk_name: str) -> str:
+    prefix = vm_cfg["image_import"]["image_name_prefix"]
     return f"{prefix}-{disk_name}"
 
 
-def boot_disk_entry(ctx: Ctx) -> dict[str, Any]:
-    for d in ctx.cfg["source"]["disks"]:
+def boot_disk_entry(vm_cfg: dict[str, Any]) -> dict[str, Any]:
+    for d in vm_cfg["source"]["disks"]:
         if d.get("boot"):
             return d
-    sys.exit("エラー: source.disks に boot: true のディスクがありません。")
+    sys.exit(f"エラー: vms[{vm_cfg.get('name')}].source.disks に boot: true のディスクがありません。")
 
 
-def data_disk_entries(ctx: Ctx) -> list[dict[str, Any]]:
-    return [d for d in ctx.cfg["source"]["disks"] if not d.get("boot")]
+def data_disk_entries(vm_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    return [d for d in vm_cfg["source"]["disks"] if not d.get("boot")]
+
+
+def _migration_target_ids(ctx: Ctx, vm_cfg: dict[str, Any]) -> tuple[str, str]:
+    """(host_project, target_project_id) を返す。未指定なら両方 ctx.project。"""
+    ii = vm_cfg.get("image_import", {}) or {}
+    host = ii.get("target_project_host") or ctx.project
+    target = ii.get("target_project_name") or ctx.project
+    return host, target
+
+
+def _source_bucket_names_for_vm(vm_cfg: dict[str, Any]) -> list[str]:
+    seen: list[str] = []
+    for d in vm_cfg.get("source", {}).get("disks", []) or []:
+        uri = str(d.get("gcs_uri", ""))
+        if not uri.startswith("gs://"):
+            continue
+        bucket = uri[len("gs://"):].split("/", 1)[0]
+        if bucket and bucket not in seen:
+            seen.append(bucket)
+    return seen
 
 
 def image_disk_size_gb(ctx: Ctx, img_name: str) -> int | None:
@@ -178,22 +205,14 @@ def image_disk_size_gb(ctx: Ctx, img_name: str) -> int | None:
 
 
 # --------------------------------------------------------------------------- #
-# setup
+# setup helpers
 # --------------------------------------------------------------------------- #
 REQUIRED_APIS = [
     "compute.googleapis.com",
     "storage.googleapis.com",
-    "vmmigration.googleapis.com",  # gcloud migration vms image-imports
+    "vmmigration.googleapis.com",
     "iam.googleapis.com",
 ]
-
-
-def _migration_target_ids(ctx: Ctx) -> tuple[str, str]:
-    """(host_project, target_project_id) を返す。未指定なら両方 ctx.project。"""
-    ii = ctx.cfg.get("image_import", {}) or {}
-    host = ii.get("target_project_host") or ctx.project
-    target = ii.get("target_project_name") or ctx.project
-    return host, target
 
 
 def _gcloud_access_token() -> str:
@@ -208,7 +227,6 @@ def ensure_target_project(ctx: Ctx, host_project: str, target_id: str) -> None:
     """Migrate to VMs の TargetProject リソースを登録 (REST API)。
 
     gcloud には `target-projects create` が無いので vmmigration REST を直接叩く。
-    target_id はリソース ID (= 既存の登録名)。中身の参照先 project_id は同じ値を使う。
     """
     expected = f"projects/{host_project}/locations/global/targetProjects/{target_id}"
     rc, out, _ = run_capture(ctx, [
@@ -250,7 +268,7 @@ def ensure_target_project(ctx: Ctx, host_project: str, target_id: str) -> None:
         logging.info("target project 登録完了 (即時)")
         return
     poll_url = f"https://vmmigration.googleapis.com/v1/{op_name}"
-    for _ in range(60):  # 最大 ~60s
+    for _ in range(60):
         time.sleep(1)
         req2 = urllib.request.Request(poll_url, headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req2) as r2:
@@ -277,43 +295,17 @@ def _vmmigration_sa_email(project_number: str) -> str:
     return f"service-{project_number}@gcp-sa-vmmigration.iam.gserviceaccount.com"
 
 
-def _source_bucket_names(ctx: Ctx) -> list[str]:
-    seen: list[str] = []
-    for d in ctx.cfg.get("source", {}).get("disks", []) or []:
-        uri = str(d.get("gcs_uri", ""))
-        if not uri.startswith("gs://"):
-            continue
-        bucket = uri[len("gs://"):].split("/", 1)[0]
-        if bucket and bucket not in seen:
-            seen.append(bucket)
-    return seen
-
-
-def grant_source_bucket_access(ctx: Ctx) -> None:
-    """source VMDK の置かれた GCS バケットに vmmigration SA の Object Viewer を付与。"""
-    # 1) サービスエージェントを明示作成 (既存なら no-op)
-    run(ctx, [
-        "gcloud", "beta", "services", "identity", "create",
-        "--service", "vmmigration.googleapis.com",
-        "--project", ctx.project,
-    ])
-
-    # 2) SA email 算出
-    pnum = _project_number(ctx, ctx.project)
-    if not pnum:
-        if ctx.apply:
-            sys.exit(f"エラー: project number を取得できません: {ctx.project}")
-        logging.info("[DRY] project number 取得スキップ。SA email は service-<NUM>@gcp-sa-vmmigration...")
-        sa_email = "service-<PROJECT_NUMBER>@gcp-sa-vmmigration.iam.gserviceaccount.com"
-    else:
-        sa_email = _vmmigration_sa_email(pnum)
-
-    # 3) source bucket ごとに objectViewer を付与
-    buckets = _source_bucket_names(ctx)
-    if not buckets:
-        logging.info("source.disks に gcs_uri が無いので bucket 権限付与はスキップ。")
+def grant_source_bucket_access(ctx: Ctx, sa_email: str, all_vms: list[dict[str, Any]]) -> None:
+    """全 VM の source VMDK が置かれた GCS バケットに vmmigration SA の objectViewer を付与。"""
+    all_buckets: list[str] = []
+    for vm_cfg in all_vms:
+        for b in _source_bucket_names_for_vm(vm_cfg):
+            if b not in all_buckets:
+                all_buckets.append(b)
+    if not all_buckets:
+        logging.info("全 VM の source.disks に gcs_uri が無いので bucket 権限付与はスキップ。")
         return
-    for bucket in buckets:
+    for bucket in all_buckets:
         run(ctx, [
             "gcloud", "storage", "buckets", "add-iam-policy-binding",
             f"gs://{bucket}",
@@ -322,133 +314,164 @@ def grant_source_bucket_access(ctx: Ctx) -> None:
         ])
 
 
-def cmd_setup(ctx: Ctx) -> None:
-    logging.info("===== setup: target project = %s =====", ctx.project)
-
-    # 1) API 有効化
-    for api in REQUIRED_APIS:
-        run(ctx, ["gcloud", "services", "enable", api, "--project", ctx.project])
-
-    # 2) Migrate to VMs の TargetProject 登録
-    host_project, target_id = _migration_target_ids(ctx)
-    ensure_target_project(ctx, host_project, target_id)
-
-    # 3) source bucket への vmmigration SA アクセス権付与
-    grant_source_bucket_access(ctx)
-
-    # 4) 内部 IP 予約 (mode=address_name の時のみ)
-    # Shared VPC: 予約リソースは service project (= ctx.project) に作成し、
-    #             --subnet だけ host_project の self-link を指す。
-    net = ctx.cfg.get("network", {})
+def _reserve_internal_ip(ctx: Ctx, vm_name: str, net: dict[str, Any]) -> None:
     ip = net.get("internal_ip", {}) or {}
     if ip.get("mode") == "address_name":
         addr = ip.get("address_name")
         if not addr or addr.startswith("REPLACE_ME"):
-            sys.exit("エラー: network.internal_ip.address_name が未設定です。")
+            sys.exit(f"エラー: vms[{vm_name}].network.internal_ip.address_name が未設定です。")
         host_project = net.get("host_project") or ctx.project
         subnet = net.get("subnetwork")
         if not subnet or subnet.startswith("REPLACE_ME"):
-            sys.exit("エラー: network.subnetwork が未設定です。")
+            sys.exit(f"エラー: vms[{vm_name}].network.subnetwork が未設定です。")
         rc, _, _ = run_capture(ctx, [
             "gcloud", "compute", "addresses", "describe", addr,
-            "--region", ctx.region,
-            "--project", ctx.project,
+            "--region", ctx.region, "--project", ctx.project,
         ])
         if rc == 0:
-            logging.info("内部 IP 予約は既存: %s (project=%s)", addr, ctx.project)
-        else:
-            subnet_ref = (
-                subnet
-                if subnet.startswith("projects/") or subnet.startswith("https://")
-                else f"projects/{host_project}/regions/{ctx.region}/subnetworks/{subnet}"
-            )
-            cmd = [
-                "gcloud", "compute", "addresses", "create", addr,
-                "--region", ctx.region,
-                "--project", ctx.project,
-                "--subnet", subnet_ref,
-                "--purpose", "GCE_ENDPOINT",
-            ]
-            if ip.get("ip"):
-                cmd += ["--addresses", str(ip["ip"])]
-            run(ctx, cmd)
+            logging.info("[%s] 内部 IP 予約は既存: %s", vm_name, addr)
+            return
+        subnet_ref = (
+            subnet
+            if subnet.startswith("projects/") or subnet.startswith("https://")
+            else f"projects/{host_project}/regions/{ctx.region}/subnetworks/{subnet}"
+        )
+        cmd = [
+            "gcloud", "compute", "addresses", "create", addr,
+            "--region", ctx.region,
+            "--project", ctx.project,
+            "--subnet", subnet_ref,
+            "--purpose", "GCE_ENDPOINT",
+        ]
+        if ip.get("ip"):
+            cmd += ["--addresses", str(ip["ip"])]
+        run(ctx, cmd)
     elif ip.get("mode") == "ip":
-        logging.info("内部 IP は固定値モード。予約はスキップ (instance create で直接指定)。")
+        logging.info("[%s] 内部 IP は固定値モード。予約はスキップ。", vm_name)
 
-    # 4) external static IP 予約 (任意)
+
+def _reserve_external_ip(ctx: Ctx, vm_name: str, net: dict[str, Any]) -> None:
     ext = net.get("external_ip", {}) or {}
-    if ext.get("enabled") and ext.get("mode") == "static":
-        addr = ext.get("address_name")
-        if addr:
-            rc, _, _ = run_capture(ctx, [
-                "gcloud", "compute", "addresses", "describe", addr,
-                "--region", ctx.region, "--project", ctx.project,
-            ])
-            if rc == 0:
-                logging.info("external static IP 既存: %s", addr)
-            else:
-                tier = ext.get("network_tier", "PREMIUM")
-                run(ctx, [
-                    "gcloud", "compute", "addresses", "create", addr,
-                    "--region", ctx.region,
-                    "--project", ctx.project,
-                    "--network-tier", tier,
-                ])
+    if not (ext.get("enabled") and ext.get("mode") == "static"):
+        return
+    addr = ext.get("address_name")
+    if not addr:
+        return
+    rc, _, _ = run_capture(ctx, [
+        "gcloud", "compute", "addresses", "describe", addr,
+        "--region", ctx.region, "--project", ctx.project,
+    ])
+    if rc == 0:
+        logging.info("[%s] external static IP 既存: %s", vm_name, addr)
+        return
+    tier = ext.get("network_tier", "PREMIUM")
+    run(ctx, [
+        "gcloud", "compute", "addresses", "create", addr,
+        "--region", ctx.region,
+        "--project", ctx.project,
+        "--network-tier", tier,
+    ])
 
-    logging.info("setup 完了。")
+
+# --------------------------------------------------------------------------- #
+# setup
+# --------------------------------------------------------------------------- #
+def cmd_setup(ctx: Ctx) -> None:
+    vms = _vms(ctx)
+    logging.info("===== setup: project=%s, %d VM =====", ctx.project, len(vms))
+
+    # 1) API 有効化 (共通・1回)
+    for api in REQUIRED_APIS:
+        run(ctx, ["gcloud", "services", "enable", api, "--project", ctx.project])
+
+    # 2) TargetProject 登録 (unique な (host, target) ペアごと)
+    seen_targets: set[tuple[str, str]] = set()
+    for vm_cfg in vms:
+        pair = _migration_target_ids(ctx, vm_cfg)
+        if pair not in seen_targets:
+            ensure_target_project(ctx, pair[0], pair[1])
+            seen_targets.add(pair)
+
+    # 3) vmmigration SA 作成 + 全 VM の source bucket 権限付与 (共通・1回)
+    run(ctx, [
+        "gcloud", "beta", "services", "identity", "create",
+        "--service", "vmmigration.googleapis.com",
+        "--project", ctx.project,
+    ])
+    pnum = _project_number(ctx, ctx.project)
+    if not pnum:
+        if ctx.apply:
+            sys.exit(f"エラー: project number を取得できません: {ctx.project}")
+        logging.info("[DRY] project number 取得スキップ。")
+        sa_email = "service-<PROJECT_NUMBER>@gcp-sa-vmmigration.iam.gserviceaccount.com"
+    else:
+        sa_email = _vmmigration_sa_email(pnum)
+    grant_source_bucket_access(ctx, sa_email, vms)
+
+    # 4) 各 VM の IP 予約
+    for vm_cfg in vms:
+        vm_name = vm_cfg.get("name", "?")
+        net = vm_cfg.get("network", {})
+        _reserve_internal_ip(ctx, vm_name, net)
+        _reserve_external_ip(ctx, vm_name, net)
+
+    logging.info("setup 完了。(%d VM)", len(vms))
 
 
 # --------------------------------------------------------------------------- #
 # import
 # --------------------------------------------------------------------------- #
 def cmd_import(ctx: Ctx) -> None:
-    logging.info("===== import: VMDK -> custom image (Migrate to VMs) =====")
-    ii = ctx.cfg.get("image_import", {}) or {}
-    license_type = ii.get("license_type")
-    host_project, target_id = _migration_target_ids(ctx)
-    target_project_path = (
-        f"projects/{host_project}/locations/global/targetProjects/{target_id}"
-    )
+    vms = _vms(ctx)
+    logging.info("===== import: VMDK -> custom image (Migrate to VMs), %d VM =====", len(vms))
 
-    for disk in ctx.cfg["source"]["disks"]:
-        img = image_name(ctx, disk["name"])
-        import_name = img  # import resource 名 = image 名 (混乱回避)
+    for vm_cfg in vms:
+        vm_name = vm_cfg.get("name", "?")
+        logging.info("----- [%s] import 開始 -----", vm_name)
+        ii = vm_cfg.get("image_import", {}) or {}
+        license_type = ii.get("license_type")
+        host_project, target_id = _migration_target_ids(ctx, vm_cfg)
+        target_project_path = (
+            f"projects/{host_project}/locations/global/targetProjects/{target_id}"
+        )
 
-        # 1) 最終イメージが既に存在すれば skip
-        rc, _, _ = run_capture(ctx, [
-            "gcloud", "compute", "images", "describe", img, "--project", ctx.project,
-        ])
-        if rc == 0:
-            logging.info("image 既存: %s (skip)", img)
-            continue
+        for disk in vm_cfg["source"]["disks"]:
+            img = image_name(vm_cfg, disk["name"])
+            import_name = img
 
-        # 2) image-import resource が既にあれば「進行中」とみなして skip
-        rc, _, _ = run_capture(ctx, [
-            "gcloud", "migration", "vms", "image-imports", "describe", import_name,
-            "--location", ctx.region,
-            "--project", ctx.project,
-        ])
-        if rc == 0:
-            logging.info(
-                "image-import 進行中または失敗: %s (state を describe で確認してください)",
-                import_name,
-            )
-            continue
+            rc, _, _ = run_capture(ctx, [
+                "gcloud", "compute", "images", "describe", img, "--project", ctx.project,
+            ])
+            if rc == 0:
+                logging.info("[%s] image 既存: %s (skip)", vm_name, img)
+                continue
 
-        cmd = [
-            "gcloud", "migration", "vms", "image-imports", "create", import_name,
-            "--project", ctx.project,
-            "--location", ctx.region,
-            "--source-file", disk["gcs_uri"],
-            "--image-name", img,
-        ]
-        cmd += ["--target-project", target_project_path]
-        if disk.get("boot"):
-            if license_type:
-                cmd += ["--license-type", license_type]
-        else:
-            cmd += ["--skip-os-adaptation"]
-        run(ctx, cmd)
+            rc, _, _ = run_capture(ctx, [
+                "gcloud", "migration", "vms", "image-imports", "describe", import_name,
+                "--location", ctx.region,
+                "--project", ctx.project,
+            ])
+            if rc == 0:
+                logging.info(
+                    "[%s] image-import 進行中または失敗: %s (describe で確認してください)",
+                    vm_name, import_name,
+                )
+                continue
+
+            cmd = [
+                "gcloud", "migration", "vms", "image-imports", "create", import_name,
+                "--project", ctx.project,
+                "--location", ctx.region,
+                "--source-file", disk["gcs_uri"],
+                "--image-name", img,
+            ]
+            cmd += ["--target-project", target_project_path]
+            if disk.get("boot"):
+                if license_type:
+                    cmd += ["--license-type", license_type]
+            else:
+                cmd += ["--skip-os-adaptation"]
+            run(ctx, cmd)
 
     logging.info("import 投入完了 (非同期)。完了確認は `gcloud migration vms image-imports describe` で。")
 
@@ -456,129 +479,110 @@ def cmd_import(ctx: Ctx) -> None:
 # --------------------------------------------------------------------------- #
 # start (instance create)
 # --------------------------------------------------------------------------- #
-def cmd_start(ctx: Ctx) -> None:
-    logging.info("===== start: create GCE instance =====")
-    inst = ctx.cfg["instance"]
-    net = ctx.cfg.get("network", {})
+def _build_instance_cmd(
+    ctx: Ctx, vm_name: str, inst: dict[str, Any], net: dict[str, Any], vm_cfg: dict[str, Any],
+) -> list[str]:
     name = inst["name"]
-    if name.startswith("REPLACE_ME"):
-        sys.exit("エラー: instance.name が REPLACE_ME のままです。")
+    boot_disk = boot_disk_entry(vm_cfg)
+    boot_img = image_name(vm_cfg, boot_disk["name"])
+    bd = inst.get("boot_disk", {}) or {}
 
-    # 既存チェック
-    rc, _, _ = run_capture(ctx, [
-        "gcloud", "compute", "instances", "describe", name,
-        "--zone", ctx.zone, "--project", ctx.project,
-    ])
-    if rc == 0:
-        logging.info("instance 既存: %s (create skip)。起動状態のみ確認。", name)
-    else:
-        boot_disk = boot_disk_entry(ctx)
-        boot_img = image_name(ctx, boot_disk["name"])
-        bd = inst.get("boot_disk", {}) or {}
+    cmd: list[str] = [
+        "gcloud", "compute", "instances", "create", name,
+        "--project", ctx.project,
+        "--zone", ctx.zone,
+        "--machine-type", inst["machine_type"],
+        "--image", boot_img,
+        "--image-project", ctx.project,
+        "--boot-disk-type", bd.get("type", "pd-balanced"),
+    ]
 
-        cmd: list[str] = [
-            "gcloud", "compute", "instances", "create", name,
-            "--project", ctx.project,
-            "--zone", ctx.zone,
-            "--machine-type", inst["machine_type"],
-            "--image", boot_img,
-            "--image-project", ctx.project,
-            "--boot-disk-type", bd.get("type", "pd-balanced"),
-        ]
-        # ブートディスクサイズ: 指定が無い、またはイメージ実サイズ未満なら
-        # イメージ実サイズに自動引き上げ (gcloud は image より小さい disk を許可しない)
-        img_size = image_disk_size_gb(ctx, boot_img)
-        cfg_size = bd.get("size_gb")
-        if img_size is not None:
-            if cfg_size and int(cfg_size) >= img_size:
-                final_size = int(cfg_size)
-            else:
-                if cfg_size:
-                    logging.info(
-                        "boot_disk.size_gb=%s はイメージ %s の実サイズ %sGB より小さいため %sGB に引き上げ",
-                        cfg_size, boot_img, img_size, img_size,
-                    )
-                final_size = img_size
-            cmd += ["--boot-disk-size", f"{final_size}GB"]
-        elif cfg_size:
-            cmd += ["--boot-disk-size", f"{cfg_size}GB"]
-        if bd.get("auto_delete") is False:
-            cmd += ["--no-boot-disk-auto-delete"]
-
-        # network
-        host_project = net.get("host_project") or ctx.project
-        subnet = net.get("subnetwork")
-        if not subnet:
-            sys.exit("エラー: network.subnetwork が必須です。")
-        subnet_ref = (
-            subnet
-            if subnet.startswith("projects/") or subnet.startswith("https://")
-            else f"projects/{host_project}/regions/{ctx.region}/subnetworks/{subnet}"
-        )
-        cmd += ["--subnet", subnet_ref]
-
-        # internal IP
-        ip = net.get("internal_ip", {}) or {}
-        if ip.get("mode") == "address_name":
-            cmd += ["--private-network-ip", ip["address_name"]]
-        elif ip.get("mode") == "ip":
-            cmd += ["--private-network-ip", str(ip["ip"])]
-
-        # external IP
-        ext = net.get("external_ip", {}) or {}
-        if not ext.get("enabled"):
-            cmd += ["--no-address"]
+    img_size = image_disk_size_gb(ctx, boot_img)
+    cfg_size = bd.get("size_gb")
+    if img_size is not None:
+        if cfg_size and int(cfg_size) >= img_size:
+            final_size = int(cfg_size)
         else:
-            tier = ext.get("network_tier", "PREMIUM")
-            cmd += ["--network-tier", tier]
-            if ext.get("mode") == "static" and ext.get("address_name"):
-                cmd += ["--address", ext["address_name"]]
+            if cfg_size:
+                logging.info(
+                    "[%s] boot_disk.size_gb=%s はイメージ %s の実サイズ %sGB より小さいため %sGB に引き上げ",
+                    vm_name, cfg_size, boot_img, img_size, img_size,
+                )
+            final_size = img_size
+        cmd += ["--boot-disk-size", f"{final_size}GB"]
+    elif cfg_size:
+        cmd += ["--boot-disk-size", f"{cfg_size}GB"]
+    if bd.get("auto_delete") is False:
+        cmd += ["--no-boot-disk-auto-delete"]
 
-        # tags
-        tags = inst.get("tags") or []
-        if tags:
-            cmd += ["--tags", ",".join(tags)]
+    host_project = net.get("host_project") or ctx.project
+    subnet = net.get("subnetwork")
+    if not subnet:
+        sys.exit(f"エラー: vms[{vm_name}].network.subnetwork が必須です。")
+    subnet_ref = (
+        subnet
+        if subnet.startswith("projects/") or subnet.startswith("https://")
+        else f"projects/{host_project}/regions/{ctx.region}/subnetworks/{subnet}"
+    )
+    cmd += ["--subnet", subnet_ref]
 
-        # labels
-        labels = inst.get("labels") or {}
-        if labels:
-            cmd += ["--labels", ",".join(f"{k}={v}" for k, v in labels.items())]
+    ip = net.get("internal_ip", {}) or {}
+    if ip.get("mode") == "address_name":
+        cmd += ["--private-network-ip", ip["address_name"]]
+    elif ip.get("mode") == "ip":
+        cmd += ["--private-network-ip", str(ip["ip"])]
 
-        # SA / scopes
-        if inst.get("service_account"):
-            cmd += ["--service-account", inst["service_account"]]
-        if inst.get("scopes"):
-            cmd += ["--scopes", ",".join(inst["scopes"])]
+    ext = net.get("external_ip", {}) or {}
+    if not ext.get("enabled"):
+        cmd += ["--no-address"]
+    else:
+        tier = ext.get("network_tier", "PREMIUM")
+        cmd += ["--network-tier", tier]
+        if ext.get("mode") == "static" and ext.get("address_name"):
+            cmd += ["--address", ext["address_name"]]
 
-        # metadata
-        md = inst.get("metadata") or {}
-        if md:
-            md_items = []
-            md_files = []
-            for k, v in md.items():
-                if k == "startup-script":
-                    # ファイルに落として --metadata-from-file
-                    sp = Path(ctx.cfg["global"].get("log_dir", "./logs")) / f"{name}.startup.sh"
-                    sp.write_text(v, encoding="utf-8")
-                    md_files.append(f"startup-script={sp}")
-                else:
-                    md_items.append(f"{k}={v}")
-            if md_items:
-                cmd += ["--metadata", ",".join(md_items)]
-            if md_files:
-                cmd += ["--metadata-from-file", ",".join(md_files)]
+    tags = inst.get("tags") or []
+    if tags:
+        cmd += ["--tags", ",".join(tags)]
 
-        run(ctx, cmd)
+    labels = inst.get("labels") or {}
+    if labels:
+        cmd += ["--labels", ",".join(f"{k}={v}" for k, v in labels.items())]
 
-    # 追加ディスク (data disk) を create + attach
-    for d in data_disk_entries(ctx):
+    if inst.get("service_account"):
+        cmd += ["--service-account", inst["service_account"]]
+    if inst.get("scopes"):
+        cmd += ["--scopes", ",".join(inst["scopes"])]
+
+    md = inst.get("metadata") or {}
+    if md:
+        md_items = []
+        md_files = []
+        for k, v in md.items():
+            if k == "startup-script":
+                sp = Path(ctx.cfg["global"].get("log_dir", "./logs")) / f"{name}.startup.sh"
+                sp.write_text(v, encoding="utf-8")
+                md_files.append(f"startup-script={sp}")
+            else:
+                md_items.append(f"{k}={v}")
+        if md_items:
+            cmd += ["--metadata", ",".join(md_items)]
+        if md_files:
+            cmd += ["--metadata-from-file", ",".join(md_files)]
+
+    return cmd
+
+
+def _attach_data_disks(ctx: Ctx, vm_name: str, inst: dict[str, Any], vm_cfg: dict[str, Any]) -> None:
+    name = inst["name"]
+    for d in data_disk_entries(vm_cfg):
         attach_entry = None
         for ad in inst.get("additional_disks") or []:
             if ad.get("source_name") == d["name"]:
                 attach_entry = ad
                 break
         if not attach_entry:
-            logging.warning("source.disks の %s に対応する instance.additional_disks がありません。", d["name"])
+            logging.warning("[%s] source.disks の %s に対応する additional_disks がありません。", vm_name, d["name"])
             continue
 
         disk_name = f"{name}-{d['name']}"
@@ -592,24 +596,23 @@ def cmd_start(ctx: Ctx) -> None:
                 "--project", ctx.project,
                 "--zone", ctx.zone,
                 "--type", attach_entry.get("type", "pd-balanced"),
-                "--image", image_name(ctx, d["name"]),
+                "--image", image_name(vm_cfg, d["name"]),
                 "--image-project", ctx.project,
             ]
             if attach_entry.get("size_gb"):
                 create += ["--size", f"{attach_entry['size_gb']}GB"]
             run(ctx, create)
         else:
-            logging.info("data disk 既存: %s (create skip)", disk_name)
+            logging.info("[%s] data disk 既存: %s (create skip)", vm_name, disk_name)
 
-        attach = [
+        run(ctx, [
             "gcloud", "compute", "instances", "attach-disk", name,
             "--project", ctx.project,
             "--zone", ctx.zone,
             "--disk", disk_name,
             "--device-name", attach_entry.get("device_name", d["name"]),
             "--mode", attach_entry.get("mode", "READ_WRITE"),
-        ]
-        run(ctx, attach, allow_fail=True)  # 既に attach 済みなら失敗するので許容
+        ], allow_fail=True)
 
         if attach_entry.get("auto_delete") is True:
             run(ctx, [
@@ -620,22 +623,46 @@ def cmd_start(ctx: Ctx) -> None:
                 "--auto-delete",
             ], allow_fail=True)
 
-    # 起動状態確認 (既に RUNNING なら no-op)
-    rc, out, _ = run_capture(ctx, [
-        "gcloud", "compute", "instances", "describe", name,
-        "--zone", ctx.zone, "--project", ctx.project,
-        "--format", "value(status)",
-    ])
-    status = (out or "").strip()
-    if rc == 0 and status and status != "RUNNING":
-        run(ctx, [
-            "gcloud", "compute", "instances", "start", name,
+
+def cmd_start(ctx: Ctx) -> None:
+    vms = _vms(ctx)
+    logging.info("===== start: create GCE instances, %d VM =====", len(vms))
+
+    for vm_cfg in vms:
+        vm_name = vm_cfg.get("name", "?")
+        logging.info("----- [%s] start 開始 -----", vm_name)
+        inst = vm_cfg["instance"]
+        net = vm_cfg.get("network", {})
+        name = inst["name"]
+        if name.startswith("REPLACE_ME"):
+            sys.exit(f"エラー: vms[{vm_name}].instance.name が REPLACE_ME のままです。")
+
+        rc, _, _ = run_capture(ctx, [
+            "gcloud", "compute", "instances", "describe", name,
             "--zone", ctx.zone, "--project", ctx.project,
         ])
-    else:
-        logging.info("instance status = %s (start 不要)", status or "unknown")
+        if rc == 0:
+            logging.info("[%s] instance 既存: %s (create skip)。起動状態のみ確認。", vm_name, name)
+        else:
+            run(ctx, _build_instance_cmd(ctx, vm_name, inst, net, vm_cfg))
 
-    logging.info("start 完了。")
+        _attach_data_disks(ctx, vm_name, inst, vm_cfg)
+
+        rc, out, _ = run_capture(ctx, [
+            "gcloud", "compute", "instances", "describe", name,
+            "--zone", ctx.zone, "--project", ctx.project,
+            "--format", "value(status)",
+        ])
+        status = (out or "").strip()
+        if rc == 0 and status and status != "RUNNING":
+            run(ctx, [
+                "gcloud", "compute", "instances", "start", name,
+                "--zone", ctx.zone, "--project", ctx.project,
+            ])
+        else:
+            logging.info("[%s] instance status = %s (start 不要)", vm_name, status or "unknown")
+
+    logging.info("start 完了。(%d VM)", len(vms))
 
 
 # --------------------------------------------------------------------------- #
