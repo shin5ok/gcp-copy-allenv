@@ -49,3 +49,4 @@ make vmware-all # VMware → GCE フル処理
   - `Co-Authored-By: Claude ...` 行を付けない
   - `🤖 Generated with Claude Code` などの行も付けない
   - 勝手にコミットやプッシュしない
+
