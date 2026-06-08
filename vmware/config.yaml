@@ -34,7 +34,7 @@ global:
 # 各エントリが 1 つの GCE インスタンスに対応する。
 # setup / import / start はすべての VM をまとめて処理する。
 vms:
-  - name: "centos8"                  # 識別子 (ログ表示用)
+  - name: "centos8t"                  # 識別子 (ログ表示用)
 
     # ---- ソース VMDK ----
     source:
@@ -64,8 +64,8 @@ vms:
 
     # ---- GCE インスタンス設定 ----
     instance:
-      name: "centos8-from-vm"
-      machine_type: "n2-standard-2"
+      name: "centos8-from-vmv"
+      machine_type: "e2-standard-2"
 
       boot_disk:
         type: "pd-balanced"
@@ -102,7 +102,80 @@ vms:
       internal_ip:
         mode: "ip"
         address_name: "centos8-internal-ip"
-        ip: 10.100.1.201
+        ip: 10.100.1.200
+
+      external_ip:
+        enabled: false
+
+  - name: "centos8v"                  # 識別子 (ログ表示用)
+
+    # ---- ソース VMDK ----
+    source:
+      disks:
+        - name: "boot"               # 任意の識別子（image 名のサフィックスにも使う）
+          boot: true
+          gcs_uri: "gs://shingo-ar-sharedhost0926/vmware_images/CentOS_8.4.2105_VMM_LinuxVMImages.COM.vmdk"
+
+        # データディスクがある場合は以下のように追加（不要なら削除可）
+        # - name: "data1"
+        #   boot: false
+        #   gcs_uri: "gs://REPLACE_ME/path/to/data1.vmdk"
+
+    # ---- イメージ import 設定 ----
+    image_import:
+      # 作成するカスタムイメージ名のプレフィックス
+      # 実際の image 名 / import resource 名は "<prefix>-<source.disks[].name>" になる
+      image_name_prefix: "vmdk-imported-20260608"
+
+      # ライセンスタイプ (省略可、boot disk のみ有効)
+      # compute-engine-license-type-byol / -payg / -default
+      # license_type: "compute-engine-license-type-default"
+
+      # Migration host project と target project が異なる場合のみ指定
+      # target_project_host: "vm-migration-host-project"
+      # target_project_name: "target-project-id"
+
+    # ---- GCE インスタンス設定 ----
+    instance:
+      name: "centos8-from-vmr"
+      machine_type: "e2-standard-2"
+
+      boot_disk:
+        type: "pd-balanced"
+        # size_gb: 50  # 未指定またはイメージ実サイズ未満の場合は自動引き上げ
+        auto_delete: true
+
+      additional_disks:
+        # - source_name: "data1"      # source.disks[].name を参照
+        #   device_name: "data1"
+        #   type: "pd-balanced"
+        #   size_gb: 100
+        #   mode: "READ_WRITE"
+        #   auto_delete: false
+
+      # service_account: "my-vm-sa@REPLACE_ME.iam.gserviceaccount.com"
+      # scopes: ["cloud-platform"]
+
+      labels:
+        env: "migrated"
+        source: "vmware"
+
+      tags:
+        - "ssh-allowed"
+
+      # metadata:
+      #   enable-oslogin: "TRUE"
+
+    # ---- ネットワーク設定 ----
+    network:
+      host_project: "shingo-ar-sharedhost0926"
+      network: "shared-vpc"
+      subnetwork: "subnet-svc1"
+
+      internal_ip:
+        mode: "ip"
+        address_name: "centos8-internal-ip"
+        ip: 10.100.1.202
 
       external_ip:
         enabled: false

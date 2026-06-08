@@ -139,7 +139,8 @@ def run_capture(ctx: Ctx, argv: list[str]) -> tuple[int, str, str]:
 # --------------------------------------------------------------------------- #
 def image_name(vm_cfg: dict[str, Any], disk_name: str) -> str:
     prefix = vm_cfg["image_import"]["image_name_prefix"]
-    return f"{prefix}-{disk_name}"
+    vm_name = vm_cfg.get("name", "vm")
+    return f"{prefix}-{vm_name}-{disk_name}"
 
 
 def boot_disk_entry(vm_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -425,9 +426,12 @@ def cmd_import(ctx: Ctx) -> None:
     vms = _vms(ctx)
     logging.info("===== import: VMDK -> custom image (Migrate to VMs), %d VM =====", len(vms))
 
+    used_locations: set[tuple[str, str]] = set()
+
     for vm_cfg in vms:
         vm_name = vm_cfg.get("name", "?")
         logging.info("----- [%s] import 開始 -----", vm_name)
+        used_locations.add((ctx.project, ctx.region))
         ii = vm_cfg.get("image_import", {}) or {}
         license_type = ii.get("license_type")
         host_project, target_id = _migration_target_ids(ctx, vm_cfg)
@@ -473,7 +477,12 @@ def cmd_import(ctx: Ctx) -> None:
                 cmd += ["--skip-os-adaptation"]
             run(ctx, cmd)
 
-    logging.info("import 投入完了 (非同期)。完了確認は `gcloud migration vms image-imports describe` で。")
+    logging.info("import 投入完了 (非同期)。完了確認:")
+    for proj, loc in sorted(used_locations):
+        logging.info(
+            "  gcloud migration vms image-imports list --project=%s --location=%s",
+            proj, loc,
+        )
 
 
 # --------------------------------------------------------------------------- #

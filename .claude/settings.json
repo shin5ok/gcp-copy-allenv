@@ -30,9 +30,39 @@
       "Read(/tmp/**)",
       "Read(terraform/**)",
       "Read(logs/**)"
+    ],
+    "deny": [
+      "Bash(git push *)",
+      "Bash(gcloud * delete *)",
+      "Bash(terraform destroy *)"
     ]
   },
   "enabledPlugins": {
-    "semgrep@claude-plugins-official": true
+    "semgrep@claude-plugins-official": true,
+    "claude-code-setup@claude-plugins-official": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file=\"$CLAUDE_TOOL_INPUT_FILE_PATH\"; if [[ \"$file\" == *.env || \"$file\" == *credentials* || \"$file\" == *service-account*.json ]]; then echo \"BLOCKED: sensitive file edit denied\"; exit 2; fi"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file=\"$CLAUDE_TOOL_INPUT_FILE_PATH\"; if [[ \"$file\" == *.py ]]; then cd /home/shin5ok/repos/copy-all-env && uv run python3 -m py_compile \"$file\" 2>&1 && echo \"syntax OK: $file\" || echo \"syntax ERROR: $file\"; fi"
+          }
+        ]
+      }
+    ]
   }
 }
