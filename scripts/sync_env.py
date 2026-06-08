@@ -69,6 +69,9 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud storage buckets list",
     "gcloud storage rsync",
     "gcloud storage cp",
+    "gcloud compute addresses create",
+    "gcloud compute addresses describe",
+    "gcloud services enable",
     "bq ls",
     "bq show",
     "bq mk",
@@ -129,7 +132,17 @@ def is_src_read_only(cmd: str) -> bool:
 
 
 def is_known_mock_command(cmd: str) -> bool:
-    return any(cmd.strip().startswith(p) for p in _MOCK_KNOWN_PATTERNS)
+    """コマンドが Mock 対応済みかを判定する。
+
+    `bq --project_id=xxx cp ...` のようにツール名と動詞の間にフラグが入る場合も
+    マッチさせるため、フラグ（`--` 始まり）を除いたトークン列でも判定する。
+    """
+    stripped = cmd.strip()
+    if any(stripped.startswith(p) for p in _MOCK_KNOWN_PATTERNS):
+        return True
+    tokens = [t for t in stripped.split() if not t.startswith("--")]
+    normalized = " ".join(tokens)
+    return any(normalized.startswith(p) for p in _MOCK_KNOWN_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
