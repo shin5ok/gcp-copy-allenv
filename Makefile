@@ -3,7 +3,16 @@
         bootstrap bootstrap-apply \
         bootstrap-dst-sa bootstrap-dst-sa-apply \
         bootstrap-cross-project bootstrap-cross-project-apply \
-        bootstrap-shared-vpc bootstrap-shared-vpc-apply
+        bootstrap-shared-vpc bootstrap-shared-vpc-apply \
+        vmware-setup vmware-setup-apply \
+        vmware-import vmware-import-apply \
+        vmware-start vmware-start-apply \
+        vmware-all vmware-all-apply vmware-clean
+
+# vmware/ 配下の Makefile に委譲するためのパラメータ
+#   make vmware-setup VMWARE_CONFIG=vmware/other.yaml
+VMWARE_CONFIG ?= config.yaml
+VMWARE_MAKE   := $(MAKE) -C vmware CONFIG=$(VMWARE_CONFIG)
 
 ## help: ターゲット一覧を表示します
 help:
@@ -94,4 +103,41 @@ bootstrap-shared-vpc:
 	bash scripts/bootstrap_shared_vpc.sh
 bootstrap-shared-vpc-apply:
 	bash scripts/bootstrap_shared_vpc.sh --apply
+
+# ==============================================================================
+# VMware VMDK → GCE 化 (vmware/Makefile への委譲)
+#   設定: vmware/config.yaml (VMWARE_CONFIG=... で切替可)
+# ==============================================================================
+
+## vmware-setup: vmware/ ターゲット project の準備 (API 有効化 / scratch bucket / 内部IP 予約) ※dry-run
+vmware-setup:
+	$(VMWARE_MAKE) vmware-setup
+## vmware-setup-apply: 同上 (--apply で実行)
+vmware-setup-apply:
+	$(VMWARE_MAKE) vmware-setup-apply
+
+## vmware-import: VMDK を gcloud compute images import でイメージ化 (dry-run)
+vmware-import:
+	$(VMWARE_MAKE) vmware-import
+## vmware-import-apply: 同上 (--apply で実行)
+vmware-import-apply:
+	$(VMWARE_MAKE) vmware-import-apply
+
+## vmware-start: カスタムイメージから GCE instance を作成・起動 (dry-run)
+vmware-start:
+	$(VMWARE_MAKE) vmware-start
+## vmware-start-apply: 同上 (--apply で実行)
+vmware-start-apply:
+	$(VMWARE_MAKE) vmware-start-apply
+
+## vmware-all: vmware-setup → vmware-import → vmware-start を一気通貫 (dry-run)
+vmware-all:
+	$(VMWARE_MAKE) vmware-all
+## vmware-all-apply: 同上 (--apply で実行)
+vmware-all-apply:
+	$(VMWARE_MAKE) vmware-all-apply
+
+## vmware-clean: vmware/logs を削除
+vmware-clean:
+	$(VMWARE_MAKE) vmware-clean
 

@@ -246,6 +246,30 @@ tail -f logs/$(ls -t logs/ | head -1)/dst.log
 
 ---
 
+## 📦 VMDK → GCE インポート（`vmware/`）
+
+VMware からエクスポートした VMDK を GCS 経由で `gcloud compute images import` でカスタムイメージ化し、
+指定した構成の GCE インスタンスを作成するためのワークフローです。本体の `dst/` パイプラインとは独立しています。
+
+設定ファイル: [`vmware/config.yaml`](./vmware/config.yaml)
+
+| セクション | 用途 |
+| :--- | :--- |
+| `global` | 出力先 project / region / zone / dry_run / ログ |
+| `source.disks[]` | import 対象 VMDK の GCS URI（`boot: true` を 1 本、`boot: false` をデータディスクとして複数指定可） |
+| `image_import` | `--os`（例: `centos-7`）、image 名 prefix、scratch bucket、timeout |
+| `instance` | machine_type、boot/additional disk、service account、labels、tags |
+| `network` | VPC / subnetwork（Shared VPC は `host_project` 指定）、内部 IP（予約 address 名 or 直接 IP）、外部 IP 有無 |
+
+想定する処理順:
+1. `source.disks[]` の各 VMDK を `gcloud compute images import` でカスタムイメージ化（boot は OS image、それ以外は `--data-disk`）。
+2. boot image から `gcloud compute instances create` で GCE を作成（machine_type / SA / labels / tags / 内部 static IP を反映）。
+3. データディスクがあれば対応イメージから `compute disks create` → `compute instances attach-disk`。
+
+> ⚠️ CentOS 7 など EOL OS は importer から警告が出る場合があります。`image_import.os` の値で挙動が変わります。
+
+---
+
 ## 🛠️ その他
 
 ### 単体テストの実行
