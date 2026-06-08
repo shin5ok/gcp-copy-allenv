@@ -1,0 +1,186 @@
+# ==============================================================================
+# VMDK Import → GCE 作成 設定ファイル
+# ==============================================================================
+# 想定フロー:
+#   1) setup  : API 有効化 / TargetProject 登録 / bucket 権限 / IP 予約
+#   2) import : GCS 上の VMDK を `gcloud migration vms image-imports create` でカスタムイメージ化 (非同期)
+#   3) start  : カスタムイメージから `gcloud compute instances create` で GCE 作成
+#
+# 使い方:
+#   cp vmware/config.yaml.template vmware/config.yaml
+#   # REPLACE_ME をすべて実際の値に置き換えて保存
+#   make vmware-all-apply
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. 共通設定 (Global)
+# ------------------------------------------------------------------------------
+global:
+  # 出力先 GCP プロジェクト（image / instance / disk が作られる先）
+  project_id: "REPLACE_ME"
+
+  # GCE / イメージを作る region と zone
+  region: "asia-northeast1"
+  zone: "asia-northeast1-b"
+
+  # ログ出力先
+  log_dir: "./logs"
+  log_file: "vmdk_import.log"
+
+  # ドライランモード (true なら gcloud を実行せずコマンドを表示のみ)
+  dry_run: true
+
+  # 詳細ログ
+  verbose_logging: true
+
+# ------------------------------------------------------------------------------
+# 2. VM 定義 (複数指定可)
+# ------------------------------------------------------------------------------
+# 各エントリが 1 つの GCE インスタンスに対応する。
+# setup / import / start はすべての VM をまとめて処理する。
+vms:
+  - name: "vm1"                       # 識別子 (ログ表示用)
+
+    # ---- ソース VMDK ----
+    source:
+      disks:
+        - name: "boot"                # 任意の識別子（image 名のサフィックスにも使う）
+          boot: true
+          gcs_uri: "gs://REPLACE_ME/path/to/os.vmdk"
+
+        # データディスクがある場合は以下のように追加（不要なら削除可）
+        # - name: "data1"
+        #   boot: false
+        #   gcs_uri: "gs://REPLACE_ME/path/to/data1.vmdk"
+
+    # ---- イメージ import 設定 ----
+    image_import:
+      # 作成するカスタムイメージ名のプレフィックス
+      # 実際の image 名 / import resource 名は "<prefix>-<source.disks[].name>" になる
+      # 例) vmdk-vm1-20260608-boot
+      image_name_prefix: "vmdk-vm1-20260608"
+
+      # ライセンスタイプ (省略可、boot disk のみ有効)
+      # compute-engine-license-type-byol / -payg / -default
+      # license_type: "compute-engine-license-type-default"
+
+      # Migration host project と target project が異なる構成の場合のみ指定。
+      # 省略時は global.project_id をそのまま使用する。
+      # target_project_host: "vm-migration-host-project"
+      # target_project_name: "target-project-id"
+
+    # ---- GCE インスタンス設定 ----
+    instance:
+      name: "REPLACE_ME-vm1"
+
+      # マシンタイプ。元 VM の vCPU/メモリに合わせて選ぶ。
+      # 例: "n2-custom-4-16384" / "n2-standard-4" / "e2-standard-2"
+      machine_type: "n2-standard-4"
+
+      boot_disk:
+        # 種別: pd-balanced / pd-ssd / pd-standard / hyperdisk-balanced 等
+        type: "pd-balanced"
+        # size_gb: 50  # 未指定またはイメージ実サイズ未満の場合は実サイズに自動引き上げ
+        auto_delete: true
+
+      additional_disks:
+        # - source_name: "data1"      # source.disks[].name を参照
+        #   device_name: "data1"      # /dev/disk/by-id/google-<device_name> としてゲストから見える
+        #   type: "pd-balanced"
+        #   size_gb: 100              # 元 VMDK より大きくしたい場合のみ
+        #   mode: "READ_WRITE"        # READ_WRITE / READ_ONLY
+        #   auto_delete: false
+
+      # サービスアカウント (未指定なら project の default compute SA)
+      # service_account: "my-vm-sa@REPLACE_ME.iam.gserviceaccount.com"
+      # scopes: ["cloud-platform"]
+
+      # ラベル (任意)
+      labels:
+        env: "migrated"
+        source: "vmware"
+
+      # ネットワークタグ (FW ルールの target tag に紐付ける用)
+      tags:
+        - "ssh-allowed"
+
+      # メタデータ (任意)
+      # metadata:
+      #   enable-oslogin: "TRUE"
+      #   startup-script: |
+      #     #!/bin/bash
+      #     echo "hello" > /tmp/hello
+
+    # ---- ネットワーク設定 ----
+    network:
+      # 共有 VPC を使う場合は host_project を指定し、subnetwork は self-link でもよい
+      # host_project: "shared-vpc-host-project"
+
+      # VPC ネットワーク名
+      network: "REPLACE_ME-vpc"
+
+      # サブネット名 (region 内)
+      subnetwork: "REPLACE_ME-subnet"
+
+      # 内部 IP 設定
+      internal_ip:
+        # 指定方法:
+        #   - "address_name": 予約済み compute address リソース名を使う (setup で予約)
+        #   - "ip": IP アドレス値を直接指定 (--private-network-ip)
+        mode: "address_name"
+
+        # mode が "address_name" の場合に使う、予約済みアドレスのリソース名
+        address_name: "REPLACE_ME-internal-ip"
+
+        # mode が "ip" の場合に使う、固定 IP アドレス値
+        # ip: "10.0.0.10"
+
+      # 外部 IP 設定
+      external_ip:
+        enabled: false
+        # enabled: true にした場合の設定
+        # mode: "ephemeral"           # "ephemeral" or "static"
+        # address_name: ""            # mode=static のときに使う予約済みアドレス名 (setup で予約)
+        # network_tier: "PREMIUM"     # PREMIUM / STANDARD
+
+  # 2 台目以降は以下のように追加する
+  # - name: "vm2"
+  #   source:
+  #     disks:
+  #       - name: "boot"
+  #         boot: true
+  #         gcs_uri: "gs://REPLACE_ME/path/to/vm2.vmdk"
+  #   image_import:
+  #     image_name_prefix: "vmdk-vm2-20260608"
+  #   instance:
+  #     name: "REPLACE_ME-vm2"
+  #     machine_type: "e2-standard-2"
+  #     boot_disk:
+  #       type: "pd-balanced"
+  #       auto_delete: true
+  #     labels:
+  #       env: "migrated"
+  #       source: "vmware"
+  #     tags:
+  #       - "ssh-allowed"
+  #   network:
+  #     # host_project: "shared-vpc-host-project"
+  #     network: "REPLACE_ME-vpc"
+  #     subnetwork: "REPLACE_ME-subnet"
+  #     internal_ip:
+  #       mode: "ip"
+  #       ip: "10.0.0.11"
+  #     external_ip:
+  #       enabled: false
+
+# ------------------------------------------------------------------------------
+# ファイアウォールルール (参考用・このスクリプトでは作成しない)
+# ------------------------------------------------------------------------------
+# firewall:
+#   - name: "allow-ssh-from-iap"
+#     network: "REPLACE_ME-vpc"
+#     source_ranges: ["35.235.240.0/20"]
+#     target_tags: ["ssh-allowed"]
+#     allow:
+#       - protocol: "tcp"
+#         ports: ["22"]
