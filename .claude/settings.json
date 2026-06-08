@@ -31,5 +31,8 @@
       "Read(terraform/**)",
       "Read(logs/**)"
     ]
+  },
+  "enabledPlugins": {
+    "semgrep@claude-plugins-official": true
   }
 }
