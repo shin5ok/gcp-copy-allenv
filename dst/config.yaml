@@ -128,11 +128,6 @@ steps:
   # bulk-export は network_firewall_policy を出力しないため gcloud で直接同期する
   network_firewall:
     enabled: true
-    # ドリフト時の挙動:
-    # - false (デフォルト): dst の既存ルールと src の内容が異なってもログ警告のみ。
-    # - true: 内容差分があれば dst を delete してから再 create。短時間ですが
-    #   トラフィックが遮断されるため、メンテナンスウィンドウで運用するときに使用。
-    allow_drift_recreate: false
 
   # [Step 5] GCE VM 復元 (スナップショットから復元したディスクをVMに紐付け起動)
   gce_restore:
