@@ -71,6 +71,22 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud storage cp",
     "gcloud compute addresses create",
     "gcloud compute addresses describe",
+    "gcloud compute firewall-rules list",
+    "gcloud compute firewall-rules describe",
+    "gcloud compute firewall-rules create",
+    "gcloud compute firewall-rules delete",
+    "gcloud compute network-firewall-policies list",
+    "gcloud compute network-firewall-policies describe",
+    "gcloud compute network-firewall-policies create",
+    "gcloud compute network-firewall-policies delete",
+    "gcloud compute network-firewall-policies rules list",
+    "gcloud compute network-firewall-policies rules describe",
+    "gcloud compute network-firewall-policies rules create",
+    "gcloud compute network-firewall-policies rules delete",
+    "gcloud compute network-firewall-policies associations list",
+    "gcloud compute network-firewall-policies associations describe",
+    "gcloud compute network-firewall-policies associations create",
+    "gcloud compute network-firewall-policies associations delete",
     "gcloud services enable",
     "bq ls",
     "bq show",
@@ -90,21 +106,23 @@ _MOCK_KNOWN_PATTERNS = (
 # 最小セット。baseline は常に付与し、有効ステップ分を union する。
 _SRC_BASELINE_PERMS = ("resourcemanager.projects.get",)
 _SRC_PERMS_BY_STEP = {
-    "cai_scan":     ("cloudasset.assets.searchAllResources",),
-    "gce_snapshot": ("compute.instances.list", "compute.snapshots.list"),
-    "bulk_export":  ("cloudasset.assets.searchAllResources",
-                     "compute.instances.list", "storage.buckets.list"),
-    "gce_restore":  ("compute.instances.list", "compute.snapshots.list"),
-    "data_sync":    ("storage.buckets.list", "bigquery.datasets.get"),
+    "cai_scan":         ("cloudasset.assets.searchAllResources",),
+    "gce_snapshot":     ("compute.instances.list", "compute.snapshots.list"),
+    "bulk_export":      ("cloudasset.assets.searchAllResources",
+                         "compute.instances.list", "storage.buckets.list"),
+    "network_firewall": ("compute.firewalls.list", "compute.networkFirewallPolicies.list"),
+    "gce_restore":      ("compute.instances.list", "compute.snapshots.list"),
+    "data_sync":        ("storage.buckets.list", "bigquery.datasets.get"),
 }
 _DST_BASELINE_PERMS = ("resourcemanager.projects.get",)
 _DST_PERMS_BY_STEP = {
-    "terraform_apply": ("compute.instances.create", "storage.buckets.create"),
-    "gce_restore":     ("compute.instances.start", "compute.instances.stop",
-                        "compute.disks.create", "compute.disks.delete",
-                        "compute.instances.attachDisk", "compute.instances.detachDisk"),
-    "data_sync":       ("storage.objects.create",
-                        "bigquery.datasets.create", "bigquery.tables.create"),
+    "terraform_apply":  ("compute.instances.create", "storage.buckets.create"),
+    "network_firewall": ("compute.firewalls.create", "compute.networkFirewallPolicies.create"),
+    "gce_restore":      ("compute.instances.start", "compute.instances.stop",
+                         "compute.disks.create", "compute.disks.delete",
+                         "compute.instances.attachDisk", "compute.instances.detachDisk"),
+    "data_sync":        ("storage.objects.create",
+                         "bigquery.datasets.create", "bigquery.tables.create"),
 }
 
 
@@ -800,6 +818,39 @@ class MigrationOrchestrator:
                 {"name": "shared-vpc", "autoCreateSubnetworks": False},
             ])
 
+        if cmd.strip().startswith("gcloud compute firewall-rules list"):
+            logger.info(f"{tag}[MOCK] ファイアウォールルール一覧をシミュレート ({proj_id})")
+            return json.dumps([
+                {"name": "allow-shared-iap-ssh", "direction": "INGRESS", "priority": 1000,
+                 "network": f"projects/{proj_id}/global/networks/shared-vpc",
+                 "allowed": [{"IPProtocol": "tcp", "ports": ["22"]}],
+                 "sourceRanges": ["35.235.240.0/20"], "disabled": False},
+                {"name": "all-for-incredibuild", "direction": "INGRESS", "priority": 1000,
+                 "network": f"projects/{proj_id}/global/networks/shared-vpc",
+                 "allowed": [{"IPProtocol": "all"}],
+                 "sourceRanges": ["10.0.0.0/8"], "disabled": False},
+                {"name": "ssh", "direction": "INGRESS", "priority": 1000,
+                 "network": f"projects/{proj_id}/global/networks/shared-vpc",
+                 "allowed": [{"IPProtocol": "tcp", "ports": ["22"]}],
+                 "sourceRanges": ["10.0.0.0/8"], "disabled": False},
+                {"name": "rdp", "direction": "INGRESS", "priority": 1000,
+                 "network": f"projects/{proj_id}/global/networks/shared-vpc",
+                 "allowed": [{"IPProtocol": "tcp", "ports": ["3389"]}],
+                 "sourceRanges": ["0.0.0.0/0"], "disabled": False},
+            ])
+
+        if cmd.strip().startswith("gcloud compute network-firewall-policies list"):
+            logger.info(f"{tag}[MOCK] ネットワークファイアウォールポリシー一覧をシミュレート ({proj_id})")
+            return json.dumps([])
+
+        if cmd.strip().startswith("gcloud compute network-firewall-policies rules list"):
+            logger.info(f"{tag}[MOCK] ファイアウォールポリシールール一覧をシミュレート")
+            return json.dumps([])
+
+        if cmd.strip().startswith("gcloud compute network-firewall-policies associations list"):
+            logger.info(f"{tag}[MOCK] ファイアウォールポリシーアソシエーション一覧をシミュレート")
+            return json.dumps([])
+
         if cmd.strip().startswith("gcloud storage buckets list"):
             logger.info(f"{tag}[MOCK] バケット一覧をシミュレート ({proj_id})")
             return json.dumps([
@@ -893,6 +944,8 @@ resource "google_storage_bucket" "mock_bucket" {{
                 self.step_bulk_export()
             if steps.get('terraform_apply', {}).get('enabled', False):
                 self.step_terraform_apply()
+            if steps.get('network_firewall', {}).get('enabled', True):
+                self.step_network_firewall()
             if steps.get('gce_restore', {}).get('enabled', False):
                 self.step_gce_restore()
             if steps.get('data_sync', {}).get('enabled', False):
@@ -2056,6 +2109,620 @@ resource "google_storage_bucket" "mock_bucket" {{
     # ============================================================
     # Step 5: GCE VM 復元
     # ============================================================
+    def step_network_firewall(self):
+        """Step 4.5: host project のファイアウォールルール・ポリシーを dst に冪等複製。
+
+        bulk-export は google_compute_network_firewall_policy を出力しない。
+        classic firewall rule も Shared VPC ネットワーク URL が src を向くため
+        terraform では適用困難。本ステップで gcloud を直接使い src と完全一致するよう同期する。
+        """
+        log_stage_header(self.dst_logger, 45, "Network Firewall 複製 (rules + policies)")
+
+        host = self.config.get('project_mapping', {}).get('host_project', {})
+        src_host = host.get('src')
+        dst_host = host.get('dst')
+        src_sa = host.get('src_impersonate_service_account')
+        dst_sa = host.get('dst_impersonate_service_account')
+
+        if not src_host or not dst_host:
+            self.dst_logger.warning("  host_project が未設定のため network_firewall をスキップ")
+            return
+
+        cfg = self.config.get('steps', {}).get('network_firewall', {}) or {}
+        allow_drift = bool(cfg.get('allow_drift_recreate', False))
+        self.dst_logger.info(f"  allow_drift_recreate = {allow_drift}")
+
+        self._sync_classic_firewall_rules(src_host, dst_host, src_sa, dst_sa, allow_drift)
+        self._sync_network_firewall_policies(src_host, dst_host, src_sa, dst_sa, allow_drift)
+        self.dst_logger.info("  ✓ Step 4.5 完了")
+
+    # --- FW 共通ヘルパー --------------------------------------------------
+    @staticmethod
+    def _layer4_to_flag_value(configs: List[Dict]) -> str:
+        """layer4Configs → '--layer4-configs' / '--allow' フラグ用文字列。
+
+        例: [{ipProtocol: tcp, ports: ['80', '443']},
+             {ipProtocol: udp}]
+            → 'tcp:80,tcp:443,udp'
+        ports が range（'8000-9000'）の場合もそのまま展開する。
+        """
+        parts: List[str] = []
+        for c in configs or []:
+            proto = c.get('ipProtocol', 'all')
+            ports = c.get('ports', []) or []
+            if ports:
+                for p in ports:
+                    parts.append(f"{proto}:{p}")
+            else:
+                parts.append(proto)
+        return ','.join(parts)
+
+    @staticmethod
+    def _normalize_proto_list(items: List[Dict]) -> List[str]:
+        """classic FW の allowed/denied リストを正規化（順序非依存比較用）。"""
+        out: List[str] = []
+        for it in items or []:
+            proto = it.get('IPProtocol', 'all')
+            ports = it.get('ports', []) or []
+            if ports:
+                for p in ports:
+                    out.append(f"{proto}:{p}")
+            else:
+                out.append(proto)
+        return sorted(out)
+
+    @staticmethod
+    def _secure_tags_names(tags: List[Dict]) -> List[str]:
+        """secureTags の [{name: 'tagValues/123'}, ...] → ['tagValues/123', ...]。"""
+        return sorted([t.get('name', '') for t in (tags or []) if t.get('name')])
+
+    @classmethod
+    def _normalize_classic_rule(cls, rule: Dict) -> Dict:
+        """classic FW rule を比較用 dict に正規化（src/dst 間の差分検出）。"""
+        log_cfg = rule.get('logConfig', {}) or {}
+        return {
+            'network':                 (rule.get('network', '') or '').split('/')[-1],
+            'direction':               rule.get('direction', 'INGRESS'),
+            'priority':                int(rule.get('priority', 1000)),
+            'disabled':                bool(rule.get('disabled', False)),
+            'description':             rule.get('description', '') or '',
+            'sourceRanges':            sorted(rule.get('sourceRanges', []) or []),
+            'destinationRanges':       sorted(rule.get('destinationRanges', []) or []),
+            'sourceTags':              sorted(rule.get('sourceTags', []) or []),
+            'targetTags':              sorted(rule.get('targetTags', []) or []),
+            'sourceServiceAccounts':   sorted(rule.get('sourceServiceAccounts', []) or []),
+            'targetServiceAccounts':   sorted(rule.get('targetServiceAccounts', []) or []),
+            'allowed':                 cls._normalize_proto_list(rule.get('allowed', [])),
+            'denied':                  cls._normalize_proto_list(rule.get('denied', [])),
+            'logging_enabled':         bool(log_cfg.get('enable', False)),
+            'logging_metadata':        log_cfg.get('metadata', '') or '',
+        }
+
+    @classmethod
+    def _normalize_policy_rule(cls, r: Dict) -> Dict:
+        """network FW policy rule を比較用 dict に正規化。"""
+        match = r.get('match', {}) or {}
+        return {
+            'action':                    r.get('action', 'allow'),
+            'direction':                 r.get('direction', 'INGRESS'),
+            'disabled':                  bool(r.get('disabled', False)),
+            'enableLogging':             bool(r.get('enableLogging', False)),
+            'description':               r.get('description', '') or '',
+            'targetServiceAccounts':     sorted(r.get('targetServiceAccounts', []) or []),
+            'targetSecureTags':          cls._secure_tags_names(r.get('targetSecureTags', [])),
+            'layer4Configs':             cls._layer4_to_flag_value(match.get('layer4Configs', [])),
+            'srcIpRanges':               sorted(match.get('srcIpRanges', []) or []),
+            'destIpRanges':              sorted(match.get('destIpRanges', []) or []),
+            'srcAddressGroups':          sorted(match.get('srcAddressGroups', []) or []),
+            'destAddressGroups':         sorted(match.get('destAddressGroups', []) or []),
+            'srcFqdns':                  sorted(match.get('srcFqdns', []) or []),
+            'destFqdns':                 sorted(match.get('destFqdns', []) or []),
+            'srcRegionCodes':            sorted(match.get('srcRegionCodes', []) or []),
+            'destRegionCodes':           sorted(match.get('destRegionCodes', []) or []),
+            'srcThreatIntelligences':    sorted(match.get('srcThreatIntelligences', []) or []),
+            'destThreatIntelligences':   sorted(match.get('destThreatIntelligences', []) or []),
+            'srcSecureTags':             cls._secure_tags_names(match.get('srcSecureTags', [])),
+        }
+
+    def _gcloud_describe_json(
+        self, cmd: str, impersonate_sa: Optional[str],
+    ) -> Optional[Dict]:
+        """describe コマンドを安全に実行し JSON を dict で返す（存在しなければ None）。"""
+        if self.mock or self.dry_run:
+            return None
+        env = os.environ.copy()
+        if impersonate_sa:
+            env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = impersonate_sa
+        try:
+            res = subprocess.run(
+                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env, timeout=60,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return json.loads(res.stdout)
+        except Exception:
+            pass
+        return None
+
+    def _gcloud_list_json(
+        self, cmd: str, impersonate_sa: Optional[str],
+    ) -> List[Dict]:
+        """list コマンドを安全に実行し JSON を list で返す。"""
+        if self.mock or self.dry_run:
+            return []
+        env = os.environ.copy()
+        if impersonate_sa:
+            env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = impersonate_sa
+        try:
+            res = subprocess.run(
+                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env, timeout=60,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                data = json.loads(res.stdout)
+                return data if isinstance(data, list) else []
+        except Exception:
+            pass
+        return []
+
+    def _sync_classic_firewall_rules(
+        self, src_host: str, dst_host: str,
+        src_sa: Optional[str], dst_sa: Optional[str],
+        allow_drift: bool,
+    ):
+        """src host の classic VPC ファイアウォールルールを dst host に同期。
+
+        - 新規ルール: dst に作成
+        - 内容差分あり: allow_drift=True なら delete+create、false なら警告のみ
+        - dst の余分なルール: 削除（GCP 自動生成 default-allow-* は保護）
+        """
+        self.dst_logger.info(f"  [FW Rules] {src_host} → {dst_host}")
+
+        src_raw = self.run_command(
+            f"gcloud compute firewall-rules list --project={src_host} --format=json",
+            side="src", logger=self.org_logger,
+            desc=f"List FW Rules {src_host}",
+            explanation=f"{src_host} のファイアウォールルール一覧取得",
+            impersonate_sa=src_sa, allow_fail=True,
+        )
+        try:
+            src_rules = json.loads(src_raw) if src_raw else []
+        except Exception:
+            src_rules = []
+
+        dst_rules = self._gcloud_list_json(
+            f"gcloud compute firewall-rules list --project={dst_host} --format=json",
+            dst_sa,
+        )
+        dst_by_name = {r.get('name'): r for r in dst_rules if r.get('name')}
+
+        # --- create / update フェーズ ---
+        for rule in src_rules:
+            name = rule.get('name', '')
+            if not name:
+                continue
+
+            src_norm = self._normalize_classic_rule(rule)
+            dst_rule = dst_by_name.get(name)
+
+            if dst_rule is None:
+                self._create_classic_fw_rule(dst_host, name, src_norm, rule, dst_sa)
+                continue
+
+            dst_norm = self._normalize_classic_rule(dst_rule)
+            if src_norm == dst_norm:
+                self.dst_logger.info(f"    FW rule '{name}': 一致。スキップ")
+                continue
+
+            diff_keys = [k for k in src_norm if src_norm[k] != dst_norm.get(k)]
+            self.dst_logger.warning(
+                f"    FW rule '{name}': ドリフト検出 (差分フィールド: {diff_keys})"
+            )
+            if not allow_drift:
+                self.dst_logger.warning(
+                    f"      → allow_drift_recreate=false のため更新せず（警告のみ）"
+                )
+                continue
+            self.dst_logger.info(f"      → delete + create で src の状態に再現")
+            self.run_command(
+                f"gcloud compute firewall-rules delete {name} --project={dst_host} --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Drift Delete FW Rule {name}",
+                explanation=f"ドリフト解消のため dst の '{name}' を削除",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+            self._create_classic_fw_rule(dst_host, name, src_norm, rule, dst_sa)
+
+        # --- 削除フェーズ: dst にあって src にないルールを削除 ---
+        # 安全制約（GCP 自動生成 default-allow-* を保護）:
+        #   ① priority == 65534 AND
+        #   ② network == 'default' AND
+        #   ③ name in {default-allow-icmp, default-allow-internal,
+        #              default-allow-rdp, default-allow-ssh}
+        # の3条件全部を満たすルールのみ「自動生成」とみなして削除しない。
+        # それ以外はユーザー作成ルールとして src との差分を解消する。
+        src_rule_names = {r.get('name') for r in src_rules if r.get('name')}
+        DEFAULT_AUTO_NAMES = {
+            'default-allow-icmp', 'default-allow-internal',
+            'default-allow-rdp', 'default-allow-ssh',
+        }
+
+        if self.mock:
+            return  # mock では dst に実ルールが存在しないのでスキップ
+
+        for dst_rule in dst_rules:
+            dname = dst_rule.get('name', '')
+            if not dname or dname in src_rule_names:
+                continue
+
+            dnet = (dst_rule.get('network', '') or '').split('/')[-1]
+            dprio = int(dst_rule.get('priority', 0))
+            if dprio == 65534 and dnet == 'default' and dname in DEFAULT_AUTO_NAMES:
+                self.dst_logger.info(
+                    f"    GCP 自動生成ルール '{dname}' は保護のため削除しない"
+                )
+                continue
+
+            self.run_command(
+                f"gcloud compute firewall-rules delete {dname} --project={dst_host} --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Delete Extra FW Rule {dname}",
+                explanation=f"dst にあって src にないルール '{dname}'（network={dnet}, priority={dprio}）を削除",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+
+    def _create_classic_fw_rule(
+        self, dst_host: str, name: str, norm: Dict, raw: Dict, dst_sa: Optional[str],
+    ):
+        """classic FW rule を dst に作成。norm は比較済みの正規化結果、raw は元の API レスポンス。"""
+        if not norm['allowed'] and not norm['denied']:
+            self.dst_logger.warning(f"    FW rule '{name}': allowed/denied が空のため作成スキップ")
+            return
+
+        action_flag = '--allow' if norm['allowed'] else '--deny'
+        proto_list = ','.join(norm['allowed'] or norm['denied'])
+
+        parts = [
+            "gcloud", "compute", "firewall-rules", "create", name,
+            f"--project={dst_host}",
+            f"--network={norm['network'] or 'default'}",
+            f"--direction={norm['direction']}",
+            f"--priority={norm['priority']}",
+            f"{action_flag}={proto_list}",
+        ]
+        # disabled は明示的に両方の状態を扱う
+        parts.append("--disabled" if norm['disabled'] else "--no-disabled")
+
+        for key, flag in [
+            ('sourceRanges',           '--source-ranges'),
+            ('destinationRanges',      '--destination-ranges'),
+            ('sourceTags',             '--source-tags'),
+            ('targetTags',             '--target-tags'),
+            ('sourceServiceAccounts',  '--source-service-accounts'),
+            ('targetServiceAccounts',  '--target-service-accounts'),
+        ]:
+            if norm[key]:
+                parts.append(f"{flag}={','.join(norm[key])}")
+
+        # フローログ設定
+        if norm['logging_enabled']:
+            parts.append("--enable-logging")
+            if norm['logging_metadata']:
+                parts.append(f"--logging-metadata={norm['logging_metadata'].lower()}")
+        else:
+            parts.append("--no-enable-logging")
+
+        if norm['description']:
+            parts.append(f"--description={shlex.quote(norm['description'])}")
+
+        self.run_command(
+            ' '.join(parts), side="dst", logger=self.dst_logger,
+            desc=f"Create FW Rule {name}",
+            explanation=f"dst host {dst_host} にファイアウォールルール '{name}' を作成",
+            impersonate_sa=dst_sa, allow_fail=True,
+        )
+
+    def _sync_network_firewall_policies(
+        self, src_host: str, dst_host: str,
+        src_sa: Optional[str], dst_sa: Optional[str],
+        allow_drift: bool,
+    ):
+        """src host のネットワークファイアウォールポリシーを dst host に同期。
+
+        - 新規 policy/rule/association: dst に作成
+        - 内容差分あり: allow_drift=True なら delete+create、false なら警告のみ
+        - dst の余分な policy/rule/association: 削除
+        """
+        self.dst_logger.info(f"  [FW Policies] {src_host} → {dst_host}")
+
+        src_raw = self.run_command(
+            f"gcloud compute network-firewall-policies list --project={src_host} --format=json",
+            side="src", logger=self.org_logger,
+            desc=f"List FW Policies {src_host}",
+            explanation=f"{src_host} のネットワークファイアウォールポリシー一覧取得",
+            impersonate_sa=src_sa, allow_fail=True,
+        )
+        try:
+            src_policies = json.loads(src_raw) if src_raw else []
+        except Exception:
+            src_policies = []
+
+        dst_policies = self._gcloud_list_json(
+            f"gcloud compute network-firewall-policies list --project={dst_host} --format=json",
+            dst_sa,
+        )
+        dst_policy_names = {p.get('name') for p in dst_policies if p.get('name')}
+        src_policy_names = {p.get('name') for p in src_policies if p.get('name')}
+
+        for policy in src_policies:
+            pname = policy.get('name', '')
+            if not pname:
+                continue
+            self._sync_one_policy(
+                pname, policy, src_host, dst_host, src_sa, dst_sa,
+                policy_exists_in_dst=pname in dst_policy_names,
+                allow_drift=allow_drift,
+            )
+
+        # --- 削除フェーズ: dst にあって src にない policy を削除 ---
+        for dp in dst_policies:
+            dpname = dp.get('name', '')
+            if not dpname or dpname in src_policy_names:
+                continue
+            # 削除前に association を全部外す必要がある
+            self._delete_all_associations(dpname, dst_host, dst_sa)
+            self.run_command(
+                f"gcloud compute network-firewall-policies delete {dpname} "
+                f"--project={dst_host} --global --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Delete Extra FW Policy {dpname}",
+                explanation=f"dst にあって src にないポリシー '{dpname}' を削除",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+
+    def _sync_one_policy(
+        self, pname: str, src_policy: Dict,
+        src_host: str, dst_host: str,
+        src_sa: Optional[str], dst_sa: Optional[str],
+        policy_exists_in_dst: bool, allow_drift: bool,
+    ):
+        """1 つの policy（rules + associations 含む）を src → dst へ同期。"""
+        p_desc = src_policy.get('description', '') or ''
+
+        if not policy_exists_in_dst:
+            cmd = (
+                f"gcloud compute network-firewall-policies create {pname} "
+                f"--project={dst_host} --global --quiet"
+            )
+            if p_desc:
+                cmd += f" --description={shlex.quote(p_desc)}"
+            self.run_command(
+                cmd, side="dst", logger=self.dst_logger,
+                desc=f"Create FW Policy {pname}",
+                explanation=f"dst host {dst_host} にファイアウォールポリシー '{pname}' を作成",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+        else:
+            self.dst_logger.info(f"    FW policy '{pname}' は既存。rules/associations のみ同期")
+
+        # --- rules の同期 ---
+        src_rules_raw = self.run_command(
+            f"gcloud compute network-firewall-policies rules list "
+            f"--firewall-policy={pname} --project={src_host} --format=json",
+            side="src", logger=self.org_logger,
+            desc=f"List FW Policy Rules {pname}",
+            explanation=f"ポリシー '{pname}' のルール一覧取得",
+            impersonate_sa=src_sa, allow_fail=True,
+        )
+        try:
+            src_rules = json.loads(src_rules_raw) if src_rules_raw else []
+        except Exception:
+            src_rules = []
+
+        dst_rules = self._gcloud_list_json(
+            f"gcloud compute network-firewall-policies rules list "
+            f"--firewall-policy={pname} --project={dst_host} --global --format=json",
+            dst_sa,
+        )
+        dst_by_prio = {int(r['priority']): r for r in dst_rules if r.get('priority') is not None}
+        src_prios = set()
+
+        for r in src_rules:
+            prio = r.get('priority')
+            if prio is None:
+                continue
+            prio = int(prio)
+            src_prios.add(prio)
+            src_norm = self._normalize_policy_rule(r)
+            existing = dst_by_prio.get(prio)
+
+            if existing is None:
+                self._create_policy_rule(pname, prio, src_norm, dst_host, dst_sa)
+                continue
+
+            dst_norm = self._normalize_policy_rule(existing)
+            if src_norm == dst_norm:
+                self.dst_logger.info(f"      Rule priority={prio}: 一致。スキップ")
+                continue
+
+            diff = [k for k in src_norm if src_norm[k] != dst_norm.get(k)]
+            self.dst_logger.warning(
+                f"      Rule priority={prio}: ドリフト検出 (差分: {diff})"
+            )
+            if not allow_drift:
+                self.dst_logger.warning("        → allow_drift_recreate=false のため更新せず")
+                continue
+            self.dst_logger.info("        → delete + create で再現")
+            self.run_command(
+                f"gcloud compute network-firewall-policies rules delete {prio} "
+                f"--firewall-policy={pname} --project={dst_host} --global --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Drift Delete Rule {pname}/{prio}",
+                explanation=f"ドリフト解消のため priority={prio} を削除",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+            self._create_policy_rule(pname, prio, src_norm, dst_host, dst_sa)
+
+        # 余分な rule の削除
+        for prio, dst_rule in dst_by_prio.items():
+            if prio in src_prios:
+                continue
+            self.run_command(
+                f"gcloud compute network-firewall-policies rules delete {prio} "
+                f"--firewall-policy={pname} --project={dst_host} --global --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Delete Extra Rule {pname}/{prio}",
+                explanation=f"dst にあって src にないルール priority={prio} を削除",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+
+        # --- associations の同期 ---
+        self._sync_policy_associations(pname, src_host, dst_host, src_sa, dst_sa)
+
+    def _create_policy_rule(
+        self, pname: str, prio: int, norm: Dict,
+        dst_host: str, dst_sa: Optional[str],
+    ):
+        """正規化された rule dict から policy rule を作成する。"""
+        if not norm['layer4Configs']:
+            self.dst_logger.warning(
+                f"      Rule priority={prio}: layer4Configs が空のため作成スキップ"
+            )
+            return
+
+        parts = [
+            "gcloud", "compute", "network-firewall-policies", "rules", "create", str(prio),
+            f"--firewall-policy={pname}",
+            f"--project={dst_host}",
+            "--global",
+            f"--action={norm['action']}",
+            f"--direction={norm['direction']}",
+            f"--layer4-configs={norm['layer4Configs']}",
+        ]
+        parts.append("--disabled" if norm['disabled'] else "--no-disabled")
+        parts.append("--enable-logging" if norm['enableLogging'] else "--no-enable-logging")
+
+        for key, flag in [
+            ('srcIpRanges',             '--src-ip-ranges'),
+            ('destIpRanges',            '--dest-ip-ranges'),
+            ('srcAddressGroups',        '--src-address-groups'),
+            ('destAddressGroups',       '--dest-address-groups'),
+            ('srcFqdns',                '--src-fqdns'),
+            ('destFqdns',               '--dest-fqdns'),
+            ('srcRegionCodes',          '--src-region-codes'),
+            ('destRegionCodes',         '--dest-region-codes'),
+            ('srcThreatIntelligences',  '--src-threat-intelligences'),
+            ('destThreatIntelligences', '--dest-threat-intelligences'),
+            ('srcSecureTags',           '--src-secure-tags'),
+            ('targetServiceAccounts',   '--target-service-accounts'),
+            ('targetSecureTags',        '--target-secure-tags'),
+        ]:
+            if norm[key]:
+                parts.append(f"{flag}={','.join(norm[key])}")
+
+        if norm['description']:
+            parts.append(f"--description={shlex.quote(norm['description'])}")
+
+        self.run_command(
+            ' '.join(parts), side="dst", logger=self.dst_logger,
+            desc=f"Create FW Policy Rule {pname}/{prio}",
+            explanation=f"ポリシー '{pname}' に priority={prio} のルールを作成",
+            impersonate_sa=dst_sa, allow_fail=True,
+        )
+
+    def _sync_policy_associations(
+        self, pname: str, src_host: str, dst_host: str,
+        src_sa: Optional[str], dst_sa: Optional[str],
+    ):
+        """policy の association（ネットワーク紐付け）を同期。"""
+        src_raw = self.run_command(
+            f"gcloud compute network-firewall-policies associations list "
+            f"--firewall-policy={pname} --project={src_host} --format=json",
+            side="src", logger=self.org_logger,
+            desc=f"List FW Policy Assoc {pname}",
+            explanation=f"ポリシー '{pname}' のアソシエーション一覧取得",
+            impersonate_sa=src_sa, allow_fail=True,
+        )
+        try:
+            src_assocs = json.loads(src_raw) if src_raw else []
+        except Exception:
+            src_assocs = []
+
+        dst_assocs = self._gcloud_list_json(
+            f"gcloud compute network-firewall-policies associations list "
+            f"--firewall-policy={pname} --project={dst_host} --global --format=json",
+            dst_sa,
+        )
+        dst_assoc_names = {a.get('name') for a in dst_assocs if a.get('name')}
+
+        proj_map = self._build_proj_id_map()
+        src_assoc_names = set()
+        for assoc in src_assocs:
+            net_url = assoc.get('attachmentTarget', '')
+            net_name = net_url.split('/')[-1] if net_url else ''
+            assoc_name = assoc.get('name', f"{pname}-assoc-{net_name}")
+            if not net_name:
+                continue
+            src_assoc_names.add(assoc_name)
+
+            if assoc_name in dst_assoc_names:
+                self.dst_logger.info(f"      Association '{assoc_name}' 既存。スキップ")
+                continue
+
+            # src プロジェクト URL → dst プロジェクト URL に置換
+            dst_net_url = net_url
+            for s, d in proj_map.items():
+                dst_net_url = re.sub(
+                    rf'(?<![A-Za-z0-9_-]){re.escape(s)}(?![A-Za-z0-9_-])', d, dst_net_url,
+                )
+            self.run_command(
+                f"gcloud compute network-firewall-policies associations create "
+                f"--firewall-policy={pname} --project={dst_host} --global "
+                f"--name={assoc_name} --network={dst_net_url}",
+                side="dst", logger=self.dst_logger,
+                desc=f"Create FW Policy Assoc {assoc_name}",
+                explanation=f"ポリシー '{pname}' をネットワーク '{net_name}' に関連付け",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+
+        # 余分な association を削除
+        for da in dst_assocs:
+            daname = da.get('name', '')
+            if not daname or daname in src_assoc_names:
+                continue
+            self.run_command(
+                f"gcloud compute network-firewall-policies associations delete "
+                f"--firewall-policy={pname} --project={dst_host} --global --quiet "
+                f"--name={daname}",
+                side="dst", logger=self.dst_logger,
+                desc=f"Delete Extra Assoc {pname}/{daname}",
+                explanation=f"dst にあって src にないアソシエーション '{daname}' を削除",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+
+    def _delete_all_associations(
+        self, pname: str, dst_host: str, dst_sa: Optional[str],
+    ):
+        """policy 削除前にすべての association を外す。"""
+        assocs = self._gcloud_list_json(
+            f"gcloud compute network-firewall-policies associations list "
+            f"--firewall-policy={pname} --project={dst_host} --global --format=json",
+            dst_sa,
+        )
+        for a in assocs:
+            aname = a.get('name', '')
+            if not aname:
+                continue
+            self.run_command(
+                f"gcloud compute network-firewall-policies associations delete "
+                f"--firewall-policy={pname} --project={dst_host} --global --quiet "
+                f"--name={aname}",
+                side="dst", logger=self.dst_logger,
+                desc=f"Detach Assoc {pname}/{aname}",
+                explanation=f"ポリシー '{pname}' 削除前にアソシエーション '{aname}' を外す",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+
     def step_gce_restore(self):
         pairs = list(self._iter_project_pairs())
         log_stage_header(self.dst_logger, 5, "GCE VM 復元（スナップショット → ディスク差し替え）", len(pairs))

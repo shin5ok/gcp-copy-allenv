@@ -8,6 +8,7 @@
 import argparse
 import sys
 import os
+import time
 import yaml
 import logging
 import subprocess
@@ -141,25 +142,37 @@ class ProjectProvisioner:
         if self.verbose:
             self.logger.info(f"{tag}実行: {cmd}")
 
-        try:
-            result = subprocess.run(
-                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            if result.returncode != 0:
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = subprocess.run(
+                    cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                if result.returncode != 0:
+                    stderr = result.stderr.strip()
+                    if "RATE_LIMIT_EXCEEDED" in stderr or "429" in stderr:
+                        wait = 2 ** attempt * 10
+                        self.logger.warning(f"{tag}レート制限 (429)。{wait}秒後にリトライ ({attempt}/{max_attempts - 1})...")
+                        time.sleep(wait)
+                        continue
+                    if not allow_fail:
+                        self.logger.error(f"{tag}✗ 失敗 (exit={result.returncode})")
+                        if stderr:
+                            self.logger.error(f"      理由: {stderr}")
+                        self.failed += 1
+                        sys.exit(result.returncode)
+                    else:
+                        return None
+                return result.stdout.strip()
+            except Exception as e:
+                self.logger.error(f"{tag}例外: {e}")
                 if not allow_fail:
-                    self.logger.error(f"{tag}✗ 失敗 (exit={result.returncode})")
-                    if result.stderr:
-                        self.logger.error(f"      理由: {result.stderr.strip()[:400]}")
-                    self.failed += 1
-                    sys.exit(result.returncode)
-                else:
-                    return None
-            return result.stdout.strip()
-        except Exception as e:
-            self.logger.error(f"{tag}例外: {e}")
-            if not allow_fail:
-                sys.exit(1)
-            return None
+                    sys.exit(1)
+                return None
+
+        self.logger.error(f"{tag}✗ リトライ上限到達 ({max_attempts}回)")
+        self.failed += 1
+        sys.exit(1)
 
     def project_exists(self, project_id: str) -> bool:
         res = self.run_command(
