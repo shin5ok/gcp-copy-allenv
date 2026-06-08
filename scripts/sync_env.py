@@ -79,12 +79,9 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud compute network-firewall-policies describe",
     "gcloud compute network-firewall-policies create",
     "gcloud compute network-firewall-policies delete",
-    "gcloud compute network-firewall-policies rules list",
     "gcloud compute network-firewall-policies rules describe",
     "gcloud compute network-firewall-policies rules create",
     "gcloud compute network-firewall-policies rules delete",
-    "gcloud compute network-firewall-policies associations list",
-    "gcloud compute network-firewall-policies associations describe",
     "gcloud compute network-firewall-policies associations create",
     "gcloud compute network-firewall-policies associations delete",
     "gcloud services enable",
@@ -843,13 +840,9 @@ class MigrationOrchestrator:
             logger.info(f"{tag}[MOCK] ネットワークファイアウォールポリシー一覧をシミュレート ({proj_id})")
             return json.dumps([])
 
-        if cmd.strip().startswith("gcloud compute network-firewall-policies rules list"):
-            logger.info(f"{tag}[MOCK] ファイアウォールポリシールール一覧をシミュレート")
-            return json.dumps([])
-
-        if cmd.strip().startswith("gcloud compute network-firewall-policies associations list"):
-            logger.info(f"{tag}[MOCK] ファイアウォールポリシーアソシエーション一覧をシミュレート")
-            return json.dumps([])
+        if cmd.strip().startswith("gcloud compute network-firewall-policies describe"):
+            logger.info(f"{tag}[MOCK] ネットワークファイアウォールポリシー describe をシミュレート")
+            return json.dumps({"rules": [], "associations": []})
 
         if cmd.strip().startswith("gcloud storage buckets list"):
             logger.info(f"{tag}[MOCK] バケット一覧をシミュレート ({proj_id})")
@@ -2244,6 +2237,88 @@ resource "google_storage_bucket" "mock_bucket" {{
             pass
         return None
 
+    def _fetch_policy_full(
+        self, pname: str, project: str, impersonate_sa: Optional[str],
+        is_src: bool, scope_flag: str = '',
+    ) -> Optional[Dict]:
+        """`network-firewall-policies describe POLICY --format=json` を取得。
+
+        gcloud には `rules list` / `associations list` サブコマンドが存在しないため、
+        describe レスポンスに含まれる `rules` / `associations` フィールドから取得する。
+        side="src" 用は run_command で借用 SA + read-only 検査を通し、dst 用は describe
+        失敗（未存在）を無視するため _gcloud_describe_json を使う。
+
+        scope_flag は '--region=REGION'（regional policy）または '' （global, デフォルト）。
+        古い gcloud では '--global' が未対応のため、global の場合はフラグ無指定にする。
+
+        gcloud のバージョンによっては describe 出力が [obj] 形式の list で返ることが
+        あるため、list/dict 両対応で正規化する。
+        """
+        scope = f" {scope_flag}" if scope_flag else ""
+        cmd = (
+            f"gcloud compute network-firewall-policies describe {pname} "
+            f"--project={project}{scope} --format=json"
+        )
+        if is_src:
+            raw = self.run_command(
+                cmd, side="src", logger=self.org_logger,
+                desc=f"Describe FW Policy {pname}",
+                explanation=f"ポリシー '{pname}' の rules/associations を取得（src）",
+                impersonate_sa=impersonate_sa, allow_fail=True,
+            )
+            try:
+                data = json.loads(raw) if raw else None
+            except Exception:
+                data = None
+        else:
+            data = self._gcloud_describe_json(cmd, impersonate_sa)
+        return self._normalize_policy_response(data, pname)
+
+    @staticmethod
+    def _policy_scope_flag(policy: Optional[Dict]) -> str:
+        """policy オブジェクトから scope を判定し、gcloud フラグを返す。
+
+        - regional policy: '--region=REGION'
+        - global policy:   '' (デフォルト)
+
+        list/describe レスポンスの `region` フィールドまたは `selfLink` から判定。
+        古い gcloud では '--global' フラグが未対応のため、global の場合は無指定にする。
+        """
+        if not policy:
+            return ''
+        region_url = (policy.get('region') or '').strip()
+        if region_url:
+            region = region_url.rsplit('/', 1)[-1]
+            return f'--region={region}'
+        self_link = (policy.get('selfLink') or '')
+        m = re.search(r'/regions/([^/]+)/', self_link)
+        if m:
+            return f'--region={m.group(1)}'
+        return ''
+
+    @staticmethod
+    def _normalize_policy_response(data, pname: str) -> Optional[Dict]:
+        """describe 出力を必ず dict 形式に正規化する。
+
+        gcloud は describe をスカラー dict で返すケースと、[dict] のリストで返す
+        ケースの両方がある。list のときは pname に一致する要素を優先採用する。
+        """
+        if data is None:
+            return None
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get('name', '') or ''
+                if name == pname or name.endswith(f"/{pname}"):
+                    return item
+            for item in data:
+                if isinstance(item, dict):
+                    return item
+        return None
+
     def _gcloud_list_json(
         self, cmd: str, impersonate_sa: Optional[str],
     ) -> List[Dict]:
@@ -2385,10 +2460,10 @@ resource "google_storage_bucket" "mock_bucket" {{
         parts = [
             "gcloud", "compute", "firewall-rules", "create", name,
             f"--project={dst_host}",
-            f"--network={norm['network'] or 'default'}",
-            f"--direction={norm['direction']}",
-            f"--priority={norm['priority']}",
-            f"{action_flag}={proto_list}",
+            f"--network={shlex.quote(norm['network'] or 'default')}",
+            f"--direction={shlex.quote(norm['direction'])}",
+            f"--priority={int(norm['priority'])}",
+            f"{action_flag}={shlex.quote(proto_list)}",
         ]
         # disabled は明示的に両方の状態を扱う
         parts.append("--disabled" if norm['disabled'] else "--no-disabled")
@@ -2401,8 +2476,9 @@ resource "google_storage_bucket" "mock_bucket" {{
             ('sourceServiceAccounts',  '--source-service-accounts'),
             ('targetServiceAccounts',  '--target-service-accounts'),
         ]:
-            if norm[key]:
-                parts.append(f"{flag}={','.join(norm[key])}")
+            vals = [v for v in (norm.get(key) or []) if v]
+            if vals:
+                parts.append(f"{flag}={shlex.quote(','.join(vals))}")
 
         # フローログ設定
         if norm['logging_enabled']:
@@ -2458,10 +2534,12 @@ resource "google_storage_bucket" "mock_bucket" {{
             pname = policy.get('name', '')
             if not pname:
                 continue
+            scope_flag = self._policy_scope_flag(policy)
             self._sync_one_policy(
                 pname, policy, src_host, dst_host, src_sa, dst_sa,
                 policy_exists_in_dst=pname in dst_policy_names,
                 allow_drift=allow_drift,
+                scope_flag=scope_flag,
             )
 
         # --- 削除フェーズ: dst にあって src にない policy を削除 ---
@@ -2469,11 +2547,13 @@ resource "google_storage_bucket" "mock_bucket" {{
             dpname = dp.get('name', '')
             if not dpname or dpname in src_policy_names:
                 continue
+            dst_scope = self._policy_scope_flag(dp)
+            scope_part = f" {dst_scope}" if dst_scope else ""
             # 削除前に association を全部外す必要がある
-            self._delete_all_associations(dpname, dst_host, dst_sa)
+            self._delete_all_associations(dpname, dst_host, dst_sa, dst_scope)
             self.run_command(
                 f"gcloud compute network-firewall-policies delete {dpname} "
-                f"--project={dst_host} --global --quiet",
+                f"--project={dst_host}{scope_part} --quiet",
                 side="dst", logger=self.dst_logger,
                 desc=f"Delete Extra FW Policy {dpname}",
                 explanation=f"dst にあって src にないポリシー '{dpname}' を削除",
@@ -2485,14 +2565,19 @@ resource "google_storage_bucket" "mock_bucket" {{
         src_host: str, dst_host: str,
         src_sa: Optional[str], dst_sa: Optional[str],
         policy_exists_in_dst: bool, allow_drift: bool,
+        scope_flag: str = '',
     ):
-        """1 つの policy（rules + associations 含む）を src → dst へ同期。"""
+        """1 つの policy（rules + associations 含む）を src → dst へ同期。
+
+        scope_flag は src policy から判定したスコープ。dst へも同じスコープで複製する。
+        """
         p_desc = src_policy.get('description', '') or ''
+        scope_part = f" {scope_flag}" if scope_flag else ""
 
         if not policy_exists_in_dst:
             cmd = (
                 f"gcloud compute network-firewall-policies create {pname} "
-                f"--project={dst_host} --global --quiet"
+                f"--project={dst_host}{scope_part} --quiet"
             )
             if p_desc:
                 cmd += f" --description={shlex.quote(p_desc)}"
@@ -2506,24 +2591,16 @@ resource "google_storage_bucket" "mock_bucket" {{
             self.dst_logger.info(f"    FW policy '{pname}' は既存。rules/associations のみ同期")
 
         # --- rules の同期 ---
-        src_rules_raw = self.run_command(
-            f"gcloud compute network-firewall-policies rules list "
-            f"--firewall-policy={pname} --project={src_host} --format=json",
-            side="src", logger=self.org_logger,
-            desc=f"List FW Policy Rules {pname}",
-            explanation=f"ポリシー '{pname}' のルール一覧取得",
-            impersonate_sa=src_sa, allow_fail=True,
+        # 注意: `network-firewall-policies rules list` は gcloud に存在しない。
+        #       describe POLICY のレスポンス内に rules / associations が含まれる。
+        src_policy_full = self._fetch_policy_full(
+            pname, src_host, src_sa, is_src=True, scope_flag=scope_flag,
         )
-        try:
-            src_rules = json.loads(src_rules_raw) if src_rules_raw else []
-        except Exception:
-            src_rules = []
-
-        dst_rules = self._gcloud_list_json(
-            f"gcloud compute network-firewall-policies rules list "
-            f"--firewall-policy={pname} --project={dst_host} --global --format=json",
-            dst_sa,
+        src_rules = (src_policy_full or {}).get('rules', []) or []
+        dst_policy_full = self._fetch_policy_full(
+            pname, dst_host, dst_sa, is_src=False, scope_flag=scope_flag,
         )
+        dst_rules = (dst_policy_full or {}).get('rules', []) or []
         dst_by_prio = {int(r['priority']): r for r in dst_rules if r.get('priority') is not None}
         src_prios = set()
 
@@ -2537,7 +2614,7 @@ resource "google_storage_bucket" "mock_bucket" {{
             existing = dst_by_prio.get(prio)
 
             if existing is None:
-                self._create_policy_rule(pname, prio, src_norm, dst_host, dst_sa)
+                self._create_policy_rule(pname, prio, src_norm, dst_host, dst_sa, scope_flag)
                 continue
 
             dst_norm = self._normalize_policy_rule(existing)
@@ -2555,13 +2632,13 @@ resource "google_storage_bucket" "mock_bucket" {{
             self.dst_logger.info("        → delete + create で再現")
             self.run_command(
                 f"gcloud compute network-firewall-policies rules delete {prio} "
-                f"--firewall-policy={pname} --project={dst_host} --global --quiet",
+                f"--firewall-policy={pname} --project={dst_host}{scope_part} --quiet",
                 side="dst", logger=self.dst_logger,
                 desc=f"Drift Delete Rule {pname}/{prio}",
                 explanation=f"ドリフト解消のため priority={prio} を削除",
                 impersonate_sa=dst_sa, allow_fail=True,
             )
-            self._create_policy_rule(pname, prio, src_norm, dst_host, dst_sa)
+            self._create_policy_rule(pname, prio, src_norm, dst_host, dst_sa, scope_flag)
 
         # 余分な rule の削除
         for prio, dst_rule in dst_by_prio.items():
@@ -2569,7 +2646,7 @@ resource "google_storage_bucket" "mock_bucket" {{
                 continue
             self.run_command(
                 f"gcloud compute network-firewall-policies rules delete {prio} "
-                f"--firewall-policy={pname} --project={dst_host} --global --quiet",
+                f"--firewall-policy={pname} --project={dst_host}{scope_part} --quiet",
                 side="dst", logger=self.dst_logger,
                 desc=f"Delete Extra Rule {pname}/{prio}",
                 explanation=f"dst にあって src にないルール priority={prio} を削除",
@@ -2577,11 +2654,11 @@ resource "google_storage_bucket" "mock_bucket" {{
             )
 
         # --- associations の同期 ---
-        self._sync_policy_associations(pname, src_host, dst_host, src_sa, dst_sa)
+        self._sync_policy_associations(pname, src_host, dst_host, src_sa, dst_sa, scope_flag)
 
     def _create_policy_rule(
         self, pname: str, prio: int, norm: Dict,
-        dst_host: str, dst_sa: Optional[str],
+        dst_host: str, dst_sa: Optional[str], scope_flag: str = '',
     ):
         """正規化された rule dict から policy rule を作成する。"""
         if not norm['layer4Configs']:
@@ -2594,11 +2671,12 @@ resource "google_storage_bucket" "mock_bucket" {{
             "gcloud", "compute", "network-firewall-policies", "rules", "create", str(prio),
             f"--firewall-policy={pname}",
             f"--project={dst_host}",
-            "--global",
-            f"--action={norm['action']}",
-            f"--direction={norm['direction']}",
-            f"--layer4-configs={norm['layer4Configs']}",
+            f"--action={shlex.quote(norm['action'])}",
+            f"--direction={shlex.quote(norm['direction'])}",
+            f"--layer4-configs={shlex.quote(norm['layer4Configs'])}",
         ]
+        if scope_flag:
+            parts.append(scope_flag)
         parts.append("--disabled" if norm['disabled'] else "--no-disabled")
         parts.append("--enable-logging" if norm['enableLogging'] else "--no-enable-logging")
 
@@ -2617,8 +2695,9 @@ resource "google_storage_bucket" "mock_bucket" {{
             ('targetServiceAccounts',   '--target-service-accounts'),
             ('targetSecureTags',        '--target-secure-tags'),
         ]:
-            if norm[key]:
-                parts.append(f"{flag}={','.join(norm[key])}")
+            vals = [v for v in (norm.get(key) or []) if v]
+            if vals:
+                parts.append(f"{flag}={shlex.quote(','.join(vals))}")
 
         if norm['description']:
             parts.append(f"--description={shlex.quote(norm['description'])}")
@@ -2632,27 +2711,18 @@ resource "google_storage_bucket" "mock_bucket" {{
 
     def _sync_policy_associations(
         self, pname: str, src_host: str, dst_host: str,
-        src_sa: Optional[str], dst_sa: Optional[str],
+        src_sa: Optional[str], dst_sa: Optional[str], scope_flag: str = '',
     ):
         """policy の association（ネットワーク紐付け）を同期。"""
-        src_raw = self.run_command(
-            f"gcloud compute network-firewall-policies associations list "
-            f"--firewall-policy={pname} --project={src_host} --format=json",
-            side="src", logger=self.org_logger,
-            desc=f"List FW Policy Assoc {pname}",
-            explanation=f"ポリシー '{pname}' のアソシエーション一覧取得",
-            impersonate_sa=src_sa, allow_fail=True,
+        scope_part = f" {scope_flag}" if scope_flag else ""
+        src_policy_full = self._fetch_policy_full(
+            pname, src_host, src_sa, is_src=True, scope_flag=scope_flag,
         )
-        try:
-            src_assocs = json.loads(src_raw) if src_raw else []
-        except Exception:
-            src_assocs = []
-
-        dst_assocs = self._gcloud_list_json(
-            f"gcloud compute network-firewall-policies associations list "
-            f"--firewall-policy={pname} --project={dst_host} --global --format=json",
-            dst_sa,
+        src_assocs = (src_policy_full or {}).get('associations', []) or []
+        dst_policy_full = self._fetch_policy_full(
+            pname, dst_host, dst_sa, is_src=False, scope_flag=scope_flag,
         )
+        dst_assocs = (dst_policy_full or {}).get('associations', []) or []
         dst_assoc_names = {a.get('name') for a in dst_assocs if a.get('name')}
 
         proj_map = self._build_proj_id_map()
@@ -2677,8 +2747,8 @@ resource "google_storage_bucket" "mock_bucket" {{
                 )
             self.run_command(
                 f"gcloud compute network-firewall-policies associations create "
-                f"--firewall-policy={pname} --project={dst_host} --global "
-                f"--name={assoc_name} --network={dst_net_url}",
+                f"--firewall-policy={pname} --project={dst_host}{scope_part} "
+                f"--name={assoc_name} --network={shlex.quote(dst_net_url)}",
                 side="dst", logger=self.dst_logger,
                 desc=f"Create FW Policy Assoc {assoc_name}",
                 explanation=f"ポリシー '{pname}' をネットワーク '{net_name}' に関連付け",
@@ -2692,7 +2762,7 @@ resource "google_storage_bucket" "mock_bucket" {{
                 continue
             self.run_command(
                 f"gcloud compute network-firewall-policies associations delete "
-                f"--firewall-policy={pname} --project={dst_host} --global --quiet "
+                f"--firewall-policy={pname} --project={dst_host}{scope_part} --quiet "
                 f"--name={daname}",
                 side="dst", logger=self.dst_logger,
                 desc=f"Delete Extra Assoc {pname}/{daname}",
@@ -2701,21 +2771,21 @@ resource "google_storage_bucket" "mock_bucket" {{
             )
 
     def _delete_all_associations(
-        self, pname: str, dst_host: str, dst_sa: Optional[str],
+        self, pname: str, dst_host: str, dst_sa: Optional[str], scope_flag: str = '',
     ):
         """policy 削除前にすべての association を外す。"""
-        assocs = self._gcloud_list_json(
-            f"gcloud compute network-firewall-policies associations list "
-            f"--firewall-policy={pname} --project={dst_host} --global --format=json",
-            dst_sa,
+        scope_part = f" {scope_flag}" if scope_flag else ""
+        dst_policy_full = self._fetch_policy_full(
+            pname, dst_host, dst_sa, is_src=False, scope_flag=scope_flag,
         )
+        assocs = (dst_policy_full or {}).get('associations', []) or []
         for a in assocs:
             aname = a.get('name', '')
             if not aname:
                 continue
             self.run_command(
                 f"gcloud compute network-firewall-policies associations delete "
-                f"--firewall-policy={pname} --project={dst_host} --global --quiet "
+                f"--firewall-policy={pname} --project={dst_host}{scope_part} --quiet "
                 f"--name={aname}",
                 side="dst", logger=self.dst_logger,
                 desc=f"Detach Assoc {pname}/{aname}",
