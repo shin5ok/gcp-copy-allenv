@@ -89,6 +89,59 @@
    - GCSバケットの同期（`gcloud storage rsync`）およびBigQueryデータセット・テーブルの同期を実行する。
    - モックモード時は、バケット一覧やデータセット一覧の取得および同期コマンドの成功をシミュレートする。
 
+---
+
+## VMware VMDK → GCE インポートワークフロー
+
+VMware 環境の VM を GCE に移行するための独立したサブシステム。`vmware/` ディレクトリに格納。
+
+### 1. フロー概要
+
+```
+setup → import → start
+```
+
+| ステップ | コマンド | 処理内容 |
+|---------|---------|---------|
+| setup | `make vmware-setup-apply` | 必要 API 有効化 / Migrate to VMs TargetProject 登録 / GCS bucket 権限付与 / 静的 IP 予約 |
+| import | `make vmware-import-apply` | GCS 上の VMDK を `gcloud migration vms image-imports create` でカスタムイメージ化（非同期） |
+| start | `make vmware-start-apply` | カスタムイメージから `gcloud compute instances create` で GCE インスタンスを作成・起動 |
+
+全ステップ一括実行: `make vmware-all-apply`
+
+### 2. 設定ファイル (`vmware/config.yaml`)
+
+| セクション | 役割 |
+|-----------|------|
+| `global` | 対象プロジェクト / region / zone / dry_run フラグ |
+| `vms[]` | VM ごとのソース VMDK (GCS URI)・イメージ名プレフィックス・インスタンス設定・ネットワーク設定 |
+
+複数 VM を `vms[]` 配列で定義可能。同一 GCS URI を複数 VM で指定しても、イメージ名に VM 名が含まれるため（`<prefix>-<vm_name>-<disk_name>`）、VM ごとに独立したカスタムイメージが生成される。
+
+### 3. イメージ命名規則
+
+```
+<image_name_prefix>-<vm_name>-<disk_name>
+例: vmdk-imported-20260608-centos8t-boot
+```
+
+### 4. dry_run / --apply
+
+- `config.yaml` の `global.dry_run: true` が既定。コマンドを表示するのみ、実行しない。
+- `--apply` フラグ（または `*-apply` Make ターゲット）で実際に実行。
+
+### 5. import 完了確認
+
+`import` ステップは非同期。完了後に以下のコマンドで状態を確認：
+
+```bash
+gcloud migration vms image-imports list --project=<project_id> --location=<region>
+```
+
+複数 (project, region) がある場合はそれぞれ出力される。
+
+---
+
 ### 3. 安全対策と堅牢性 (べき等性の確保とログ記録)
 - **べき等性の維持**: すべてのステップでべき等チェックを徹底し、すでに完了している処理はスキップする。
 - **ログの分離**: コピー元の読み取り操作は `org.log`、コピー先への書き込み・変更操作は `dst.log` に記録する。

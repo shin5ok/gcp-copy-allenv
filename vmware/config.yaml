@@ -1,0 +1,206 @@
+# ==============================================================================
+# VMDK Import → GCE 作成 設定ファイル
+# ==============================================================================
+# 想定フロー:
+#   1) setup  : API 有効化 / TargetProject 登録 / bucket 権限 / IP 予約
+#   2) import : GCS 上の VMDK を `gcloud migration vms image-imports create` でカスタムイメージ化 (非同期)
+#   3) start  : カスタムイメージから `gcloud compute instances create` で GCE 作成
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. 共通設定 (Global)
+# ------------------------------------------------------------------------------
+global:
+  # 出力先 GCP プロジェクト（image / instance / disk が作られる先）
+  project_id: "shingo-ar-sharedservice0926-1"
+
+  # GCE / イメージを作る region と zone
+  region: "asia-northeast1"
+  zone: "asia-northeast1-a"
+
+  # ログ出力先
+  log_dir: "./logs"
+  log_file: "vmdk_import.log"
+
+  # ドライランモード (true なら gcloud を実行せずコマンドを表示のみ)
+  dry_run: true
+
+  # 詳細ログ
+  verbose_logging: true
+
+# ------------------------------------------------------------------------------
+# 2. VM 定義 (複数指定可)
+# ------------------------------------------------------------------------------
+# 各エントリが 1 つの GCE インスタンスに対応する。
+# setup / import / start はすべての VM をまとめて処理する。
+vms:
+  - name: "centos8t"                  # 識別子 (ログ表示用)
+
+    # ---- ソース VMDK ----
+    source:
+      disks:
+        - name: "boot"               # 任意の識別子（image 名のサフィックスにも使う）
+          boot: true
+          gcs_uri: "gs://shingo-ar-sharedhost0926/vmware_images/CentOS_8.4.2105_VMM_LinuxVMImages.COM.vmdk"
+
+        # データディスクがある場合は以下のように追加（不要なら削除可）
+        # - name: "data1"
+        #   boot: false
+        #   gcs_uri: "gs://REPLACE_ME/path/to/data1.vmdk"
+
+    # ---- イメージ import 設定 ----
+    image_import:
+      # 作成するカスタムイメージ名のプレフィックス
+      # 実際の image 名 / import resource 名は "<prefix>-<source.disks[].name>" になる
+      image_name_prefix: "vmdk-imported-20260608"
+
+      # ライセンスタイプ (省略可、boot disk のみ有効)
+      # compute-engine-license-type-byol / -payg / -default
+      # license_type: "compute-engine-license-type-default"
+
+      # Migration host project と target project が異なる場合のみ指定
+      # target_project_host: "vm-migration-host-project"
+      # target_project_name: "target-project-id"
+
+    # ---- GCE インスタンス設定 ----
+    instance:
+      name: "centos8-from-vmv"
+      machine_type: "e2-standard-2"
+
+      boot_disk:
+        type: "pd-balanced"
+        # size_gb: 50  # 未指定またはイメージ実サイズ未満の場合は自動引き上げ
+        auto_delete: true
+
+      additional_disks:
+        # - source_name: "data1"      # source.disks[].name を参照
+        #   device_name: "data1"
+        #   type: "pd-balanced"
+        #   size_gb: 100
+        #   mode: "READ_WRITE"
+        #   auto_delete: false
+
+      # service_account: "my-vm-sa@REPLACE_ME.iam.gserviceaccount.com"
+      # scopes: ["cloud-platform"]
+
+      labels:
+        env: "migrated"
+        source: "vmware"
+
+      tags:
+        - "ssh-allowed"
+
+      # metadata:
+      #   enable-oslogin: "TRUE"
+
+    # ---- ネットワーク設定 ----
+    network:
+      host_project: "shingo-ar-sharedhost0926"
+      network: "shared-vpc"
+      subnetwork: "subnet-svc1"
+
+      internal_ip:
+        mode: "ip"
+        address_name: "centos8-internal-ip"
+        ip: 10.100.1.200
+
+      external_ip:
+        enabled: false
+
+  - name: "centos8v"                  # 識別子 (ログ表示用)
+
+    # ---- ソース VMDK ----
+    source:
+      disks:
+        - name: "boot"               # 任意の識別子（image 名のサフィックスにも使う）
+          boot: true
+          gcs_uri: "gs://shingo-ar-sharedhost0926/vmware_images/CentOS_8.4.2105_VMM_LinuxVMImages.COM.vmdk"
+
+        # データディスクがある場合は以下のように追加（不要なら削除可）
+        # - name: "data1"
+        #   boot: false
+        #   gcs_uri: "gs://REPLACE_ME/path/to/data1.vmdk"
+
+    # ---- イメージ import 設定 ----
+    image_import:
+      # 作成するカスタムイメージ名のプレフィックス
+      # 実際の image 名 / import resource 名は "<prefix>-<source.disks[].name>" になる
+      image_name_prefix: "vmdk-imported-20260608"
+
+      # ライセンスタイプ (省略可、boot disk のみ有効)
+      # compute-engine-license-type-byol / -payg / -default
+      # license_type: "compute-engine-license-type-default"
+
+      # Migration host project と target project が異なる場合のみ指定
+      # target_project_host: "vm-migration-host-project"
+      # target_project_name: "target-project-id"
+
+    # ---- GCE インスタンス設定 ----
+    instance:
+      name: "centos8-from-vmr"
+      machine_type: "e2-standard-2"
+
+      boot_disk:
+        type: "pd-balanced"
+        # size_gb: 50  # 未指定またはイメージ実サイズ未満の場合は自動引き上げ
+        auto_delete: true
+
+      additional_disks:
+        # - source_name: "data1"      # source.disks[].name を参照
+        #   device_name: "data1"
+        #   type: "pd-balanced"
+        #   size_gb: 100
+        #   mode: "READ_WRITE"
+        #   auto_delete: false
+
+      # service_account: "my-vm-sa@REPLACE_ME.iam.gserviceaccount.com"
+      # scopes: ["cloud-platform"]
+
+      labels:
+        env: "migrated"
+        source: "vmware"
+
+      tags:
+        - "ssh-allowed"
+
+      # metadata:
+      #   enable-oslogin: "TRUE"
+
+    # ---- ネットワーク設定 ----
+    network:
+      host_project: "shingo-ar-sharedhost0926"
+      network: "shared-vpc"
+      subnetwork: "subnet-svc1"
+
+      internal_ip:
+        mode: "ip"
+        address_name: "centos8-internal-ip"
+        ip: 10.100.1.202
+
+      external_ip:
+        enabled: false
+
+  # 2 台目以降は以下のように追加する
+  # - name: "vm2"
+  #   source:
+  #     disks:
+  #       - name: "boot"
+  #         boot: true
+  #         gcs_uri: "gs://BUCKET/path/to/vm2.vmdk"
+  #   image_import:
+  #     image_name_prefix: "vmdk-vm2-20260608"
+  #   instance:
+  #     name: "vm2-instance"
+  #     machine_type: "e2-standard-2"
+  #     boot_disk:
+  #       type: "pd-balanced"
+  #       auto_delete: true
+  #   network:
+  #     host_project: "shingo-ar-sharedhost0926"
+  #     network: "shared-vpc"
+  #     subnetwork: "subnet-svc1"
+  #     internal_ip:
+  #       mode: "ip"
+  #       ip: 10.100.1.202
+  #     external_ip:
+  #       enabled: false
