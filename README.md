@@ -248,25 +248,42 @@ tail -f logs/$(ls -t logs/ | head -1)/dst.log
 
 ## 📦 VMDK → GCE インポート（`vmware/`）
 
-VMware からエクスポートした VMDK を GCS 経由で `gcloud compute images import` でカスタムイメージ化し、
+VMware からエクスポートした VMDK を GCS 経由で **Migrate to VMs API**（`gcloud migration vms image-imports create`）でカスタムイメージ化し、
 指定した構成の GCE インスタンスを作成するためのワークフローです。本体の `dst/` パイプラインとは独立しています。
 
-設定ファイル: [`vmware/config.yaml`](./vmware/config.yaml)
+設定ファイル: [`vmware/config.yaml`](./vmware/config.yaml)（テンプレート: [`vmware/config.yaml.template`](./vmware/config.yaml.template)）
 
 | セクション | 用途 |
 | :--- | :--- |
-| `global` | 出力先 project / region / zone / dry_run / ログ |
+| `global` | 出力先 project / region / zone / dry_run / ログ設定 |
 | `source.disks[]` | import 対象 VMDK の GCS URI（`boot: true` を 1 本、`boot: false` をデータディスクとして複数指定可） |
-| `image_import` | `--os`（例: `centos-7`）、image 名 prefix、scratch bucket、timeout |
-| `instance` | machine_type、boot/additional disk、service account、labels、tags |
-| `network` | VPC / subnetwork（Shared VPC は `host_project` 指定）、内部 IP（予約 address 名 or 直接 IP）、外部 IP 有無 |
+| `image_import` | image 名 prefix、ライセンスタイプ（省略可）、Migration host/target project 分離構成（省略可） |
+| `instance` | machine_type、boot disk 設定、追加ディスク、service account、labels、tags、metadata |
+| `network` | VPC / subnetwork（Shared VPC は `host_project` 指定）、内部 IP（予約 address 名 or 直接 IP）、外部 IP 有無・tier |
 
-想定する処理順:
-1. `source.disks[]` の各 VMDK を `gcloud compute images import` でカスタムイメージ化（boot は OS image、それ以外は `--data-disk`）。
-2. boot image から `gcloud compute instances create` で GCE を作成（machine_type / SA / labels / tags / 内部 static IP を反映）。
-3. データディスクがあれば対応イメージから `compute disks create` → `compute instances attach-disk`。
+処理ステップ（`setup → import → start`）:
 
-> ⚠️ CentOS 7 など EOL OS は importer から警告が出る場合があります。`image_import.os` の値で挙動が変わります。
+1. **setup**: 必要 API の有効化（compute / storage / vmmigration / iam）、Migrate to VMs の TargetProject 登録、vmmigration SA への source bucket 権限付与（`roles/storage.objectViewer`）、内部 IP / 外部 static IP の予約。
+2. **import**: `source.disks[]` の各 VMDK を `gcloud migration vms image-imports create` でカスタムイメージ化（**非同期**）。boot disk は OS イメージとして、`boot: false` は `--skip-os-adaptation` 付きでデータディスクとして import。完了確認は `gcloud migration vms image-imports describe` でポーリング。
+3. **start**: boot image から `gcloud compute instances create` で GCE を作成（machine_type / SA / labels / tags / 内部 static IP / 外部 IP を config に従って設定）。データディスクがあれば対応イメージから `compute disks create` → `compute instances attach-disk`。
+
+Makefile コマンド（`vmware/` 配下、またはルートから `make vmware-*`）:
+
+| コマンド | 説明 |
+| :--- | :--- |
+| `make vmware-setup` | setup を dry_run 設定に従って実行 |
+| `make vmware-setup-apply` | setup を `--apply`（必ず実行）で実行 |
+| `make vmware-import` | VMDK → カスタムイメージ化（非同期投入） |
+| `make vmware-import-apply` | 同上、`--apply` で実行 |
+| `make vmware-start` | カスタムイメージから GCE インスタンス作成・起動 |
+| `make vmware-start-apply` | 同上、`--apply` で実行 |
+| `make vmware-all` | setup → import → start を順次（dry_run は config に従う） |
+| `make vmware-all-apply` | 同上、`--apply` で全ステップ実行 |
+| `make vmware-clean` | `vmware/logs/` を削除 |
+
+> 設定ファイルを切り替える場合: `make vmware-setup-apply VMWARE_CONFIG=vmware/other.yaml`
+>
+> `image_import.target_project_host` / `target_project_name` は Migration host project と target project を分離する構成（省略時は `global.project_id` を使用）。
 
 ---
 
