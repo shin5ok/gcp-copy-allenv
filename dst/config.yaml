@@ -61,20 +61,20 @@ project_mapping:
   # 共有VPCホストプロジェクト
   host_project:
     src: "shingo-ar-sharedhost0926"
-    dst: "shingo-ar-host2026060801"
+    dst: "shingo-ar-host2026060804"
     src_impersonate_service_account: "org-host-viewer@shingo-ar-sharedhost0926.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-    dst_impersonate_service_account: "dst-host-owner@shingo-ar-host2026060801.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+    dst_impersonate_service_account: "dst-host-owner@shingo-ar-host2026060804.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
   
   # サービスプロジェクトのリスト (複数指定可能)
   service_projects:
     - src: "shingo-ar-sharedservice0926-1"
-      dst: "shingo-ar-service2026060801-1"
+      dst: "shingo-ar-service2026060804-1"
       src_impersonate_service_account: "org-svc1-viewer@shingo-ar-sharedservice0926-1.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-      dst_impersonate_service_account: "dst-svc1-owner@shingo-ar-service2026060801-1.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+      dst_impersonate_service_account: "dst-svc1-owner@shingo-ar-service2026060804-1.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
     - src: "shingo-ar-sharedservice0926-3"
-      dst: "shingo-ar-service2026060801-3"
+      dst: "shingo-ar-service2026060804-3"
       src_impersonate_service_account: "org-svc3-viewer@shingo-ar-sharedservice0926-3.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-      dst_impersonate_service_account: "dst-svc3-owner@shingo-ar-service2026060801-3.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+      dst_impersonate_service_account: "dst-svc3-owner@shingo-ar-service2026060804-3.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
 
 # ------------------------------------------------------------------------------
 # 3. リネームルール設定 (Rename Rules)
@@ -123,6 +123,16 @@ steps:
   # [Step 4] dst へIaCでの再現 (Terraform適用)
   terraform_apply:
     enabled: true
+
+  # [Step 4.5] host project のファイアウォールルール・ポリシーを dst に複製
+  # bulk-export は network_firewall_policy を出力しないため gcloud で直接同期する
+  network_firewall:
+    enabled: true
+    # ドリフト時の挙動:
+    # - false (デフォルト): dst の既存ルールと src の内容が異なってもログ警告のみ。
+    # - true: 内容差分があれば dst を delete してから再 create。短時間ですが
+    #   トラフィックが遮断されるため、メンテナンスウィンドウで運用するときに使用。
+    allow_drift_recreate: false
 
   # [Step 5] GCE VM 復元 (スナップショットから復元したディスクをVMに紐付け起動)
   gce_restore:
