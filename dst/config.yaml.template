@@ -101,6 +101,9 @@ steps:
   cai_scan:
     enabled: true
     output_dir: "./cai_export"
+    # 未登録 assetType（_ASSET_COVERAGE に無い種別）を検出したら処理を停止するか
+    # 既定 false: WARNING でログに残すのみ。CI で漏れゼロを強制したい場合は true。
+    fail_on_uncovered: false
 
   # [Step 2] GCE Snapshot の準備
   gce_snapshot:
