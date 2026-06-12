@@ -10,6 +10,10 @@ from scripts.sync_env import (
     is_src_read_only,
     is_known_mock_command,
     validate_config,
+    diff_coverage,
+    _ASSET_COVERAGE,
+    fw_policy_rule_layer4,
+    fw_policy_rule_flags,
 )
 
 
@@ -527,3 +531,164 @@ class TestLogging:
         assert os.path.isdir(o.run_dir)
         assert os.path.exists(os.path.join(o.run_dir, "org.log"))
         assert os.path.exists(os.path.join(o.run_dir, "dst.log"))
+
+
+# ============================================================
+# ISSUE-01: CAI カバレッジマップと突合せ
+# ============================================================
+class TestAssetCoverage:
+    def test_known_assets_have_coverage_entry(self):
+        # 実環境 (cai_export/*) で観測された主要 assetType がマップに登録済みであること
+        must_have = [
+            "compute.googleapis.com/Firewall",
+            "compute.googleapis.com/Instance",
+            "compute.googleapis.com/Subnetwork",
+            "compute.googleapis.com/Router",
+            "iam.googleapis.com/Role",
+        ]
+        for t in must_have:
+            assert t in _ASSET_COVERAGE, f"{t} が _ASSET_COVERAGE に未登録"
+
+    def test_diff_coverage_detects_unknown(self):
+        # 未登録 type は uncovered に出る、既知 type は出ない
+        observed = [
+            "compute.googleapis.com/Firewall",       # known
+            "compute.googleapis.com/Instance",       # known
+            "fake.googleapis.com/UnknownThing",      # unknown
+            "another.googleapis.com/Mystery",        # unknown
+        ]
+        uncovered, _ = diff_coverage(observed)
+        assert "fake.googleapis.com/UnknownThing" in uncovered
+        assert "another.googleapis.com/Mystery" in uncovered
+        assert "compute.googleapis.com/Firewall" not in uncovered
+
+    def test_diff_coverage_empty_input(self):
+        uncovered, _ = diff_coverage([])
+        assert uncovered == []
+
+    def test_report_cai_coverage_warns_uncovered(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+
+        # mock の CAI 出力ファイルを作る
+        out_dir = os.path.join(temp_dir, "cai_out")
+        os.makedirs(out_dir)
+        sample = (
+            "assetType: compute.googleapis.com/Firewall\n"
+            "displayName: x\n"
+            "---\n"
+            "assetType: fake.googleapis.com/Mystery\n"
+            "displayName: y\n"
+        )
+        with open(os.path.join(out_dir, "cai_resources_src-host.txt"), "w") as f:
+            f.write(sample)
+
+        # org_logger は propagate=False なので caplog ではなく自前ハンドラで捕捉
+        records = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        h = _Capture(level=logging.WARNING)
+        o.org_logger.addHandler(h)
+        try:
+            o._report_cai_coverage(
+                [("src-host", None)], out_dir, fail_on_uncovered=False,
+            )
+        finally:
+            o.org_logger.removeHandler(h)
+
+        msgs = [r.getMessage() for r in records]
+        assert any("fake.googleapis.com/Mystery" in m for m in msgs)
+
+    def test_fail_on_uncovered_exits(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        out_dir = os.path.join(temp_dir, "cai_out")
+        os.makedirs(out_dir)
+        with open(os.path.join(out_dir, "cai_resources_src-host.txt"), "w") as f:
+            f.write("assetType: unknown.googleapis.com/Type\n")
+        with pytest.raises(SystemExit):
+            o._report_cai_coverage(
+                [("src-host", None)], out_dir, fail_on_uncovered=True,
+            )
+
+
+# ============================================================
+# ISSUE-02: FW policy rule の gcloud フラグ変換
+# ============================================================
+class TestFwPolicyRuleConversion:
+    def test_layer4_single_port(self):
+        rule = {"match": {"layer4Configs": [{"ipProtocol": "tcp", "ports": ["22"]}]}}
+        assert fw_policy_rule_layer4(rule) == "tcp:22"
+
+    def test_layer4_multiple_ports_same_protocol(self):
+        # 旧コードはここで先頭ポートしか拾わなかった ('tcp:80' になっていた)
+        rule = {"match": {"layer4Configs": [{"ipProtocol": "tcp", "ports": ["80", "443"]}]}}
+        assert fw_policy_rule_layer4(rule) == "tcp:80,tcp:443"
+
+    def test_layer4_multiple_protocols(self):
+        rule = {"match": {"layer4Configs": [
+            {"ipProtocol": "tcp", "ports": ["80", "443"]},
+            {"ipProtocol": "udp", "ports": ["53"]},
+            {"ipProtocol": "icmp"},
+        ]}}
+        assert fw_policy_rule_layer4(rule) == "tcp:80,tcp:443,udp:53,icmp"
+
+    def test_layer4_no_ports(self):
+        rule = {"match": {"layer4Configs": [{"ipProtocol": "all"}]}}
+        assert fw_policy_rule_layer4(rule) == "all"
+
+    def test_layer4_empty_falls_back_to_all(self):
+        assert fw_policy_rule_layer4({}) == "all"
+        assert fw_policy_rule_layer4({"match": {"layer4Configs": []}}) == "all"
+
+    def test_flags_src_dest_ip_ranges(self):
+        rule = {"match": {"srcIpRanges": ["10.0.0.0/8", "192.168.0.0/16"], "destIpRanges": ["172.16.0.0/12"]}}
+        flags = fw_policy_rule_flags(rule, {})
+        assert "--src-ip-ranges=10.0.0.0/8,192.168.0.0/16" in flags
+        assert "--dest-ip-ranges=172.16.0.0/12" in flags
+
+    def test_flags_disabled_and_logging(self):
+        rule = {"disabled": True, "enableLogging": True}
+        flags = fw_policy_rule_flags(rule, {})
+        assert "--disabled" in flags
+        assert "--enable-logging" in flags
+
+    def test_flags_omits_disabled_when_false(self):
+        rule = {"disabled": False, "enableLogging": False}
+        flags = fw_policy_rule_flags(rule, {})
+        assert "--disabled" not in flags
+        assert "--enable-logging" not in flags
+
+    def test_flags_description_is_shell_quoted(self):
+        rule = {"description": "allow web; multi word"}
+        flags = fw_policy_rule_flags(rule, {})
+        joined = " ".join(flags)
+        assert joined.startswith("--description=")
+        # shlex.quote によりスペースを含む文字列はクォートされる
+        assert "'allow web; multi word'" in joined
+
+    def test_flags_target_sa_project_remap(self):
+        rule = {"targetServiceAccounts": ["app@src-proj.iam.gserviceaccount.com"]}
+        flags = fw_policy_rule_flags(rule, {"src-proj": "dst-proj"})
+        assert "--target-service-accounts=app@dst-proj.iam.gserviceaccount.com" in flags
+
+    def test_flags_secure_tags(self):
+        rule = {
+            "match": {"srcSecureTags": [{"name": "tagValues/111"}, {"name": "tagValues/222"}]},
+            "targetSecureTags": [{"name": "tagValues/333"}],
+        }
+        flags = fw_policy_rule_flags(rule, {})
+        assert "--src-secure-tags=tagValues/111,tagValues/222" in flags
+        assert "--target-secure-tags=tagValues/333" in flags
+
+    def test_flags_empty_rule_returns_empty(self):
+        assert fw_policy_rule_flags({}, {}) == []
