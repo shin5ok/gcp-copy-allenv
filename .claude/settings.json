@@ -37,10 +37,6 @@
       "Bash(terraform destroy *)"
     ]
   },
-  "enabledPlugins": {
-    "semgrep@claude-plugins-official": true,
-    "claude-code-setup@claude-plugins-official": true
-  },
   "hooks": {
     "PreToolUse": [
       {
@@ -64,5 +60,10 @@
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "semgrep@claude-plugins-official": true,
+    "claude-code-setup@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true
   }
 }
