@@ -110,13 +110,10 @@ cp dst/config.yaml.template dst/config.yaml
   （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に
   永続化され、`make plan` / `make run` / `skip_on_run` 間で同じ値が再利用されます
   （別名で作り直す場合はこのファイルを削除）。
-- **`steps`**: 各ステップ (1〜6 + 4.5) の有効/無効と個別設定（スナップショット期限など）。
+- **`steps`**: 各ステップ (1〜6) の有効/無効と個別設定（スナップショット期限など）。
   `bulk_export.skip_on_run: true` にすると本番実行 (`make run`) では export/customize を
   スキップし、`make plan` で生成済みの `terraform/active/` を再利用して高速化します
   （`make plan` 自体は常に最新を取り直します）。
-  `network_firewall.allow_drift_recreate: true` にすると、dst の既存ルールと src の内容に
-  差分がある場合 dst を delete してから再 create します（短時間トラフィックが遮断されるため
-  メンテナンスウィンドウ向け）。false（既定）の場合は警告ログのみ。
 - **`global`**: `dry_run` / `verbose_logging` / `parallel_jobs` / `log_dir` / `org_log_file` / `dst_log_file`。
 - **`bootstrap`**: コピー先プロジェクトを新規作成する場合の組織 ID / フォルダ ID（任意） / 請求先アカウント。
 
@@ -180,7 +177,6 @@ make plan
 > 2. **GCE スナップショット検証** (`gce_snapshot`): 各 VM に期限内（既定 30 日）の有効なスナップショットがあるか確認。なければエラー。
 > 3. **Terraform コード生成** (`bulk_export`): Original リソースを HCL としてエクスポートし、プロジェクト ID 置換・GCS バケットのリネーム・同一プロジェクト内 network 参照の `self_link` 化・`boot_disk.source` 行の削除を実施。
 > 4. **インフラ再現** (`terraform_apply`): `terraform plan -out=tfplan` を生成（本番時のみ apply）。
-> 4.5. **Network Firewall 複製** (`network_firewall`): src host の classic VPC ファイアウォールルールと network firewall policy（rules / associations 含む）を gcloud で直接 dst host に同期。bulk-export が出力しない `google_compute_network_firewall_policy` を補完し、Shared VPC ネットワーク URL の差替が必要な classic firewall も完全再現。
 > 5. **VM データ復元** (`gce_restore`): スナップショットから復元したディスクの差し替え計画。
 > 6. **データ移行** (`data_sync`): GCS バケット（リネーム後）・BigQuery（location 継承）の同期計画。
 
@@ -199,19 +195,17 @@ make run
 ```
 
 > 🚀 **クローンのメカニズム**
-> 1. コピー先ホストプロジェクトに、Terraform で VPC・サブネット・NAT 等のインフラを再現。
-> 2. Step 4.5 で src host のファイアウォールルール / ポリシー / アソシエーションを gcloud で直接同期し、bulk-export では落ちる定義（network_firewall_policy / Shared VPC 配下の classic FW）を補完。
-> 3. Original の有効なスナップショット（期限内）から、コピー先にディスクを復元。
-> 4. 復元したブートディスクを VM に差し替えて起動（OS 状態・データごと完全復元）。
-> 5. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
-> 6. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
+> 1. コピー先ホストプロジェクトに、Terraform で VPC・サブネット・NAT・FW 等のインフラを再現。
+> 2. Original の有効なスナップショット（期限内）から、コピー先にディスクを復元。
+> 3. 復元したブートディスクを VM に差し替えて起動（OS 状態・データごと完全復元）。
+> 4. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
+> 5. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
 
 > ♻️ **Terraform 適用の冪等性**（再実行しても 409/404 で落ちないための仕組み）
 > - dst プロジェクトが前回と変わった場合、stale な `terraform.tfstate` を破棄して import からやり直します（`active/<src>/.dst_project` マーカーで判定）。
 > - `google_storage_bucket` はリネーム後の実名で import し、作成済みバケットを adopt して再 apply を冪等化。
 > - 同一プロジェクト内の network URL を `google_compute_network.<label>.self_link` 参照へ書き換え、firewall/subnetwork が network より先に作られて 404 になるのを防止。
 > - VM/disk は Step 4 ではなく Step 5 (`gce_restore`) 側で管理し、`make run` の失敗を抑制。
-> - Step 4.5 (`network_firewall`) は名前 / priority キーで存在チェックし、内容が一致すればスキップ。差分があった場合の挙動は `allow_drift_recreate` フラグで制御。GCP 自動生成の `default-allow-*`（priority=65534 & network=default）は削除対象から保護。
 
 ---
 
