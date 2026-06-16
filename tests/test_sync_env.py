@@ -14,6 +14,11 @@ from scripts.sync_env import (
     _ASSET_COVERAGE,
     fw_policy_rule_layer4,
     fw_policy_rule_flags,
+    parse_cai_resources,
+    parse_tf_resources,
+    gcloud_recreate_command,
+    analyze_cai_tf_diff,
+    format_diff_report,
 )
 
 
@@ -692,3 +697,223 @@ class TestFwPolicyRuleConversion:
 
     def test_flags_empty_rule_returns_empty(self):
         assert fw_policy_rule_flags({}, {}) == []
+
+
+# ============================================================
+# CAI ↔ TF 差分解析 (make plan 後の DIFF.md 生成)
+# ============================================================
+_CAI_SAMPLE = """\
+---
+assetType: compute.googleapis.com/Subnetwork
+location: asia-northeast1
+name: //compute.googleapis.com/projects/src-host/regions/asia-northeast1/subnetworks/subnet-svc1
+project: projects/100
+---
+assetType: compute.googleapis.com/Subnetwork
+location: asia-northeast1
+name: //compute.googleapis.com/projects/src-host/regions/asia-northeast1/subnetworks/subnet-svc-missing
+project: projects/100
+---
+assetType: compute.googleapis.com/Router
+location: asia-northeast1
+name: //compute.googleapis.com/projects/src-host/regions/asia-northeast1/routers/nat-router
+project: projects/100
+---
+assetType: storage.googleapis.com/Bucket
+location: us-central1
+name: //storage.googleapis.com/org-bucket-shared-data
+project: projects/100
+---
+assetType: fake.googleapis.com/Unknown
+location: global
+name: //fake.googleapis.com/projects/src-host/unknowns/x
+project: projects/100
+"""
+
+_TF_SAMPLE_SUBNET = '''
+resource "google_compute_subnetwork" "subnet-svc1" {
+  name = "subnet-svc1"
+  region = "asia-northeast1"
+}
+'''
+
+_TF_SAMPLE_BUCKET = '''
+resource "google_storage_bucket" "bucket1" {
+  name = "org-bucket-shared-data"
+  location = "US"
+}
+'''
+
+
+def _write(p, body):
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(body)
+
+
+class TestParseCaiResources:
+    def test_parses_basic_records(self, temp_dir):
+        path = os.path.join(temp_dir, "cai.txt")
+        _write(path, _CAI_SAMPLE)
+        rs = parse_cai_resources(path)
+        types = sorted({r["asset_type"] for r in rs})
+        assert "compute.googleapis.com/Subnetwork" in types
+        assert "storage.googleapis.com/Bucket" in types
+        # short_name は full name の末尾セグメント
+        names = {r["short_name"] for r in rs}
+        assert "subnet-svc1" in names
+        assert "nat-router" in names
+        assert "org-bucket-shared-data" in names
+
+    def test_missing_file_returns_empty(self, temp_dir):
+        assert parse_cai_resources(os.path.join(temp_dir, "nope.txt")) == []
+
+
+class TestParseTfResources:
+    def test_parses_resource_blocks(self, temp_dir):
+        d = os.path.join(temp_dir, "tf")
+        os.makedirs(d)
+        _write(os.path.join(d, "google_compute_subnetwork.tf"), _TF_SAMPLE_SUBNET)
+        _write(os.path.join(d, "google_storage_bucket.tf"), _TF_SAMPLE_BUCKET)
+        out = parse_tf_resources(d)
+        assert "google_compute_subnetwork" in out
+        assert "subnet-svc1" in out["google_compute_subnetwork"]
+        assert "google_storage_bucket" in out
+        assert "org-bucket-shared-data" in out["google_storage_bucket"]
+
+    def test_missing_dir_returns_empty(self, temp_dir):
+        assert parse_tf_resources(os.path.join(temp_dir, "nope")) == {}
+
+
+class TestGcloudRecreateCommand:
+    def test_subnet_command_includes_region_and_dst(self):
+        cmds = gcloud_recreate_command(
+            "compute.googleapis.com/Subnetwork", "subnet-x", "asia-northeast1",
+            "dst-host",
+            "//compute.googleapis.com/projects/src-host/regions/asia-northeast1/subnetworks/subnet-x",
+        )
+        joined = " ".join(cmds)
+        assert "gcloud compute networks subnets describe subnet-x" in joined
+        assert "--region=asia-northeast1" in joined
+        assert "--project=src-host" in joined
+        assert "--project=dst-host" in joined
+
+    def test_bucket_command_uses_gs_prefix(self):
+        cmds = gcloud_recreate_command(
+            "storage.googleapis.com/Bucket", "my-bkt", "us-central1",
+            "dst-host", "//storage.googleapis.com/my-bkt",
+        )
+        joined = " ".join(cmds)
+        assert "gs://my-bkt" in joined
+        assert "--location=us-central1" in joined
+        assert "--project=dst-host" in joined
+
+    def test_service_account_extracts_account_id(self):
+        cmds = gcloud_recreate_command(
+            "iam.googleapis.com/ServiceAccount",
+            "myacct@src-host.iam.gserviceaccount.com", "global",
+            "dst-host",
+            "//iam.googleapis.com/projects/src-host/serviceAccounts/"
+            "myacct@src-host.iam.gserviceaccount.com",
+        )
+        joined = " ".join(cmds)
+        # describe は email 全体、create は accountId のみ
+        assert "describe myacct@src-host.iam.gserviceaccount.com" in joined
+        assert "create myacct " in joined or "create myacct\t" in joined or "create myacct " in joined
+
+    def test_unknown_type_falls_back_to_asset_describe(self):
+        cmds = gcloud_recreate_command(
+            "fake.googleapis.com/Unknown", "x", "global",
+            "dst-host", "//fake.googleapis.com/projects/src-host/unknowns/x",
+        )
+        assert any("gcloud asset describe" in c for c in cmds)
+
+
+class TestAnalyzeCaiTfDiff:
+    def _setup(self, temp_dir):
+        cai_path = os.path.join(temp_dir, "cai.txt")
+        _write(cai_path, _CAI_SAMPLE)
+        tf_dir = os.path.join(temp_dir, "tf_raw")
+        os.makedirs(tf_dir)
+        _write(os.path.join(tf_dir, "google_compute_subnetwork.tf"), _TF_SAMPLE_SUBNET)
+        _write(os.path.join(tf_dir, "google_storage_bucket.tf"), _TF_SAMPLE_BUCKET)
+        return cai_path, tf_dir
+
+    def test_detects_missing_subnet_and_router(self, temp_dir):
+        cai_path, tf_dir = self._setup(temp_dir)
+        report = analyze_cai_tf_diff(
+            cai_path, [tf_dir],
+            src_project="src-host", dst_project="dst-host",
+        )
+        missing_names = {(m["asset_type"], m["short_name"]) for m in report["missing"]}
+        # subnet-svc1 と bucket は TF にあるので covered
+        assert ("compute.googleapis.com/Subnetwork", "subnet-svc1") not in missing_names
+        assert ("storage.googleapis.com/Bucket", "org-bucket-shared-data") not in missing_names
+        # 一方、subnet-svc-missing と nat-router (Router) は欠落
+        assert ("compute.googleapis.com/Subnetwork", "subnet-svc-missing") in missing_names
+        assert ("compute.googleapis.com/Router", "nat-router") in missing_names
+        # 未登録 type は unknown_types に集計
+        assert "fake.googleapis.com/Unknown" in report["unknown_types"]
+        # CAI 5 件 / 一致 2 件
+        assert report["cai_total"] == 5
+        assert report["covered"] == 2
+
+    def test_missing_entries_have_recreate_commands(self, temp_dir):
+        cai_path, tf_dir = self._setup(temp_dir)
+        report = analyze_cai_tf_diff(
+            cai_path, [tf_dir],
+            src_project="src-host", dst_project="dst-host",
+        )
+        for m in report["missing"]:
+            assert m["commands"], f"{m['short_name']} に推奨コマンドが無い"
+            assert any(c.strip() for c in m["commands"])
+
+    def test_format_diff_report_markdown(self, temp_dir):
+        cai_path, tf_dir = self._setup(temp_dir)
+        report = analyze_cai_tf_diff(
+            cai_path, [tf_dir],
+            src_project="src-host", dst_project="dst-host",
+        )
+        md = format_diff_report([report])
+        assert "CAI ↔ Terraform" in md
+        assert "src-host" in md and "dst-host" in md
+        assert "subnet-svc-missing" in md
+        assert "```bash" in md  # コマンドが fenced コードブロックで提示される
+
+
+class TestEmitCaiTfDiff:
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir, steps={
+            "cai_scan": {"enabled": True, "output_dir": os.path.join(temp_dir, "cai_export")},
+            "bulk_export": {"enabled": True, "output_dir": os.path.join(temp_dir, "tf")},
+        })
+        # _iter_src_projects は host_project (src-host) と service_projects (src-svc-1) を
+        # 両方返す。テストでは host だけに CAI ファイルを用意して、svc 側は
+        # "出力が無いためスキップ" 経路を踏ませる（warning が出れば OK）。
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o, cfg
+
+    def test_writes_diff_md_and_logs(self, temp_dir, monkeypatch):
+        o, _ = self._orch(temp_dir)
+        # CAI 出力を src-host 向けに用意
+        cai_dir = os.path.join(temp_dir, "cai_export")
+        os.makedirs(cai_dir)
+        _write(os.path.join(cai_dir, "cai_resources_src-host.txt"), _CAI_SAMPLE)
+        # tf raw を一部だけ用意（subnet-svc1 と bucket は出ている）
+        tf_dir = os.path.join(temp_dir, "tf", "raw", "src-host")
+        os.makedirs(tf_dir)
+        _write(os.path.join(tf_dir, "google_compute_subnetwork.tf"), _TF_SAMPLE_SUBNET)
+        _write(os.path.join(tf_dir, "google_storage_bucket.tf"), _TF_SAMPLE_BUCKET)
+
+        # DIFF.md は cwd 配下に書く設計 → cwd を temp_dir に切り替え
+        monkeypatch.chdir(temp_dir)
+        o._emit_cai_tf_diff()
+        diff_path = os.path.join(temp_dir, "DIFF.md")
+        assert os.path.isfile(diff_path)
+        body = open(diff_path, encoding="utf-8").read()
+        assert "subnet-svc-missing" in body
+        assert "nat-router" in body
+        # 一致したリソースは載らない
+        assert "subnet-svc1\n" not in body or "subnet-svc1" in body  # short_name は missing 内のみ列挙
