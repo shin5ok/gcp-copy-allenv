@@ -236,6 +236,460 @@ def diff_coverage(asset_types: List[str]) -> Tuple[List[str], List[str]]:
 
 
 # ---------------------------------------------------------------------------
+# CAI vs bulk-export tf 差分解析
+# ---------------------------------------------------------------------------
+# CAI assetType → bulk-export が出力しうる terraform resource type 群。
+# bulk-export は config-connector 経由でリソースを HCL 化する。複数候補がある
+# 場合は最初に見つかった一致を採用（例: Address は global/regional で別 type）。
+_CAI_TO_TF_RESOURCE: Dict[str, Tuple[str, ...]] = {
+    "compute.googleapis.com/Network":         ("google_compute_network",),
+    "compute.googleapis.com/Subnetwork":      ("google_compute_subnetwork",),
+    "compute.googleapis.com/Firewall":        ("google_compute_firewall",),
+    "compute.googleapis.com/FirewallPolicy":  ("google_compute_network_firewall_policy",
+                                               "google_compute_firewall_policy"),
+    "compute.googleapis.com/Router":          ("google_compute_router",),
+    "compute.googleapis.com/Route":           ("google_compute_route",),
+    "compute.googleapis.com/Address":         ("google_compute_address",
+                                               "google_compute_global_address"),
+    "compute.googleapis.com/Instance":        ("google_compute_instance",),
+    "compute.googleapis.com/Disk":            ("google_compute_disk",
+                                               "google_compute_region_disk"),
+    "compute.googleapis.com/Snapshot":        ("google_compute_snapshot",),
+    "compute.googleapis.com/Image":           ("google_compute_image",),
+    "compute.googleapis.com/ResourcePolicy":  ("google_compute_resource_policy",),
+    "storage.googleapis.com/Bucket":          ("google_storage_bucket",),
+    "bigquery.googleapis.com/Dataset":        ("google_bigquery_dataset",),
+    "bigquery.googleapis.com/Table":          ("google_bigquery_table",),
+    "iam.googleapis.com/Role":                ("google_project_iam_custom_role",),
+    "iam.googleapis.com/ServiceAccount":      ("google_service_account",),
+    "serviceusage.googleapis.com/Service":    ("google_project_service",),
+    "logging.googleapis.com/LogSink":         ("google_logging_project_sink",),
+    "logging.googleapis.com/LogBucket":       ("google_logging_project_bucket_config",),
+}
+
+
+# CAI full name の正規表現:  //<service>/projects/<proj>/[<scope>/<region>/]<kind>/<name>
+# 例: //compute.googleapis.com/projects/X/regions/asia-northeast1/subnetworks/subnet-svc1
+#     //storage.googleapis.com/<bucket-name>
+#     //serviceusage.googleapis.com/projects/<num>/services/<api>
+_CAI_NAME_RE = re.compile(
+    r"^//(?P<service>[a-z0-9.\-]+)/(?P<tail>.+)$"
+)
+
+
+def parse_cai_resources(path: str) -> List[Dict[str, str]]:
+    """CAI 出力 (YAML 風) をパースしてリソースリストを返す。
+
+    各レコードは `---` で区切られ、`assetType:` `name:` 等のキーを 1 行に持つ。
+    本パーサは PyYAML を使わず簡易行スキャンで対応する（CAI 出力は flat なため十分）。
+    Returns:
+        [{asset_type, name, short_name, location, project, display_name}, ...]
+    """
+    records: List[Dict[str, str]] = []
+    if not os.path.isfile(path):
+        return records
+
+    current: Dict[str, str] = {}
+
+    def _flush() -> None:
+        if not current:
+            return
+        if current.get("asset_type"):
+            full = current.get("name", "")
+            current["short_name"] = full.rsplit("/", 1)[-1] if full else ""
+            records.append(dict(current))
+        current.clear()
+
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.rstrip("\n")
+            if s.strip() == "---":
+                _flush()
+                continue
+            if not s or s.startswith(" ") or s.startswith("\t") or s.startswith("-"):
+                continue
+            if ":" not in s:
+                continue
+            k, v = s.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            if k == "assetType":
+                current["asset_type"] = v
+            elif k == "name":
+                current["name"] = v
+            elif k == "location":
+                current["location"] = v
+            elif k == "project":
+                current["project"] = v
+            elif k == "displayName":
+                current["display_name"] = v
+    _flush()
+    return records
+
+
+# terraform .tf 内の resource ブロック検出。`name = "..."` 属性も拾う。
+_TF_RESOURCE_RE = re.compile(
+    r'resource\s+"([a-zA-Z0-9_]+)"\s+"([a-zA-Z0-9_\-]+)"\s*\{'
+)
+_TF_NAME_ATTR_RE = re.compile(r'^\s*name\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
+
+
+def parse_tf_resources(tf_dir: str) -> Dict[str, List[str]]:
+    """terraform/<project>/*.tf から {resource_type: [name_attr, ...]} を抽出。
+
+    name 属性が無いリソースは Terraform ラベル（2 番目の `"..."`) をフォールバック。
+    bulk-export の慣行に従い 1 ファイル 1 リソース型を前提とせず、すべての .tf を走査。
+    """
+    out: Dict[str, List[str]] = {}
+    if not os.path.isdir(tf_dir):
+        return out
+    for fn in sorted(os.listdir(tf_dir)):
+        if not fn.endswith(".tf"):
+            continue
+        path = os.path.join(tf_dir, fn)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        # ブロック単位に走査: 各 `resource "T" "L" {` の次の `}` までを本体とみなす
+        for m in _TF_RESOURCE_RE.finditer(text):
+            rtype, label = m.group(1), m.group(2)
+            body_start = m.end()
+            # ざっくり `}` の最初の出現を本体終端とする（bulk-export の出力は
+            # ネスト浅く、name 属性は通常先頭近傍にあるため誤検出は限定的）
+            body_end = text.find("\nresource ", body_start)
+            body = text[body_start: body_end if body_end != -1 else len(text)]
+            nm = _TF_NAME_ATTR_RE.search(body)
+            name_val = nm.group(1) if nm else label
+            out.setdefault(rtype, []).append(name_val)
+    return out
+
+
+def gcloud_recreate_command(
+    asset_type: str, short_name: str, location: str,
+    dst_project: str, full_name: str,
+) -> List[str]:
+    """欠落リソースを dst に作るための gcloud コマンド列を生成する。
+
+    生成方針:
+      1) src 側で詳細を取得する `gcloud ... describe` を先に提示（read-only、安全）
+      2) dst 側で作成する `gcloud ... create` を提示（必要な値は <PLACEHOLDER> で示す）
+
+    完全な引数を網羅できない種別は generic な `gcloud asset` ベースの調査コマンドだけを
+    返す。短い 1 ライナを目指し、ログでも DIFF.md でも読みやすい長さに留める。
+    """
+    src_proj = ""
+    m = re.match(r"^//[^/]+/projects/([^/]+)/", full_name)
+    if m:
+        src_proj = m.group(1)
+
+    loc = location or "global"
+    sn = short_name or "<RESOURCE_NAME>"
+    src_flag = f"--project={src_proj}" if src_proj else ""
+    dst_flag = f"--project={dst_project}" if dst_project else "--project=<DST_PROJECT>"
+
+    if asset_type == "compute.googleapis.com/Network":
+        return [
+            f"gcloud compute networks describe {sn} {src_flag}",
+            f"gcloud compute networks create {sn} {dst_flag} --subnet-mode=custom",
+        ]
+    if asset_type == "compute.googleapis.com/Subnetwork":
+        return [
+            f"gcloud compute networks subnets describe {sn} --region={loc} {src_flag}",
+            f"gcloud compute networks subnets create {sn} {dst_flag} "
+            f"--region={loc} --network=<NETWORK> --range=<CIDR>",
+        ]
+    if asset_type == "compute.googleapis.com/Firewall":
+        return [
+            f"gcloud compute firewall-rules describe {sn} {src_flag}",
+            f"gcloud compute firewall-rules create {sn} {dst_flag} "
+            f"--network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> "
+            f"--rules=<PROTO:PORT,...>",
+        ]
+    if asset_type == "compute.googleapis.com/FirewallPolicy":
+        return [
+            f"gcloud compute network-firewall-policies describe {sn} --global {src_flag}",
+            f"gcloud compute network-firewall-policies create {sn} --global {dst_flag} "
+            f"--description=<DESC>",
+        ]
+    if asset_type == "compute.googleapis.com/Router":
+        return [
+            f"gcloud compute routers describe {sn} --region={loc} {src_flag}",
+            f"gcloud compute routers create {sn} {dst_flag} --region={loc} "
+            f"--network=<NETWORK> --asn=<ASN>",
+        ]
+    if asset_type == "compute.googleapis.com/Route":
+        return [
+            f"gcloud compute routes describe {sn} {src_flag}",
+            f"gcloud compute routes create {sn} {dst_flag} "
+            f"--network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>",
+        ]
+    if asset_type == "compute.googleapis.com/Address":
+        region_flag = f"--region={loc}" if loc and loc != "global" else "--global"
+        return [
+            f"gcloud compute addresses describe {sn} {region_flag} {src_flag}",
+            f"gcloud compute addresses create {sn} {dst_flag} {region_flag}",
+        ]
+    if asset_type == "compute.googleapis.com/Instance":
+        return [
+            f"gcloud compute instances describe {sn} --zone={loc} {src_flag}",
+            f"gcloud compute instances create {sn} {dst_flag} "
+            f"--zone={loc} --machine-type=<MACHINE_TYPE> "
+            f"--source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当",
+        ]
+    if asset_type == "compute.googleapis.com/Disk":
+        return [
+            f"gcloud compute disks describe {sn} --zone={loc} {src_flag}",
+            f"gcloud compute disks create {sn} {dst_flag} "
+            f"--zone={loc} --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)",
+        ]
+    if asset_type == "compute.googleapis.com/Snapshot":
+        return [
+            f"gcloud compute snapshots describe {sn} {src_flag}",
+            f"# snapshot は src 側からの参照で復元する設計のため dst 作成は不要 "
+            f"(Step 5 gce_restore が source-snapshot として直接使用)",
+        ]
+    if asset_type == "compute.googleapis.com/Image":
+        return [
+            f"gcloud compute images describe {sn} {src_flag}",
+            f"# image は使用しない方針（snapshot 由来）。必要なら "
+            f"gcloud compute images create {sn} {dst_flag} --source-snapshot=<SNAPSHOT>",
+        ]
+    if asset_type == "compute.googleapis.com/ResourcePolicy":
+        return [
+            f"gcloud compute resource-policies describe {sn} --region={loc} {src_flag}",
+            f"gcloud compute resource-policies create snapshot-schedule {sn} {dst_flag} "
+            f"--region={loc} --max-retention-days=<N> --daily-schedule --start-time=<HH:MM>",
+        ]
+    if asset_type == "storage.googleapis.com/Bucket":
+        return [
+            f"gcloud storage buckets describe gs://{sn}",
+            f"gcloud storage buckets create gs://<DST_BUCKET_NAME> "
+            f"{dst_flag} --location={loc}  # 名前は rename_rules.gcs を適用すること",
+        ]
+    if asset_type == "bigquery.googleapis.com/Dataset":
+        return [
+            f"bq --project_id={src_proj or '<SRC>'} show --format=prettyjson {sn}",
+            f"bq --project_id={dst_project or '<DST>'} mk --location={loc} "
+            f"--dataset {dst_project or '<DST>'}:{sn}",
+        ]
+    if asset_type == "bigquery.googleapis.com/Table":
+        # CAI の full name 形式: //bigquery.googleapis.com/projects/<p>/datasets/<d>/tables/<t>
+        ds = ""
+        mm = re.search(r"/datasets/([^/]+)/tables/([^/]+)$", full_name)
+        if mm:
+            ds, sn = mm.group(1), mm.group(2)
+        return [
+            f"bq --project_id={src_proj or '<SRC>'} show --format=prettyjson "
+            f"{src_proj or '<SRC>'}:{ds or '<DATASET>'}.{sn}",
+            f"bq --project_id={dst_project or '<DST>'} cp "
+            f"{src_proj or '<SRC>'}:{ds or '<DATASET>'}.{sn} "
+            f"{dst_project or '<DST>'}:{ds or '<DATASET>'}.{sn}  "
+            f"# 通常は Step 6 (data_sync) が担当",
+        ]
+    if asset_type == "iam.googleapis.com/Role":
+        # full name: //iam.googleapis.com/projects/<p>/roles/<roleId>
+        return [
+            f"gcloud iam roles describe {sn} {src_flag}",
+            f"gcloud iam roles create {sn} {dst_flag} "
+            f"--title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA",
+        ]
+    if asset_type == "iam.googleapis.com/ServiceAccount":
+        # full name: //iam.googleapis.com/projects/<p>/serviceAccounts/<email>
+        # short_name は email 全体。create の引数は accountId（email の @ より前）。
+        account_id = sn.split("@", 1)[0] if "@" in sn else sn
+        return [
+            f"gcloud iam service-accounts describe {sn} {src_flag}",
+            f"gcloud iam service-accounts create {account_id} {dst_flag} "
+            f"--display-name=<DISPLAY_NAME>",
+        ]
+    if asset_type == "serviceusage.googleapis.com/Service":
+        return [
+            f"gcloud services list --enabled {src_flag} --filter='config.name:{sn}'",
+            f"gcloud services enable {sn} {dst_flag}",
+        ]
+    if asset_type == "logging.googleapis.com/LogSink":
+        return [
+            f"gcloud logging sinks describe {sn} {src_flag}",
+            f"gcloud logging sinks create {sn} <DESTINATION> {dst_flag} "
+            f"--log-filter='<FILTER>'",
+        ]
+    if asset_type == "logging.googleapis.com/LogBucket":
+        # full name: //logging.googleapis.com/projects/<p>/locations/<loc>/buckets/<id>
+        return [
+            f"gcloud logging buckets describe {sn} --location={loc} {src_flag}",
+            f"gcloud logging buckets create {sn} --location={loc} {dst_flag} "
+            f"--retention-days=<N>",
+        ]
+    # generic fallback
+    return [
+        f"gcloud asset describe '{full_name}' {src_flag}",
+        f"# {asset_type} は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。",
+    ]
+
+
+def analyze_cai_tf_diff(
+    cai_path: str, tf_dirs: List[str],
+    src_project: str, dst_project: str,
+) -> Dict[str, Any]:
+    """CAI と terraform 出力を突合し、欠落リソースとリカバリコマンドを返す。
+
+    Args:
+        cai_path:  cai_export/cai_resources_<src>.txt
+        tf_dirs:   走査する terraform ディレクトリ群（raw 優先 / active fallback など）。
+                   先頭から順に資料を統合し、いずれかに resource が見つかれば「カバー済み」。
+        src_project: src プロジェクト ID（ログ表示用）
+        dst_project: dst プロジェクト ID（生成コマンドに埋め込む）
+
+    Returns:
+        {
+            'src_project': str,
+            'dst_project': str,
+            'cai_total':   int,
+            'tf_total':    int,
+            'covered':     int,
+            'missing':     [ {asset_type, short_name, full_name, location,
+                              tf_resource_type, coverage_step, reason, commands}, ...],
+            'unknown_types': [str, ...],
+        }
+    """
+    cai_records = parse_cai_resources(cai_path)
+    tf_resources: Dict[str, set] = {}
+    for d in tf_dirs:
+        for rtype, names in parse_tf_resources(d).items():
+            tf_resources.setdefault(rtype, set()).update(names)
+
+    missing: List[Dict[str, Any]] = []
+    unknown_types: set = set()
+    covered = 0
+
+    for r in cai_records:
+        atype = r.get("asset_type", "")
+        short = r.get("short_name", "")
+        full = r.get("name", "")
+        loc = r.get("location", "")
+        coverage_step = _ASSET_COVERAGE.get(atype, "<unknown>")
+        tf_types = _CAI_TO_TF_RESOURCE.get(atype, ())
+
+        # tf 側で同名のリソースが見つかればカバー済み
+        is_covered = False
+        if tf_types:
+            for t in tf_types:
+                if short and short in tf_resources.get(t, set()):
+                    is_covered = True
+                    break
+
+        if is_covered:
+            covered += 1
+            continue
+
+        if atype not in _ASSET_COVERAGE:
+            unknown_types.add(atype)
+            reason = "_ASSET_COVERAGE に未登録（複製漏れの可能性）"
+        elif coverage_step is None:
+            reason = "意図的に対象外（マップで None 指定）"
+        elif coverage_step == "bulk_export" or tf_types:
+            reason = (
+                f"bulk-export が出力しなかった (期待 TF 型: {'/'.join(tf_types) or '不明'})"
+            )
+        else:
+            reason = f"別ステップ '{coverage_step}' が複製を担当（bulk-export 出力対象外）"
+
+        missing.append({
+            "asset_type": atype,
+            "short_name": short,
+            "full_name": full,
+            "location": loc,
+            "tf_resource_type": "/".join(tf_types) if tf_types else None,
+            "coverage_step": coverage_step,
+            "reason": reason,
+            "commands": gcloud_recreate_command(atype, short, loc, dst_project, full),
+        })
+
+    return {
+        "src_project": src_project,
+        "dst_project": dst_project,
+        "cai_total": len(cai_records),
+        "tf_total": sum(len(v) for v in tf_resources.values()),
+        "covered": covered,
+        "missing": missing,
+        "unknown_types": sorted(unknown_types),
+    }
+
+
+def format_diff_report(reports: List[Dict[str, Any]]) -> str:
+    """analyze_cai_tf_diff の結果群を Markdown レポートに整形する。
+
+    DIFF.md と stdout の両方で同じテキストを使い、ログには `\n`.split() で行ごと書く。
+    """
+    lines: List[str] = []
+    lines.append("# CAI ↔ Terraform bulk-export 差分レポート")
+    lines.append("")
+    lines.append("Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、")
+    lines.append("`gcloud beta resource-config bulk-export` の出力に**含まれなかった**ものを")
+    lines.append("プロジェクトごとに列挙し、dst 側に再現するための gcloud コマンドを併記します。")
+    lines.append("")
+    lines.append("- 「意図的に対象外」: `_ASSET_COVERAGE` で None 指定。実害なしとして除外可。")
+    lines.append("- 「別ステップが担当」: Step 4.5 / Step 5 / Step 6 等で複製。bulk-export 単体での欠落は想定通り。")
+    lines.append("- 「未登録」「bulk-export が出力しなかった」: 対応の検討が必要。")
+    lines.append("")
+
+    grand_total = 0
+    for r in reports:
+        sp = r["src_project"]
+        dp = r["dst_project"] or "<未設定>"
+        lines.append(f"## プロジェクト: `{sp}` → `{dp}`")
+        lines.append("")
+        lines.append(
+            f"- CAI 検出リソース: **{r['cai_total']}** 件"
+            f" / TF 出力リソース: **{r['tf_total']}** 件"
+            f" / 一致: **{r['covered']}** 件"
+            f" / 欠落候補: **{len(r['missing'])}** 件"
+        )
+        if r["unknown_types"]:
+            lines.append(
+                f"- 未登録 assetType: " + ", ".join(f"`{t}`" for t in r["unknown_types"])
+            )
+        lines.append("")
+        if not r["missing"]:
+            lines.append("欠落候補なし。 ✓")
+            lines.append("")
+            continue
+
+        # 種別ごとにグルーピングして読みやすくする
+        by_type: Dict[str, List[Dict[str, Any]]] = {}
+        for m in r["missing"]:
+            by_type.setdefault(m["asset_type"], []).append(m)
+        for atype in sorted(by_type.keys()):
+            items = by_type[atype]
+            lines.append(f"### `{atype}` （{len(items)} 件）")
+            lines.append("")
+            for m in items:
+                grand_total += 1
+                lines.append(
+                    f"#### `{m['short_name']}` "
+                    f"(location=`{m['location'] or 'global'}`)"
+                )
+                lines.append("")
+                lines.append(f"- full name: `{m['full_name']}`")
+                cov = m.get("coverage_step")
+                cov_disp = cov if cov is not None else "意図的対象外 (None)"
+                lines.append(f"- 担当ステップ: `{cov_disp}`")
+                lines.append(f"- 期待 TF 型: `{m['tf_resource_type'] or 'なし'}`")
+                lines.append(f"- 判定理由: {m['reason']}")
+                lines.append("- 推奨コマンド:")
+                lines.append("  ```bash")
+                for c in m["commands"]:
+                    lines.append(f"  {c}")
+                lines.append("  ```")
+                lines.append("")
+    lines.append("---")
+    lines.append(f"合計欠落候補: **{grand_total}** 件")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # SA プリフライト: 借用 SA に必要な代表権限（有効ステップごと）
 # ---------------------------------------------------------------------------
 # test-iam-permissions で検査する代表的な権限。全リソース種は網羅しないが、
@@ -1104,8 +1558,76 @@ resource "google_storage_bucket" "mock_bucket" {{
                 self.step_gce_restore()
             if steps.get('data_sync', {}).get('enabled', False):
                 self.step_data_sync()
+            # 最後に CAI vs bulk-export tf 差分レポートを出力。
+            # cai_scan も bulk_export も dry_run 中（src 側 read-only）に
+            # 実コマンドが走るため、`make plan` 直後の DIFF.md 生成に使える。
+            if (
+                steps.get('cai_scan', {}).get('enabled', False)
+                and steps.get('bulk_export', {}).get('enabled', False)
+            ):
+                self._emit_cai_tf_diff()
         finally:
             self._print_summary()
+
+    def _emit_cai_tf_diff(self):
+        """CAI 出力と terraform/raw|active の .tf を突合し、欠落リソースを列挙する。
+
+        各 src プロジェクトについて:
+            1. cai_export/cai_resources_<src>.txt を analyze_cai_tf_diff() に渡し、
+            2. 欠落リソース + 推奨 gcloud コマンドを log と DIFF.md（リポジトリ直下）に出力。
+        log は org_logger（INFO） を経由するため stdout にも自動で流れる。
+        """
+        log_stage_header(self.org_logger, 99, "CAI ↔ TF 差分レポート", 0)
+        cai_cfg = self.config.get('steps', {}).get('cai_scan', {})
+        bulk_cfg = self.config.get('steps', {}).get('bulk_export', {})
+        cai_dir = cai_cfg.get('output_dir', './cai_export')
+        tf_base = bulk_cfg.get('output_dir', './terraform')
+        proj_map = self._build_proj_id_map()
+
+        reports: List[Dict[str, Any]] = []
+        for src_proj, _sa in self._iter_src_projects():
+            cai_path = os.path.join(cai_dir, f"cai_resources_{src_proj}.txt")
+            if not os.path.isfile(cai_path):
+                self.org_logger.warning(
+                    f"  CAI 出力が無いためスキップ: {cai_path}"
+                )
+                continue
+            # raw を優先（bulk-export 直後の生 HCL）→ active も補助参照
+            tf_dirs = [
+                os.path.join(tf_base, "raw", src_proj),
+                os.path.join(tf_base, "active", src_proj),
+            ]
+            report = analyze_cai_tf_diff(
+                cai_path=cai_path,
+                tf_dirs=tf_dirs,
+                src_project=src_proj,
+                dst_project=proj_map.get(src_proj, ""),
+            )
+            reports.append(report)
+            self.org_logger.info(
+                f"  {src_proj}: CAI {report['cai_total']} 件 / "
+                f"TF {report['tf_total']} 件 / 一致 {report['covered']} 件 / "
+                f"欠落 {len(report['missing'])} 件"
+            )
+
+        if not reports:
+            self.org_logger.info("  解析対象なし（CAI 出力が見つかりません）。")
+            return
+
+        # 標準出力 / org.log にも詳細を流す
+        text = format_diff_report(reports)
+        for line in text.splitlines():
+            self.org_logger.info(line)
+
+        # DIFF.md をリポジトリ直下に出力（実行 cwd 基準）。
+        # ファイル書き込みは dry_run でも実行する（src への書き込みは発生しない）。
+        diff_path = os.path.abspath("DIFF.md")
+        try:
+            with open(diff_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.org_logger.info(f"  ✓ 差分レポートを書き出しました: {diff_path}")
+        except OSError as e:
+            self.org_logger.error(f"  DIFF.md の書き出しに失敗: {e}")
 
     def _print_summary(self):
         elapsed = time.time() - self.start_t
