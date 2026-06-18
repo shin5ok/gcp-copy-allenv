@@ -1,5 +1,6 @@
 .DEFAULT_GOAL := help
 .PHONY: setup run plan mock test projects projects-plan help clean clean-all \
+        delete-projects delete-projects-plan \
         bootstrap bootstrap-apply \
         bootstrap-dst-sa bootstrap-dst-sa-apply \
         bootstrap-cross-project bootstrap-cross-project-apply \
@@ -67,6 +68,22 @@ projects-plan: setup
 ## projects: コピー先プロジェクトを実際に作成（請求紐付け + API 有効化）
 projects: setup
 	uv run python3 scripts/create_projects.py --no-dry-run $(ARGS)
+
+## delete-projects-plan: project_id に PATTERN を含むプロジェクトを一覧表示（削除なし） 要 PATTERN=...
+delete-projects-plan: setup
+	@if [ -z "$(PATTERN)" ]; then \
+		echo "ERROR: PATTERN を指定してください。例: make delete-projects-plan PATTERN=foo-dst" >&2; \
+		exit 1; \
+	fi
+	uv run python3 scripts/delete_projects.py --pattern "$(PATTERN)" --dry-run $(ARGS)
+
+## delete-projects: 同上を削除（6 桁ランダムコード入力で安全確認・lien も自動解除） 要 PATTERN=...
+delete-projects: setup
+	@if [ -z "$(PATTERN)" ]; then \
+		echo "ERROR: PATTERN を指定してください。例: make delete-projects PATTERN=foo-dst" >&2; \
+		exit 1; \
+	fi
+	uv run python3 scripts/delete_projects.py --pattern "$(PATTERN)" --no-dry-run $(ARGS)
 
 ## bootstrap: dst SA / src 読取権限 / Shared VPC を順に dry-run（コマンド表示のみ）
 bootstrap:
