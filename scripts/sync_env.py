@@ -3428,6 +3428,22 @@ resource "google_storage_bucket" "mock_bucket" {{
 
         self._parallel_for_each(units, restore_worker, "gce-restore")
 
+        # 3) 最終フェーズ: src と同じ電源状態 (TERMINATED / SUSPENDED) に揃える。
+        #    boot 直後だと guest OS が ACPI S3 に応答できず suspend が失敗するため、
+        #    全 VM の復元完了 + 待機時間を挟んでから実施する。
+        pending: List[Tuple[str, str, str, Optional[str], str]] = []
+        for src_proj, (vms, _snaps, dst_proj, _src_sa, dst_sa) in project_data.items():
+            for vm in vms:
+                name = vm.get('name')
+                zone = (vm.get('zone') or '').split('/')[-1]
+                if not name or not zone:
+                    continue
+                s = (vm.get('status') or 'RUNNING').upper()
+                if s in ('TERMINATED', 'SUSPENDED'):
+                    pending.append((name, zone, dst_proj, dst_sa, s))
+        if pending:
+            self._finalize_vm_power_states(pending)
+
         self.dst_logger.info("  ✓ Step 5 完了")
 
     def _restore_one_vm(
@@ -3495,11 +3511,6 @@ resource "google_storage_bucket" "mock_bucket" {{
             self._attach_secondary_disks(
                 vm, vm_name, zone, src_proj, dst_proj, dst_sa, snapshots, max_age_days
             )
-            self._apply_target_status(
-                vm_name, zone, dst_proj, dst_sa,
-                src_status=vm.get('status', 'RUNNING'),
-                currently_running=True,
-            )
             return
 
         self.dst_logger.info(
@@ -3539,55 +3550,57 @@ resource "google_storage_bucket" "mock_bucket" {{
             explanation="復元ディスクをブートディスクとしてアタッチ",
             impersonate_sa=dst_sa,
         )
+        self.run_command(
+            f"gcloud compute instances start {vm_name} --zone={zone} --project={dst_proj} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"Start VM {vm_name}",
+            explanation="復元ディスクで VM を起動（電源状態反映は Step 5 最終フェーズで実施）",
+            impersonate_sa=dst_sa,
+        )
         self._attach_secondary_disks(
             vm, vm_name, zone, src_proj, dst_proj, dst_sa, snapshots, max_age_days
         )
-        self._apply_target_status(
-            vm_name, zone, dst_proj, dst_sa,
-            src_status=vm.get('status', 'RUNNING'),
-            currently_running=False,
-        )
 
-    def _apply_target_status(
-        self, vm_name: str, zone: str, dst_proj: str, dst_sa: Optional[str],
-        src_status: str, currently_running: bool,
+    def _finalize_vm_power_states(
+        self, pending: List[Tuple[str, str, str, Optional[str], str]],
     ):
-        """src VM の status に合わせて dst VM を RUNNING / TERMINATED / SUSPENDED に揃える。
+        """Step 5 の最終フェーズ: 復元後 RUNNING になっている VM を src と同じ
+        電源状態 (TERMINATED / SUSPENDED) に揃える。
 
-        `currently_running` は直前操作で dst が起動中か否か（呼び出し側が把握している前提）。
-        - 新規作成パス: instances create 直後で True
-        - 既存差し替えパス: stop → 差し替え後で False
-        transient 状態 (PROVISIONING / STAGING / STOPPING / REPAIRING / SUSPENDING) は
-        WARNING を出して RUNNING として扱う（最も無難な既定）。
+        suspend は guest OS が ACPI S3 シグナルに 3 分以内に応答する必要があり、
+        新規復元 boot 直後の VM では失敗しがち。そのため:
+          1. 全 VM の復元完了後にまとめて実施し、
+          2. `steps.gce_restore.power_state_wait_seconds` (既定 120s) 待ってから、
+          3. suspend は `_try_dst_suspend` で stats 非記録の soft fail にする
+        ことで run 全体の exit code を suspend 失敗で落とさない。
         """
-        s = (src_status or "RUNNING").upper()
-        if s == "TERMINATED":
-            target = "TERMINATED"
-        elif s == "SUSPENDED":
-            target = "SUSPENDED"
-        elif s == "RUNNING":
-            target = "RUNNING"
-        else:
-            self.dst_logger.warning(
-                f"    {vm_name}: src status={s} (transient/unknown) は RUNNING として扱います"
-            )
-            target = "RUNNING"
-
+        bar = "━" * 60
+        self.dst_logger.info("")
+        self.dst_logger.info(bar)
         self.dst_logger.info(
-            f"    {vm_name}: dst の目標電源状態 = {target} (src status={s})"
+            f" ステップ 5.5: 電源状態の反映 (src と同じ TERMINATED / SUSPENDED に揃える)"
+            f"  （対象 {len(pending)} 件）"
         )
+        self.dst_logger.info(bar)
+        wait_s = int(
+            self.config.get('steps', {}).get('gce_restore', {})
+            .get('power_state_wait_seconds', 120)
+        )
+        if self.mock or self.dry_run:
+            self.dst_logger.info(f"  [DRY RUN/MOCK] guest OS 起動待ち {wait_s}s をスキップ")
+        elif wait_s > 0:
+            self.dst_logger.info(
+                f"  guest OS 起動完了を待機中 ({wait_s}s)…"
+                f" suspend は ACPI S3 応答に依存するため即時実施は失敗しやすい"
+            )
+            time.sleep(wait_s)
 
-        if target == "RUNNING":
-            if not currently_running:
-                self.run_command(
-                    f"gcloud compute instances start {vm_name} --zone={zone} --project={dst_proj} --quiet",
-                    side="dst", logger=self.dst_logger,
-                    desc=f"Start VM {vm_name}",
-                    explanation=f"src が RUNNING のため dst {vm_name} を起動",
-                    impersonate_sa=dst_sa,
-                )
-        elif target == "TERMINATED":
-            if currently_running:
+        def worker(item):
+            vm_name, zone, dst_proj, dst_sa, src_status = item
+            self.dst_logger.info(
+                f"    {vm_name}: 目標電源状態 = {src_status} (zone={zone})"
+            )
+            if src_status == 'TERMINATED':
                 self.run_command(
                     f"gcloud compute instances stop {vm_name} --zone={zone} --project={dst_proj} --quiet",
                     side="dst", logger=self.dst_logger,
@@ -3595,22 +3608,57 @@ resource "google_storage_bucket" "mock_bucket" {{
                     explanation=f"src が TERMINATED のため dst {vm_name} を停止",
                     impersonate_sa=dst_sa, allow_fail=True,
                 )
-        elif target == "SUSPENDED":
-            if not currently_running:
-                self.run_command(
-                    f"gcloud compute instances start {vm_name} --zone={zone} --project={dst_proj} --quiet",
-                    side="dst", logger=self.dst_logger,
-                    desc=f"Start VM {vm_name}",
-                    explanation="suspend するため一旦起動",
-                    impersonate_sa=dst_sa,
-                )
-            self.run_command(
-                f"gcloud compute instances suspend {vm_name} --zone={zone} --project={dst_proj} --quiet",
-                side="dst", logger=self.dst_logger,
-                desc=f"Suspend VM {vm_name}",
-                explanation=f"src が SUSPENDED のため dst {vm_name} を suspend",
-                impersonate_sa=dst_sa,
+            elif src_status == 'SUSPENDED':
+                self._try_dst_suspend(vm_name, zone, dst_proj, dst_sa)
+
+        self._parallel_for_each(pending, worker, "gce-power")
+        self.dst_logger.info("  ✓ 電源状態の反映 完了")
+
+    def _try_dst_suspend(
+        self, vm_name: str, zone: str, dst_proj: str, dst_sa: Optional[str],
+    ) -> bool:
+        """`gcloud compute instances suspend` を stats 非記録で soft fail 実行する。
+
+        suspend は guest OS の ACPI S3 応答に依存し失敗しやすい。`run_command` 経由だと
+        失敗が `stats.failed` に積まれて run 全体が exit 1 になるため、ここでは
+        `_gcloud_exists` と同様に subprocess を直接呼ぶ。成功 True / 失敗 False。
+        """
+        if self.mock or self.dry_run:
+            self.dst_logger.info(
+                f"    [DRY RUN] gcloud compute instances suspend {vm_name} "
+                f"--zone={zone} --project={dst_proj}"
             )
+            return True
+        cmd = (
+            f"gcloud compute instances suspend {vm_name} "
+            f"--zone={zone} --project={dst_proj} --quiet"
+        )
+        env = os.environ.copy()
+        if dst_sa:
+            env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = dst_sa
+        try:
+            res = subprocess.run(
+                cmd, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env, timeout=900,
+            )
+        except Exception as e:
+            self.dst_logger.warning(f"    ⚠ {vm_name}: suspend 例外: {e}")
+            return False
+        if res.returncode == 0:
+            self.dst_logger.info(f"    ✓ {vm_name}: suspend 成功")
+            return True
+        err = (res.stderr or res.stdout or '').strip()
+        self.dst_logger.warning(
+            f"    ⚠ {vm_name}: suspend 失敗 (exit={res.returncode}): {err[:500]}"
+        )
+        self.dst_logger.warning(
+            f"      原因例: guest OS が ACPI S3 に未応答 (boot 未完了 / 非対応 OS) /"
+            f" GPU・TPU 付き / Confidential VM / メモリ 208GB 超 / CSEK 付きディスク。\n"
+            f"      手動復旧: gcloud compute instances suspend {vm_name} "
+            f"--zone={zone} --project={dst_proj}"
+        )
+        return False
 
     def _gcloud_exists(self, cmd: str, impersonate_sa: Optional[str]) -> bool:
         """read-only な describe 等で対象リソースの存在を確認する（stats を汚さない）。

@@ -111,9 +111,17 @@
    - 冪等性: dst プロジェクト変更時は `terraform.tfstate` を破棄して import からやり直し（`active/<src>/.dst_project` マーカー判定）
    - `google_storage_bucket` はリネーム後の実名で import して adopt
    - VM/disk は Step 4 では作らず Step 5 で管理（責務分離）
-2. **gce_restore**: 期限内スナップショットから dst にディスクを復元 → boot disk を差し替えて VM 起動（OS 状態・データごと復元）
-   - 並列化: `_replicate_host_networks()` の後、(project, vm) のフラット work unit に展開し VM 単位で並列復元（`parallel_jobs=8` 推奨）。VM 内の操作チェーン (stop→detach→delete→create→attach→start) は依存があるため直列。
+2. **gce_restore**: 期限内スナップショットから dst にディスクを復元 → boot disk を差し替え → **どの VM も一旦 RUNNING で残す**（OS 状態・データごと復元）
+   - 並列化: `_replicate_host_networks()` の後、(project, vm) のフラット work unit に展開し VM 単位で並列復元（`parallel_jobs=8` 推奨）。VM 内の操作チェーン (stop → detach → delete → create disk → attach → start → secondary disks) は依存があるため直列。
    - snapshot 未検出時の挙動: 並列モードで `sys.exit(1)` すると他 VM の進行を巻き添えで止めるため、`stats.failed` に記録して return する（最終的に `main()` で exit 1）。
+
+2.5. **電源状態反映 (Step 5.5 / `_finalize_vm_power_states`)**: 全 VM の復元完了後に、src と同じ電源状態 (`TERMINATED` / `SUSPENDED`) に揃える独立フェーズ。
+   - **なぜ分離するか**: GCE suspend は guest OS が **ACPI S3 シグナルに 3 分以内に応答** する必要があり、boot 直後の VM では失敗しやすい。Step 5 の VM 復元ループの中で個別に suspend すると `Suspending instance(s) <name>....failed` が頻発する。
+   - **待機**: `config.steps.gce_restore.power_state_wait_seconds` (既定 120 秒) だけ sleep してから状態反映を開始。`make plan` / `make mock` ではスキップ。
+   - **TERMINATED 目標**: `gcloud compute instances stop --quiet` を `allow_fail=True` で発行（ACPI 失敗時は forceful fallback があるため通常成功）。
+   - **SUSPENDED 目標**: `_try_dst_suspend` が `subprocess` を直接呼び、失敗しても `stats.failed` を増やさない（run 全体の exit code に影響させない）。失敗時は WARNING + 手動復旧コマンド (`gcloud compute instances suspend <name> --zone=<zone> --project=<dst>`) を案内するだけ。
+   - **transient / 未対応 OS**: suspend 非対応構成（GPU/TPU 付き、Confidential VM、メモリ 208GB 超、CSEK 付きディスク、未設定の Debian 8/9/Windows）は WARNING のみで RUNNING のまま残る。
+   - **並列**: pending リストを `_parallel_for_each` で `parallel_jobs` 並列実行。
 3. **data_sync**:
    - GCS: リネーム後バケットへ `gcloud storage rsync` で同期
    - BigQuery: src の location を継承してデータセット作成 → コピー
