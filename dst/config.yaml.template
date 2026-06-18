@@ -145,6 +145,9 @@ steps:
   # [Step 5] GCE VM 復元 (スナップショットから復元したディスクをVMに紐付け起動)
   gce_restore:
     enabled: true
+    # [Step 5.5] 電源状態反映 (TERMINATED / SUSPENDED) の前に guest OS の boot 完了を待つ秒数。
+    # 0 にすると待たない。suspend は ACPI S3 応答に依存するため、短すぎると失敗しやすい。
+    power_state_wait_seconds: 120
 
   # [Step 6] データの移行 (GCS, BigQueryなど)
   data_sync:

@@ -1204,16 +1204,13 @@ class TestRestoreOneVmFailureHandling:
         assert o.stats.failed == before_failed
 
 
-class TestRestoreOneVmStatusReconciliation:
-    """_restore_one_vm: src VM の status を dst に反映する。
+class TestRestoreOneVmEndsRunning:
+    """_restore_one_vm: 復元チェーンは常に VM を RUNNING で残す。
 
-    新規作成パス: instances create で起動済 → src の状態に合わせて stop/suspend を追加発行
-    既存差し替えパス: stop → 差し替え後で停止中 → src の状態に合わせて start/suspend を発行
-                       TERMINATED の場合は start を発行しない（重要な挙動変更）
+    電源状態の TERMINATED / SUSPENDED への反映は Step 5 の最終フェーズ
+    (_finalize_vm_power_states) で実施するため、ここでは src.status に
+    関わらず stop / suspend は発行されないことを確認。
     """
-    import datetime as _dt
-    from unittest.mock import patch as _patch
-
     def _orchestrator(self, temp_dir):
         cfg = _full_config(temp_dir)
         cfg["global"]["mock"] = False
@@ -1246,13 +1243,11 @@ class TestRestoreOneVmStatusReconciliation:
             "creationTimestamp": ts,
         }]
 
-    def _capture_calls(self, o, vm, vm_exists: bool):
+    def _capture(self, o, vm, vm_exists):
         from unittest.mock import patch
-        gcloud_seq = [vm_exists, False]  # 1: VM exists?  2: disk exists?
-
+        gcloud_seq = [vm_exists, False]
         def gcloud_exists_side(*_a, **_kw):
             return gcloud_seq.pop(0) if gcloud_seq else False
-
         with patch.object(o, "run_command", return_value="") as mock_run, \
              patch.object(o, "_gcloud_exists", side_effect=gcloud_exists_side), \
              patch.object(o, "_attach_secondary_disks", return_value=None):
@@ -1264,57 +1259,96 @@ class TestRestoreOneVmStatusReconciliation:
             )
         return [c.args[0] for c in mock_run.call_args_list]
 
-    @staticmethod
-    def _is_cmd(s: str, fragment: str) -> bool:
-        return fragment in s
-
-    def test_new_vm_running_keeps_running(self, temp_dir):
+    @pytest.mark.parametrize("status", ["RUNNING", "TERMINATED", "SUSPENDED"])
+    def test_new_vm_never_stops_or_suspends(self, temp_dir, status):
         o = self._orchestrator(temp_dir)
-        calls = self._capture_calls(o, self._vm("RUNNING"), vm_exists=False)
-        assert any(self._is_cmd(c, "instances create vm1") for c in calls)
-        assert not any(self._is_cmd(c, "instances stop vm1") for c in calls)
-        assert not any(self._is_cmd(c, "instances suspend vm1") for c in calls)
+        calls = self._capture(o, self._vm(status), vm_exists=False)
+        assert any("instances create vm1" in c for c in calls)
+        assert not any("instances stop vm1" in c for c in calls)
+        assert not any("instances suspend vm1" in c for c in calls)
 
-    def test_new_vm_terminated_stops_after_create(self, temp_dir):
+    @pytest.mark.parametrize("status", ["RUNNING", "TERMINATED", "SUSPENDED"])
+    def test_existing_vm_always_starts_at_end(self, temp_dir, status):
         o = self._orchestrator(temp_dir)
-        calls = self._capture_calls(o, self._vm("TERMINATED"), vm_exists=False)
-        create_idx = next(i for i, c in enumerate(calls) if "instances create vm1" in c)
-        stop_idx = next(i for i, c in enumerate(calls) if "instances stop vm1" in c)
-        assert stop_idx > create_idx
-        assert not any(self._is_cmd(c, "instances suspend vm1") for c in calls)
-
-    def test_new_vm_suspended_suspends_after_create(self, temp_dir):
-        o = self._orchestrator(temp_dir)
-        calls = self._capture_calls(o, self._vm("SUSPENDED"), vm_exists=False)
-        create_idx = next(i for i, c in enumerate(calls) if "instances create vm1" in c)
-        suspend_idx = next(i for i, c in enumerate(calls) if "instances suspend vm1" in c)
-        assert suspend_idx > create_idx
-        assert not any(self._is_cmd(c, "instances start vm1") for c in calls)
-        assert not any(self._is_cmd(c, "instances stop vm1") for c in calls)
-
-    def test_existing_vm_running_starts_at_end(self, temp_dir):
-        o = self._orchestrator(temp_dir)
-        calls = self._capture_calls(o, self._vm("RUNNING"), vm_exists=True)
+        calls = self._capture(o, self._vm(status), vm_exists=True)
         attach_idx = next(
             i for i, c in enumerate(calls)
             if "instances attach-disk vm1" in c and "--boot" in c
         )
         start_idx = next(i for i, c in enumerate(calls) if "instances start vm1" in c)
         assert start_idx > attach_idx
-        assert not any(self._is_cmd(c, "instances suspend vm1") for c in calls)
+        assert not any("instances suspend vm1" in c for c in calls)
 
-    def test_existing_vm_terminated_skips_start(self, temp_dir):
-        o = self._orchestrator(temp_dir)
-        calls = self._capture_calls(o, self._vm("TERMINATED"), vm_exists=True)
-        # 直前 stop は差し替えのために発行される。
-        # しかし「末尾の start」は発行されてはならない（src が停止中だから）。
-        starts = [c for c in calls if "instances start vm1" in c]
-        assert starts == [], f"unexpected start commands: {starts}"
-        assert not any(self._is_cmd(c, "instances suspend vm1") for c in calls)
 
-    def test_existing_vm_suspended_starts_then_suspends(self, temp_dir):
+class TestFinalizeVmPowerStates:
+    """_finalize_vm_power_states: Step 5 の最終フェーズで電源状態を反映する。
+
+    - dry_run/mock では sleep をスキップ
+    - TERMINATED 目標 → run_command で `instances stop` 発行
+    - SUSPENDED 目標 → _try_dst_suspend を呼ぶ
+    - suspend 失敗 (subprocess returncode!=0) は stats.failed を増やさない
+    """
+    def _orchestrator(self, temp_dir, dry_run=False, mock=False):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["mock"] = mock
+        cfg["global"]["dry_run"] = dry_run
+        cfg["global"]["parallel_jobs"] = 1
+        cfg.setdefault("steps", {})
+        cfg["steps"]["gce_restore"] = {"enabled": True, "power_state_wait_seconds": 0}
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def test_dry_run_skips_sleep_and_real_commands(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orchestrator(temp_dir, dry_run=True)
+        pending = [("vm-t", "zone-a", "dst-p", None, "TERMINATED")]
+        with patch("time.sleep") as mock_sleep, \
+             patch.object(o, "run_command", return_value="") as mock_run:
+            o._finalize_vm_power_states(pending)
+        mock_sleep.assert_not_called()
+        # dry_run でも run_command は呼ばれる（中で [DRY RUN] プレフィクスを出すだけ）
+        assert any("instances stop vm-t" in c.args[0] for c in mock_run.call_args_list)
+
+    def test_terminated_calls_stop(self, temp_dir):
+        from unittest.mock import patch
         o = self._orchestrator(temp_dir)
-        calls = self._capture_calls(o, self._vm("SUSPENDED"), vm_exists=True)
-        start_idx = next(i for i, c in enumerate(calls) if "instances start vm1" in c)
-        suspend_idx = next(i for i, c in enumerate(calls) if "instances suspend vm1" in c)
-        assert start_idx < suspend_idx
+        pending = [("vm-t", "zone-a", "dst-p", None, "TERMINATED")]
+        with patch("time.sleep"), \
+             patch.object(o, "run_command", return_value="") as mock_run:
+            o._finalize_vm_power_states(pending)
+        cmds = [c.args[0] for c in mock_run.call_args_list]
+        assert any("instances stop vm-t" in c for c in cmds)
+        assert not any("instances suspend vm-t" in c for c in cmds)
+
+    def test_suspended_calls_try_suspend(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orchestrator(temp_dir)
+        pending = [("vm-s", "zone-a", "dst-p", None, "SUSPENDED")]
+        with patch("time.sleep"), \
+             patch.object(o, "_try_dst_suspend", return_value=True) as mock_susp, \
+             patch.object(o, "run_command", return_value=""):
+            o._finalize_vm_power_states(pending)
+        mock_susp.assert_called_once_with("vm-s", "zone-a", "dst-p", None)
+
+    def test_suspend_failure_does_not_increment_stats_failed(self, temp_dir):
+        from unittest.mock import patch, MagicMock
+        o = self._orchestrator(temp_dir)
+        before = o.stats.failed
+        fail = MagicMock(returncode=1, stderr="UNSUPPORTED_OPERATION", stdout="")
+        with patch("subprocess.run", return_value=fail):
+            ok = o._try_dst_suspend("vm-s", "zone-a", "dst-p", None)
+        assert ok is False
+        assert o.stats.failed == before  # run 全体を落とさない
+
+    def test_suspend_success(self, temp_dir):
+        from unittest.mock import patch, MagicMock
+        o = self._orchestrator(temp_dir)
+        ok_res = MagicMock(returncode=0, stderr="", stdout="")
+        with patch("subprocess.run", return_value=ok_res):
+            ok = o._try_dst_suspend("vm-s", "zone-a", "dst-p", None)
+        assert ok is True

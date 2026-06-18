@@ -67,12 +67,13 @@ make vmware-all # VMware → GCE フル処理
 
 ## ハマりどころ（既知の落とし穴）
 
-### GCE 復元と電源状態（Step 5）
+### GCE 復元と電源状態（Step 5 / 5.5）
 
-- `_restore_one_vm` は src VM の `status` を読み、`_apply_target_status` で dst を **RUNNING / TERMINATED / SUSPENDED** に揃える。何もしないと `instances create` / 末尾の `instances start` で常に RUNNING になる。
-- 新規作成パス: create 直後で起動中 → TERMINATED は stop、SUSPENDED は suspend。
-- 既存差し替えパス: 末尾の無条件 `instances start` は削除済 → RUNNING は start、SUSPENDED は start→suspend、TERMINATED は何もしない（差し替え中の stop のまま）。
-- transient (`PROVISIONING / STAGING / STOPPING / REPAIRING / SUSPENDING`) と不明値は WARNING を出して RUNNING にフォールバック。
+- `_restore_one_vm` は src.status に関わらず **常に VM を RUNNING で残す**（新規作成は `instances create` 直後、既存差し替えは末尾の `instances start`）。
+- 電源状態の反映は Step 5 の最終フェーズ `_finalize_vm_power_states` で実施: 全 VM の復元完了後にまとめて TERMINATED / SUSPENDED に揃える。`config.steps.gce_restore.power_state_wait_seconds` (既定 120) だけ待ってから実行することで、guest OS の boot 完了を待つ。
+- **suspend は失敗しやすい**: GCE suspend は guest OS が ACPI S3 シグナルに 3 分以内に応答する必要があり、boot 直後 / 非対応 OS / GPU・TPU 付き / Confidential VM / メモリ 208GB 超 / CSEK 付き等で失敗する。`_try_dst_suspend` は `subprocess` を直接呼んで stats を汚さず、失敗時は WARNING + 手動復旧コマンドを案内するだけ（run 全体の exit code は影響を受けない）。
+- TERMINATED は `run_command(allow_fail=True)` のまま（stop は ACPI 失敗時に forceful fallback があり通常成功）。
+- transient (`PROVISIONING / STAGING / STOPPING / REPAIRING / SUSPENDING`) と不明値は pending リストに入れず RUNNING のまま残す。
 - 新しい状態遷移コマンド（`suspend` / `resume` など）を増やす時は **`_WRITE_VERBS`（src 拒否リスト）と `_MOCK_KNOWN_PATTERNS`（mock 許容リスト）の両方** に追加。片方だけだと src で実行される / mock が fail-closed で止まる。
 
 ### Network Firewall Policy（Step 4.5）
