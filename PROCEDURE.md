@@ -132,3 +132,26 @@
 - `logs/<timestamp>/org.log` / `dst.log` をレビュー
   - ステップ単位 `━━━━` 区切り、`✓/+/−/✗` 記号、スレッドタグ `[main]` / `[cai-scan_0]`
   - `verbose_logging: true` で生コマンド + STDOUT を DEBUG レベルで記録
+
+---
+
+## 7. `make delete-projects-plan PATTERN=...` → `make delete-projects PATTERN=...`（任意・クリーンアップ）
+
+**目的**: 試行錯誤で作った dst プロジェクト群を一括で片付ける。src は対象外（コードレベルで母集団から除外）。
+
+### 削除対象の決定
+- 母集団は `dst/config.yaml` の `project_mapping.host_project.dst` と `service_projects[].dst` のみ。**config に無い無関係なプロジェクトは仕様上候補に上がらない**（誤爆防止のコア）。
+- `PATTERN` (3 文字以上必須) で母集団を project_id 部分一致でさらに絞り込む。
+- 各候補は `gcloud projects describe` で存在 / 状態を確認: `lifecycleState != ACTIVE` のものや describe 不可（存在しない / 権限不足）は自動でスキップし、理由付きで列挙。
+
+### 多重安全策
+1. **`PATTERN` 必須・3 文字未満は拒否**（make ターゲット側でも未指定なら即エラー）
+2. **削除前に一覧テーブル**を出力: `# / kind(host|svc) / project_id (dst) / name / state / lien 数 / src project` を桁揃え
+3. **6 桁ランダムコード**を端末に表示。**標準入力で一致するまで削除は実行されない**（一致しなければ exit 1 で中止）
+4. lien (`compute.googleapis.com/projects-delete-prevented` 等) が付いていれば `gcloud alpha resource-manager liens delete` で先に解除してから `gcloud projects delete --quiet`
+5. 既定は `--dry-run`（make ターゲット側で `--no-dry-run` を付与）。`delete-projects-plan` は dry-run 固定で表示のみ
+6. 並列度は `global.parallel_jobs`（既定 8）。worker 内で `sys.exit` せず、`threading.Lock` で success/fail カウンタを保護（他 worker を巻き添えで止めない）
+
+### ログ
+- `logs/<timestamp>_delete-projects/dst.log` に独立出力（`create-projects` と同じ書式）
+- サマリ: `削除済 / lien 解除 / 失敗` 件数 + ログパス。1 件でも失敗で exit 1
