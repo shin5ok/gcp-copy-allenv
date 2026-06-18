@@ -43,6 +43,46 @@ make vmware-all # VMware → GCE フル処理
 - 勝手に変更を加える・デプロイしない（テストであっても）
 - 変更を行う場合は、ユーザーにコマンド操作を促してログを貼るよう促す
 
+## 並列化方針（パフォーマンス）
+
+各ステップの直列処理が長時間化するため `_parallel_for_each` で並列化済み。`config global.parallel_jobs` (推奨 8) を上限としたスレッドプールで実行。
+
+| ステップ | 並列単位 | 備考 |
+|---|---|---|
+| 1 cai_scan | プロジェクト | src read-only |
+| 2 gce_snapshot | プロジェクト | 既存 |
+| 3 bulk_export | プロジェクト | 既存 |
+| 4.5 network_firewall (classic rules) | ルール | `_sync_classic_firewall_rules` 内 |
+| 4.5 network_firewall (policy rules) | ルール | `_sync_fw_policy_rules` 内 |
+| 5 gce_restore (listing) | プロジェクト | VM/snap 一覧並列取得 |
+| 5 gce_restore (restore) | **VM** | flat (project, vm) units で並列 |
+| 5 secondary disks (create) | ディスク | attach は同一 VM 内で直列（409 回避） |
+| 6 data_sync (GCS/BQ) | バケット / テーブル | 既存 |
+
+実装ルール:
+- 共有可変状態（dict など）に書き込む場合は `threading.Lock()` で保護。`StageStats` は組み込み Lock 済み。
+- 並列 worker から `sys.exit(1)` しない（他 worker を巻き添えで止める）。代わりに `stats.add_failure()` + `stats.incr("failed")` で記録し return。`main()` が最終的に exit 1 で抜ける。
+- 同一リソースへの並列操作は API レベルで競合する場合があるので注意（例: 同一 VM への並列 attach-disk は 409 になる → attach は直列）。
+- worker 内では `dst_logger` / `org_logger` をそのまま使ってよい（Python logging はスレッドセーフ）。
+
+## ハマりどころ（既知の落とし穴）
+
+### Network Firewall Policy（Step 4.5）
+
+- **scope flag はサブコマンドごとに違う**。誤ると `unrecognized arguments`。
+  - `list` → `--regions=R1,R2`（複数形）
+  - `describe` / `create`（ポリシー本体）→ `--global` / `--region=R`
+  - `rules ...` / `associations create` → `--global-firewall-policy` / `--firewall-policy-region=R`
+  - 変換は `fw_rule_scope_flag()`（`scripts/sync_env.py`）に集約。新規コマンド追加時は必ず通すこと。
+- **`fw_policy_rule_flags()` は REST API の FirewallPolicyRule 全フィールドに対応させること**。
+  INGRESS ルールは `srcIpRanges / srcThreatIntelligences / srcAddressGroups / srcFqdns / srcSecureTags / srcRegionCodes / srcNetworkScope` のいずれかが必須、EGRESS ルールは対応する `dest*` が必須（gcloud 仕様）。
+  フィールドを取りこぼすと `Must specify src_... for ingress direction` / `Could not fetch resource:` で失敗する。
+  特に Threat Intelligence（`srcThreatIntelligences` → `--src-threat-intelligence`）は頻出。
+- **別 ORG コピーで secure tag はそのまま使えない**。`tagValues/<数値ID>` は ORG スコープの permanent ID で dst ORG に存在せず、`rules create` が `Could not fetch resource:` で失敗する。
+  - dst ORG で同等タグを作成し `config steps.network_firewall.secure_tag_map` に `src tagValues → dst tagValues` を登録すると変換して複製。
+  - 未登録タグを参照するルールは **FW を意図せず緩めないようスキップ + WARNING**（エラーにしない）。`fw_policy_rule_flags(rule, proj_map, secure_tag_map)` / `_fw_secure_tag_map()` 参照。
+- 同種の「別 ORG では ID が変わるリソース」（org policy 制約、tag key/value、IAM の org スコープロール等）は同じパターンで config マッピング or スキップ＋WARNING を検討する。
+
 ## Git コミット
 
 - コミットメッセージに Claude の名前や署名を付けないこと

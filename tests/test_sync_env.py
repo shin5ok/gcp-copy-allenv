@@ -14,11 +14,14 @@ from scripts.sync_env import (
     _ASSET_COVERAGE,
     fw_policy_rule_layer4,
     fw_policy_rule_flags,
+    fw_policy_rule_secure_tags,
+    fw_rule_scope_flag,
     parse_cai_resources,
     parse_tf_resources,
     gcloud_recreate_command,
     analyze_cai_tf_diff,
     format_diff_report,
+    _parse_gcloud_describe_json,
 )
 
 
@@ -522,6 +525,36 @@ resource "google_compute_instance" "v" {
         # VM は Step5 管理のためスキップ → active に出力されない
         assert not os.path.exists(os.path.join(active, "vm.tf"))
 
+    def test_bigquery_dataset_and_table_skipped(self, temp_dir):
+        # BQ dataset / table は Step6 (data_sync) が管理する。
+        # terraform_apply に残すと「table を先に作って 404」する不具合が起きる。
+        o = self._setup(temp_dir)
+        raw = os.path.join(temp_dir, "raw")
+        active = os.path.join(temp_dir, "active")
+        os.makedirs(raw)
+        ds_sample = '''
+resource "google_bigquery_dataset" "d" {
+  dataset_id = "dataset_foo"
+  project    = "src-svc-1"
+  location   = "asia-northeast1"
+}
+'''
+        tbl_sample = '''
+resource "google_bigquery_table" "t" {
+  dataset_id = "dataset_foo"
+  table_id   = "tbl1"
+  project    = "src-svc-1"
+}
+'''
+        with open(os.path.join(raw, "google_bigquery_dataset.tf"), "w", encoding="utf-8") as f:
+            f.write(ds_sample)
+        with open(os.path.join(raw, "google_bigquery_table.tf"), "w", encoding="utf-8") as f:
+            f.write(tbl_sample)
+        o.customize_hcl(raw, active)
+        # 両方 active に出力されない（Step 6 が担当する所有モデル）
+        assert not os.path.exists(os.path.join(active, "google_bigquery_dataset.tf"))
+        assert not os.path.exists(os.path.join(active, "google_bigquery_table.tf"))
+
 
 # ============================================================
 # ログディレクトリ: 実行ごとに新規作成
@@ -661,6 +694,43 @@ class TestFwPolicyRuleConversion:
         assert "--src-ip-ranges=10.0.0.0/8,192.168.0.0/16" in flags
         assert "--dest-ip-ranges=172.16.0.0/12" in flags
 
+    def test_flags_threat_intelligence(self):
+        rule = {
+            "match": {
+                "srcThreatIntelligences": ["iplist-known-malicious-ips", "iplist-tor-exit-nodes"],
+                "destThreatIntelligences": ["iplist-known-malicious-ips"],
+            },
+        }
+        flags = fw_policy_rule_flags(rule, {})
+        assert "--src-threat-intelligence=iplist-known-malicious-ips,iplist-tor-exit-nodes" in flags
+        assert "--dest-threat-intelligence=iplist-known-malicious-ips" in flags
+
+    def test_flags_address_groups_and_fqdns(self):
+        rule = {
+            "match": {
+                "srcAddressGroups": ["projects/p/locations/global/addressGroups/g1"],
+                "destAddressGroups": ["projects/p/locations/global/addressGroups/g2"],
+                "srcFqdns": ["example.com"],
+                "destFqdns": ["evil.example"],
+            },
+        }
+        flags = fw_policy_rule_flags(rule, {})
+        assert "--src-address-groups=projects/p/locations/global/addressGroups/g1" in flags
+        assert "--dest-address-groups=projects/p/locations/global/addressGroups/g2" in flags
+        assert "--src-fqdns=example.com" in flags
+        assert "--dest-fqdns=evil.example" in flags
+
+    def test_flags_network_scope_and_spg(self):
+        rule = {
+            "match": {"srcNetworkScope": "INTERNET"},
+            "securityProfileGroup": "//networksecurity.googleapis.com/orgs/123/locations/global/securityProfileGroups/spg",
+            "tlsInspect": True,
+        }
+        flags = fw_policy_rule_flags(rule, {})
+        assert "--src-network-context=INTERNET" in flags
+        assert any("--security-profile-group=" in f for f in flags)
+        assert "--tls-inspect" in flags
+
     def test_flags_disabled_and_logging(self):
         rule = {"disabled": True, "enableLogging": True}
         flags = fw_policy_rule_flags(rule, {})
@@ -691,12 +761,68 @@ class TestFwPolicyRuleConversion:
             "match": {"srcSecureTags": [{"name": "tagValues/111"}, {"name": "tagValues/222"}]},
             "targetSecureTags": [{"name": "tagValues/333"}],
         }
+        # secure_tag_map=None (default) は変換せずそのまま（同一 ORG 後方互換）
         flags = fw_policy_rule_flags(rule, {})
         assert "--src-secure-tags=tagValues/111,tagValues/222" in flags
         assert "--target-secure-tags=tagValues/333" in flags
 
+    def test_flags_secure_tags_remapped_via_map(self):
+        rule = {
+            "match": {"srcSecureTags": [{"name": "tagValues/111"}, {"name": "tagValues/222"}]},
+            "targetSecureTags": [{"name": "tagValues/333"}],
+        }
+        m = {
+            "tagValues/111": "tagValues/aaa",
+            "tagValues/222": "tagValues/bbb",
+            "tagValues/333": "tagValues/ccc",
+        }
+        flags = fw_policy_rule_flags(rule, {}, m)
+        assert "--src-secure-tags=tagValues/aaa,tagValues/bbb" in flags
+        assert "--target-secure-tags=tagValues/ccc" in flags
+
+    def test_flags_secure_tags_unmapped_dropped(self):
+        # map にあるタグだけ残り、無いタグは落ちる
+        rule = {"match": {"srcSecureTags": [{"name": "tagValues/111"}, {"name": "tagValues/999"}]}}
+        flags = fw_policy_rule_flags(rule, {}, {"tagValues/111": "tagValues/aaa"})
+        assert "--src-secure-tags=tagValues/aaa" in flags
+
+    def test_secure_tags_collector(self):
+        rule = {
+            "match": {"srcSecureTags": [{"name": "tagValues/111"}]},
+            "targetSecureTags": [{"name": "tagValues/333"}],
+        }
+        assert fw_policy_rule_secure_tags(rule) == ["tagValues/111", "tagValues/333"]
+        assert fw_policy_rule_secure_tags({}) == []
+
     def test_flags_empty_rule_returns_empty(self):
         assert fw_policy_rule_flags({}, {}) == []
+
+
+# ============================================================
+# gcloud describe --format=json の出力形状ゆれ吸収
+# ============================================================
+class TestParseGcloudDescribeJson:
+    def test_object_passthrough(self):
+        assert _parse_gcloud_describe_json('{"name":"p","rules":[1,2]}') == \
+            {"name": "p", "rules": [1, 2]}
+
+    def test_single_element_list_unwraps(self):
+        # 一部 gcloud バージョンで describe が [{...}] を返すケース
+        assert _parse_gcloud_describe_json('[{"name":"p","rules":[]}]') == \
+            {"name": "p", "rules": []}
+
+    def test_empty_input_returns_empty_dict(self):
+        assert _parse_gcloud_describe_json("") == {}
+        assert _parse_gcloud_describe_json(None) == {}
+
+    def test_invalid_json_returns_empty_dict(self):
+        assert _parse_gcloud_describe_json("not json") == {}
+
+    def test_unexpected_shape_returns_empty_dict(self):
+        # 複数要素 / 空配列 / スカラはいずれも安全側で空 dict 化
+        assert _parse_gcloud_describe_json('[{"a":1},{"a":2}]') == {}
+        assert _parse_gcloud_describe_json("[]") == {}
+        assert _parse_gcloud_describe_json("123") == {}
 
 
 # ============================================================
@@ -917,3 +1043,162 @@ class TestEmitCaiTfDiff:
         assert "nat-router" in body
         # 一致したリソースは載らない
         assert "subnet-svc1\n" not in body or "subnet-svc1" in body  # short_name は missing 内のみ列挙
+
+
+class TestFwRuleScopeFlag:
+    """rules / associations サブコマンド用の scope flag 変換。"""
+
+    def test_global(self):
+        assert fw_rule_scope_flag("--global") == "--global-firewall-policy"
+
+    def test_region(self):
+        assert (
+            fw_rule_scope_flag("--region=asia-northeast1")
+            == "--firewall-policy-region=asia-northeast1"
+        )
+
+    def test_already_rule_scope_passthrough(self):
+        assert fw_rule_scope_flag("--global-firewall-policy") == "--global-firewall-policy"
+        assert (
+            fw_rule_scope_flag("--firewall-policy-region=us-central1")
+            == "--firewall-policy-region=us-central1"
+        )
+
+
+# ============================================================
+# 並列実行 (_parallel_for_each) と Step 5 並列化の安全性
+# ============================================================
+import threading as _threading_mod
+import time as _time_mod
+
+
+class TestParallelForEach:
+    """_parallel_for_each: parallel_jobs=1 は直列、>1 は並列実行で全要素を処理。"""
+
+    def _orchestrator(self, temp_dir, parallel_jobs: int):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["parallel_jobs"] = parallel_jobs
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_serial_runs_all_items_in_order(self, temp_dir):
+        o = self._orchestrator(temp_dir, parallel_jobs=1)
+        seen: list = []
+        o._parallel_for_each([1, 2, 3, 4, 5], seen.append, "test-serial")
+        assert seen == [1, 2, 3, 4, 5]
+
+    def test_parallel_runs_all_items(self, temp_dir):
+        o = self._orchestrator(temp_dir, parallel_jobs=4)
+        seen: list = []
+        lock = _threading_mod.Lock()
+
+        def worker(x):
+            with lock:
+                seen.append(x)
+
+        items = list(range(20))
+        o._parallel_for_each(items, worker, "test-parallel")
+        assert sorted(seen) == items  # 全要素実行、順序不問
+
+    def test_parallel_actually_overlaps(self, temp_dir):
+        """並列実行がシリアルより速いことを確認（タイミングテスト）。"""
+        o_serial = self._orchestrator(temp_dir, parallel_jobs=1)
+        o_parallel = self._orchestrator(temp_dir, parallel_jobs=8)
+
+        def slow_work(_x):
+            _time_mod.sleep(0.05)
+
+        items = list(range(8))
+
+        t0 = _time_mod.monotonic()
+        o_serial._parallel_for_each(items, slow_work, "serial")
+        serial_dt = _time_mod.monotonic() - t0
+
+        t0 = _time_mod.monotonic()
+        o_parallel._parallel_for_each(items, slow_work, "parallel")
+        parallel_dt = _time_mod.monotonic() - t0
+
+        # 並列は直列の半分以下になるはず（8並列で 8*50ms vs 50ms）
+        assert parallel_dt < serial_dt / 2, (
+            f"parallel={parallel_dt:.3f}s, serial={serial_dt:.3f}s — 並列化が効いていない"
+        )
+
+    def test_parallel_propagates_worker_exception(self, temp_dir):
+        """worker が例外を投げたら _parallel_for_each は再 raise する。"""
+        o = self._orchestrator(temp_dir, parallel_jobs=4)
+
+        def bad_worker(x):
+            if x == 3:
+                raise RuntimeError(f"boom at {x}")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            o._parallel_for_each(list(range(10)), bad_worker, "test-exc")
+
+
+class TestRestoreOneVmFailureHandling:
+    """_restore_one_vm: snapshot 未検出時に sys.exit せず stats.failed に記録する。
+
+    並列モードで sys.exit すると他 VM の処理が巻き添えで止まるため、
+    failure を記録して return する（最終的に main() で exit 1）。
+    """
+
+    def _orchestrator(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["mock"] = False
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        # logger を仮設定（実ファイルは作らない）
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def test_snapshot_missing_records_failure_no_exit(self, temp_dir):
+        o = self._orchestrator(temp_dir)
+        vm = {
+            "name": "vm1",
+            "zone": "projects/p/zones/asia-northeast1-a",
+            "machineType": "projects/p/zones/z/machineTypes/e2-micro",
+            "disks": [{"boot": True, "source": "projects/p/zones/z/disks/disk1"}],
+        }
+        # snapshots 空: _find_valid_snapshot が None を返す
+        before_failed = o.stats.failed
+        o._restore_one_vm(
+            vm, snapshots=[],
+            src_proj="src-p", dst_proj="dst-p",
+            src_sa=None, dst_sa=None,
+            proj_map={}, max_age_days=30,
+        )
+        # sys.exit が起きないことを確認、failed が +1 されることを確認
+        assert o.stats.failed == before_failed + 1
+        assert any("Restore VM vm1" in d for d, _ in o.stats.failures)
+
+    def test_no_boot_disk_silently_skips(self, temp_dir):
+        o = self._orchestrator(temp_dir)
+        vm = {"name": "vm-noboot", "zone": "z", "disks": [{"boot": False}]}
+        before_failed = o.stats.failed
+        o._restore_one_vm(
+            vm, snapshots=[],
+            src_proj="s", dst_proj="d",
+            src_sa=None, dst_sa=None,
+            proj_map={}, max_age_days=30,
+        )
+        # boot disk が無い → 何もしない（failed カウントも増えない）
+        assert o.stats.failed == before_failed
+
+    def test_no_vm_name_silently_skips(self, temp_dir):
+        o = self._orchestrator(temp_dir)
+        vm = {"disks": [{"boot": True, "source": "/disks/d"}]}
+        before_failed = o.stats.failed
+        o._restore_one_vm(
+            vm, snapshots=[],
+            src_proj="s", dst_proj="d",
+            src_sa=None, dst_sa=None,
+            proj_map={}, max_age_days=30,
+        )
+        assert o.stats.failed == before_failed

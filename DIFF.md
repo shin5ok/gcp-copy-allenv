@@ -10,7 +10,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 
 ## プロジェクト: `<SRC_HOST_PROJECT_ID>` → `<DST_HOST_PROJECT_ID>`
 
-- CAI 検出リソース: **61** 件 / TF 出力リソース: **3** 件 / 一致: **0** 件 / 欠落候補: **61** 件
+- CAI 検出リソース: **62** 件 / TF 出力リソース: **43** 件 / 一致: **12** 件 / 欠落候補: **50** 件
 
 ### `cloudbilling.googleapis.com/ProjectBillingInfo` （1 件）
 
@@ -52,94 +52,6 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   ```bash
   gcloud asset describe '//cloudresourcemanager.googleapis.com/projects/<SRC_HOST_PROJECT_ID>' 
   # cloudresourcemanager.googleapis.com/Project は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
-  ```
-
-### `compute.googleapis.com/Address` （2 件）
-
-#### `nat-auto-ip-10281266-7-1780362359330384` (location=`asia-northeast1`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/regions/asia-northeast1/addresses/nat-auto-ip-10281266-7-1780362359330384`
-- 担当ステップ: `terraform_apply`
-- 期待 TF 型: `google_compute_address/google_compute_global_address`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_address/google_compute_global_address)
-- 推奨コマンド:
-  ```bash
-  gcloud compute addresses describe nat-auto-ip-10281266-7-1780362359330384 --region=asia-northeast1 --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute addresses create nat-auto-ip-10281266-7-1780362359330384 --project=<DST_HOST_PROJECT_ID> --region=asia-northeast1
-  ```
-
-#### `coordinator` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/global/addresses/coordinator`
-- 担当ステップ: `terraform_apply`
-- 期待 TF 型: `google_compute_address/google_compute_global_address`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_address/google_compute_global_address)
-- 推奨コマンド:
-  ```bash
-  gcloud compute addresses describe coordinator --global --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute addresses create coordinator --project=<DST_HOST_PROJECT_ID> --global
-  ```
-
-### `compute.googleapis.com/Firewall` （5 件）
-
-#### `testrule30000` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/global/firewalls/testrule30000`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe testrule30000 --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute firewall-rules create testrule30000 --project=<DST_HOST_PROJECT_ID> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
-  ```
-
-#### `rdp` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/global/firewalls/rdp`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe rdp --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute firewall-rules create rdp --project=<DST_HOST_PROJECT_ID> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
-  ```
-
-#### `ssh` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/global/firewalls/ssh`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe ssh --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute firewall-rules create ssh --project=<DST_HOST_PROJECT_ID> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
-  ```
-
-#### `all-for-incredibuild` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/global/firewalls/all-for-incredibuild`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe all-for-incredibuild --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute firewall-rules create all-for-incredibuild --project=<DST_HOST_PROJECT_ID> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
-  ```
-
-#### `allow-shared-iap-ssh` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/global/firewalls/allow-shared-iap-ssh`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe allow-shared-iap-ssh --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute firewall-rules create allow-shared-iap-ssh --project=<DST_HOST_PROJECT_ID> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
   ```
 
 ### `compute.googleapis.com/FirewallPolicy` （2 件）
@@ -204,20 +116,6 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   ```bash
   gcloud asset describe '//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/zones/asia-northeast1-b/instanceSettings/InstanceSettings' --project=<SRC_HOST_PROJECT_ID>
   # compute.googleapis.com/InstanceSettings は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
-  ```
-
-### `compute.googleapis.com/Network` （1 件）
-
-#### `shared-vpc` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/global/networks/shared-vpc`
-- 担当ステップ: `gce_restore`
-- 期待 TF 型: `google_compute_network`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_network)
-- 推奨コマンド:
-  ```bash
-  gcloud compute networks describe shared-vpc --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute networks create shared-vpc --project=<DST_HOST_PROJECT_ID> --subnet-mode=custom
   ```
 
 ### `compute.googleapis.com/Project` （1 件）
@@ -296,70 +194,6 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   gcloud compute routes create default-route-4a82a4f6a6983b3d --project=<DST_HOST_PROJECT_ID> --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
-### `compute.googleapis.com/Router` （1 件）
-
-#### `shared-router` (location=`asia-northeast1`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/regions/asia-northeast1/routers/shared-router`
-- 担当ステップ: `意図的対象外 (None)`
-- 期待 TF 型: `google_compute_router`
-- 判定理由: 意図的に対象外（マップで None 指定）
-- 推奨コマンド:
-  ```bash
-  gcloud compute routers describe shared-router --region=asia-northeast1 --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute routers create shared-router --project=<DST_HOST_PROJECT_ID> --region=asia-northeast1 --network=<NETWORK> --asn=<ASN>
-  ```
-
-### `compute.googleapis.com/Subnetwork` （4 件）
-
-#### `subnet-svc3` (location=`asia-northeast1`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/regions/asia-northeast1/subnetworks/subnet-svc3`
-- 担当ステップ: `gce_restore`
-- 期待 TF 型: `google_compute_subnetwork`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_subnetwork)
-- 推奨コマンド:
-  ```bash
-  gcloud compute networks subnets describe subnet-svc3 --region=asia-northeast1 --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute networks subnets create subnet-svc3 --project=<DST_HOST_PROJECT_ID> --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
-  ```
-
-#### `subnet-svc1` (location=`asia-northeast1`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/regions/asia-northeast1/subnetworks/subnet-svc1`
-- 担当ステップ: `gce_restore`
-- 期待 TF 型: `google_compute_subnetwork`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_subnetwork)
-- 推奨コマンド:
-  ```bash
-  gcloud compute networks subnets describe subnet-svc1 --region=asia-northeast1 --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute networks subnets create subnet-svc1 --project=<DST_HOST_PROJECT_ID> --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
-  ```
-
-#### `tokyo-2` (location=`asia-northeast1`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/regions/asia-northeast1/subnetworks/tokyo-2`
-- 担当ステップ: `gce_restore`
-- 期待 TF 型: `google_compute_subnetwork`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_subnetwork)
-- 推奨コマンド:
-  ```bash
-  gcloud compute networks subnets describe tokyo-2 --region=asia-northeast1 --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute networks subnets create tokyo-2 --project=<DST_HOST_PROJECT_ID> --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
-  ```
-
-#### `tokyo` (location=`asia-northeast1`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/regions/asia-northeast1/subnetworks/tokyo`
-- 担当ステップ: `gce_restore`
-- 期待 TF 型: `google_compute_subnetwork`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_subnetwork)
-- 推奨コマンド:
-  ```bash
-  gcloud compute networks subnets describe tokyo --region=asia-northeast1 --project=<SRC_HOST_PROJECT_ID>
-  gcloud compute networks subnets create tokyo --project=<DST_HOST_PROJECT_ID> --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
-  ```
-
 ### `iam.googleapis.com/Role` （1 件）
 
 #### `migrationSrcReader` (location=`global`)
@@ -372,6 +206,32 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   ```bash
   gcloud iam roles describe migrationSrcReader --project=<SRC_HOST_PROJECT_ID>
   gcloud iam roles create migrationSrcReader --project=<DST_HOST_PROJECT_ID> --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
+  ```
+
+### `iam.googleapis.com/ServiceAccount` （2 件）
+
+#### `org-host-viewer@<SRC_HOST_PROJECT_ID>.iam.gserviceaccount.com` (location=`global`)
+
+- full name: `//iam.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/serviceAccounts/org-host-viewer@<SRC_HOST_PROJECT_ID>.iam.gserviceaccount.com`
+- 担当ステップ: `terraform_apply`
+- 期待 TF 型: `google_service_account`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_service_account)
+- 推奨コマンド:
+  ```bash
+  gcloud iam service-accounts describe org-host-viewer@<SRC_HOST_PROJECT_ID>.iam.gserviceaccount.com --project=<SRC_HOST_PROJECT_ID>
+  gcloud iam service-accounts create org-host-viewer --project=<DST_HOST_PROJECT_ID> --display-name=<DISPLAY_NAME>
+  ```
+
+#### `1035210593832-compute@developer.gserviceaccount.com` (location=`global`)
+
+- full name: `//iam.googleapis.com/projects/<SRC_HOST_PROJECT_ID>/serviceAccounts/1035210593832-compute@developer.gserviceaccount.com`
+- 担当ステップ: `terraform_apply`
+- 期待 TF 型: `google_service_account`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_service_account)
+- 推奨コマンド:
+  ```bash
+  gcloud iam service-accounts describe 1035210593832-compute@developer.gserviceaccount.com --project=<SRC_HOST_PROJECT_ID>
+  gcloud iam service-accounts create 1035210593832-compute --project=<DST_HOST_PROJECT_ID> --display-name=<DISPLAY_NAME>
   ```
 
 ### `logging.googleapis.com/LogBucket` （2 件）
@@ -780,7 +640,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 
 ## プロジェクト: `<SRC_SERVICE_PROJECT_ID_1>` → `<DST_SERVICE_PROJECT_ID_1>`
 
-- CAI 検出リソース: **91** 件 / TF 出力リソース: **3** 件 / 一致: **1** 件 / 欠落候補: **90** 件
+- CAI 検出リソース: **102** 件 / TF 出力リソース: **24** 件 / 一致: **1** 件 / 欠落候補: **101** 件
 
 ### `cloudbilling.googleapis.com/ProjectBillingInfo` （1 件）
 
@@ -1068,7 +928,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-e2-std4-01 --project=<DST_SERVICE_PROJECT_ID_1> --source-snapshot=<SNAPSHOT>
   ```
 
-### `compute.googleapis.com/Instance` （7 件）
+### `compute.googleapis.com/Instance` （8 件）
 
 #### `centos8-from-vmv` (location=`asia-northeast1-a`)
 
@@ -1142,6 +1002,18 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   gcloud compute instances create org-svc1-deb-n2-std2-02 --project=<DST_SERVICE_PROJECT_ID_1> --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
+#### `org-svc1-deb-e2-mic-01` (location=`asia-northeast1-a`)
+
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/zones/asia-northeast1-a/instances/org-svc1-deb-e2-mic-01`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_instance`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_instance)
+- 推奨コマンド:
+  ```bash
+  gcloud compute instances describe org-svc1-deb-e2-mic-01 --zone=asia-northeast1-a --project=<SRC_SERVICE_PROJECT_ID_1>
+  gcloud compute instances create org-svc1-deb-e2-mic-01 --project=<DST_SERVICE_PROJECT_ID_1> --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  ```
+
 #### `instance-1` (location=`asia-northeast1-b`)
 
 - full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/zones/asia-northeast1-b/instances/instance-1`
@@ -1206,21 +1078,127 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # compute.googleapis.com/Project は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
-### `compute.googleapis.com/ResourcePolicy` （1 件）
+### `compute.googleapis.com/Snapshot` （32 件）
 
-#### `default-schedule-1` (location=`asia-northeast1`)
+#### `windows-asia-northeast1-c-20260617184701-00v6d4t3` (location=`asia`)
 
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/regions/asia-northeast1/resourcePolicies/default-schedule-1`
-- 担当ステップ: `意図的対象外 (None)`
-- 期待 TF 型: `google_compute_resource_policy`
-- 判定理由: 意図的に対象外（マップで None 指定）
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/global/snapshots/windows-asia-northeast1-c-20260617184701-00v6d4t3`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
 - 推奨コマンド:
   ```bash
-  gcloud compute resource-policies describe default-schedule-1 --region=asia-northeast1 --project=<SRC_SERVICE_PROJECT_ID_1>
-  gcloud compute resource-policies create snapshot-schedule default-schedule-1 --project=<DST_SERVICE_PROJECT_ID_1> --region=asia-northeast1 --max-retention-days=<N> --daily-schedule --start-time=<HH:MM>
+  gcloud compute snapshots describe windows-asia-northeast1-c-20260617184701-00v6d4t3 --project=<SRC_SERVICE_PROJECT_ID_1>
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
   ```
 
-### `compute.googleapis.com/Snapshot` （22 件）
+#### `windows-asia-northeast1-c-20260616184701-hm0tx33z` (location=`asia`)
+
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/global/snapshots/windows-asia-northeast1-c-20260616184701-hm0tx33z`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
+- 推奨コマンド:
+  ```bash
+  gcloud compute snapshots describe windows-asia-northeast1-c-20260616184701-hm0tx33z --project=<SRC_SERVICE_PROJECT_ID_1>
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
+  ```
+
+#### `windows-asia-northeast1-c-20260615184701-v1ll0ank` (location=`asia`)
+
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/global/snapshots/windows-asia-northeast1-c-20260615184701-v1ll0ank`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
+- 推奨コマンド:
+  ```bash
+  gcloud compute snapshots describe windows-asia-northeast1-c-20260615184701-v1ll0ank --project=<SRC_SERVICE_PROJECT_ID_1>
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
+  ```
+
+#### `windows-asia-northeast1-c-20260614184701-566hr1iw` (location=`asia`)
+
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/global/snapshots/windows-asia-northeast1-c-20260614184701-566hr1iw`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
+- 推奨コマンド:
+  ```bash
+  gcloud compute snapshots describe windows-asia-northeast1-c-20260614184701-566hr1iw --project=<SRC_SERVICE_PROJECT_ID_1>
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
+  ```
+
+#### `windows-asia-northeast1-c-20260613184701-lgbhbc1p` (location=`asia`)
+
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/global/snapshots/windows-asia-northeast1-c-20260613184701-lgbhbc1p`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
+- 推奨コマンド:
+  ```bash
+  gcloud compute snapshots describe windows-asia-northeast1-c-20260613184701-lgbhbc1p --project=<SRC_SERVICE_PROJECT_ID_1>
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
+  ```
+
+#### `windows-asia-northeast1-c-20260612184701-v6bf8n0w` (location=`asia`)
+
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/global/snapshots/windows-asia-northeast1-c-20260612184701-v6bf8n0w`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
+- 推奨コマンド:
+  ```bash
+  gcloud compute snapshots describe windows-asia-northeast1-c-20260612184701-v6bf8n0w --project=<SRC_SERVICE_PROJECT_ID_1>
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
+  ```
+
+#### `windows-asia-northeast1-c-20260611184701-ml1eca73` (location=`asia`)
+
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/global/snapshots/windows-asia-northeast1-c-20260611184701-ml1eca73`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
+- 推奨コマンド:
+  ```bash
+  gcloud compute snapshots describe windows-asia-northeast1-c-20260611184701-ml1eca73 --project=<SRC_SERVICE_PROJECT_ID_1>
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
+  ```
+
+#### `windows-asia-northeast1-c-20260610184701-pgx90urt` (location=`asia`)
+
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/global/snapshots/windows-asia-northeast1-c-20260610184701-pgx90urt`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
+- 推奨コマンド:
+  ```bash
+  gcloud compute snapshots describe windows-asia-northeast1-c-20260610184701-pgx90urt --project=<SRC_SERVICE_PROJECT_ID_1>
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
+  ```
+
+#### `windows-asia-northeast1-c-20260609184701-4o7yirke` (location=`asia`)
+
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/global/snapshots/windows-asia-northeast1-c-20260609184701-4o7yirke`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
+- 推奨コマンド:
+  ```bash
+  gcloud compute snapshots describe windows-asia-northeast1-c-20260609184701-4o7yirke --project=<SRC_SERVICE_PROJECT_ID_1>
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
+  ```
+
+#### `windows-asia-northeast1-c-20260608184701-m36l3p3a` (location=`asia`)
+
+- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/global/snapshots/windows-asia-northeast1-c-20260608184701-m36l3p3a`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
+- 推奨コマンド:
+  ```bash
+  gcloud compute snapshots describe windows-asia-northeast1-c-20260608184701-m36l3p3a --project=<SRC_SERVICE_PROJECT_ID_1>
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
+  ```
 
 #### `centos8-snapshot` (location=`asia`)
 
@@ -1500,7 +1478,19 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   gcloud iam roles create migrationSrcReader --project=<DST_SERVICE_PROJECT_ID_1> --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
   ```
 
-### `iam.googleapis.com/ServiceAccount` （1 件）
+### `iam.googleapis.com/ServiceAccount` （2 件）
+
+#### `org-svc1-viewer@<SRC_SERVICE_PROJECT_ID_1>.iam.gserviceaccount.com` (location=`global`)
+
+- full name: `//iam.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_1>/serviceAccounts/org-svc1-viewer@<SRC_SERVICE_PROJECT_ID_1>.iam.gserviceaccount.com`
+- 担当ステップ: `terraform_apply`
+- 期待 TF 型: `google_service_account`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_service_account)
+- 推奨コマンド:
+  ```bash
+  gcloud iam service-accounts describe org-svc1-viewer@<SRC_SERVICE_PROJECT_ID_1>.iam.gserviceaccount.com --project=<SRC_SERVICE_PROJECT_ID_1>
+  gcloud iam service-accounts create org-svc1-viewer --project=<DST_SERVICE_PROJECT_ID_1> --display-name=<DISPLAY_NAME>
+  ```
 
 #### `1007606807581-compute@developer.gserviceaccount.com` (location=`global`)
 
@@ -1902,7 +1892,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 
 ## プロジェクト: `<SRC_SERVICE_PROJECT_ID_3>` → `<DST_SERVICE_PROJECT_ID_3>`
 
-- CAI 検出リソース: **176** 件 / TF 出力リソース: **3** 件 / 一致: **0** 件 / 欠落候補: **176** 件
+- CAI 検出リソース: **177** 件 / TF 出力リソース: **37** 件 / 一致: **13** 件 / 欠落候補: **164** 件
 
 ### `bigquery.googleapis.com/Dataset` （2 件）
 
@@ -1984,7 +1974,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # cloudresourcemanager.googleapis.com/Project は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
-### `compute.googleapis.com/Address` （7 件）
+### `compute.googleapis.com/Address` （6 件）
 
 #### `org-svc3-ub-c2-std4-01-ip` (location=`asia-northeast1`)
 
@@ -2056,18 +2046,6 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   ```bash
   gcloud compute addresses describe org-svc3-ub-e2-med-03-ip --region=asia-northeast1 --project=<SRC_SERVICE_PROJECT_ID_3>
   gcloud compute addresses create org-svc3-ub-e2-med-03-ip --project=<DST_SERVICE_PROJECT_ID_3> --region=asia-northeast1
-  ```
-
-#### `test` (location=`asia-northeast1`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/regions/asia-northeast1/addresses/test`
-- 担当ステップ: `terraform_apply`
-- 期待 TF 型: `google_compute_address/google_compute_global_address`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_address/google_compute_global_address)
-- 推奨コマンド:
-  ```bash
-  gcloud compute addresses describe test --region=asia-northeast1 --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud compute addresses create test --project=<DST_SERVICE_PROJECT_ID_3> --region=asia-northeast1
   ```
 
 ### `compute.googleapis.com/Disk` （6 件）
@@ -2142,92 +2120,6 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   ```bash
   gcloud compute disks describe org-svc3-ub-e2-med-01 --zone=asia-northeast1-a --project=<SRC_SERVICE_PROJECT_ID_3>
   gcloud compute disks create org-svc3-ub-e2-med-01 --project=<DST_SERVICE_PROJECT_ID_3> --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
-  ```
-
-### `compute.googleapis.com/Firewall` （7 件）
-
-#### `test` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/global/firewalls/test`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe test --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud compute firewall-rules create test --project=<DST_SERVICE_PROJECT_ID_3> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
-  ```
-
-#### `deny` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/global/firewalls/deny`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe deny --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud compute firewall-rules create deny --project=<DST_SERVICE_PROJECT_ID_3> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
-  ```
-
-#### `ib-network-allow-internal` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/global/firewalls/ib-network-allow-internal`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe ib-network-allow-internal --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud compute firewall-rules create ib-network-allow-internal --project=<DST_SERVICE_PROJECT_ID_3> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
-  ```
-
-#### `default-allow-ssh` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/global/firewalls/default-allow-ssh`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe default-allow-ssh --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud compute firewall-rules create default-allow-ssh --project=<DST_SERVICE_PROJECT_ID_3> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
-  ```
-
-#### `default-allow-internal` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/global/firewalls/default-allow-internal`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe default-allow-internal --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud compute firewall-rules create default-allow-internal --project=<DST_SERVICE_PROJECT_ID_3> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
-  ```
-
-#### `default-allow-rdp` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/global/firewalls/default-allow-rdp`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe default-allow-rdp --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud compute firewall-rules create default-allow-rdp --project=<DST_SERVICE_PROJECT_ID_3> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
-  ```
-
-#### `default-allow-icmp` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/global/firewalls/default-allow-icmp`
-- 担当ステップ: `network_firewall`
-- 期待 TF 型: `google_compute_firewall`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
-- 推奨コマンド:
-  ```bash
-  gcloud compute firewall-rules describe default-allow-icmp --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud compute firewall-rules create default-allow-icmp --project=<DST_SERVICE_PROJECT_ID_3> --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
   ```
 
 ### `compute.googleapis.com/Image` （4 件）
@@ -2392,19 +2284,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # compute.googleapis.com/InstanceSettings は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
-### `compute.googleapis.com/Network` （2 件）
-
-#### `ib-network` (location=`global`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/global/networks/ib-network`
-- 担当ステップ: `gce_restore`
-- 期待 TF 型: `google_compute_network`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_network)
-- 推奨コマンド:
-  ```bash
-  gcloud compute networks describe ib-network --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud compute networks create ib-network --project=<DST_SERVICE_PROJECT_ID_3> --subnet-mode=custom
-  ```
+### `compute.googleapis.com/Network` （1 件）
 
 #### `default` (location=`global`)
 
@@ -3084,7 +2964,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
   ```
 
-### `compute.googleapis.com/Subnetwork` （46 件）
+### `compute.googleapis.com/Subnetwork` （45 件）
 
 #### `default` (location=`asia-southeast3`)
 
@@ -3168,18 +3048,6 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   ```bash
   gcloud compute networks subnets describe default --region=europe-west10 --project=<SRC_SERVICE_PROJECT_ID_3>
   gcloud compute networks subnets create default --project=<DST_SERVICE_PROJECT_ID_3> --region=europe-west10 --network=<NETWORK> --range=<CIDR>
-  ```
-
-#### `tokyo` (location=`asia-northeast1`)
-
-- full name: `//compute.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/regions/asia-northeast1/subnetworks/tokyo`
-- 担当ステップ: `gce_restore`
-- 期待 TF 型: `google_compute_subnetwork`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_subnetwork)
-- 推奨コマンド:
-  ```bash
-  gcloud compute networks subnets describe tokyo --region=asia-northeast1 --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud compute networks subnets create tokyo --project=<DST_SERVICE_PROJECT_ID_3> --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`me-central1`)
@@ -3638,19 +3506,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   gcloud compute networks subnets create default --project=<DST_SERVICE_PROJECT_ID_3> --region=us-central1 --network=<NETWORK> --range=<CIDR>
   ```
 
-### `iam.googleapis.com/Role` （5 件）
-
-#### `incre3` (location=`global`)
-
-- full name: `//iam.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/roles/incre3`
-- 担当ステップ: `terraform_apply`
-- 期待 TF 型: `google_project_iam_custom_role`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_project_iam_custom_role)
-- 推奨コマンド:
-  ```bash
-  gcloud iam roles describe incre3 --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud iam roles create incre3 --project=<DST_SERVICE_PROJECT_ID_3> --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
-  ```
+### `iam.googleapis.com/Role` （2 件）
 
 #### `Incre` (location=`global`)
 
@@ -3676,31 +3532,19 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   gcloud iam roles create migrationSrcReader --project=<DST_SERVICE_PROJECT_ID_3> --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
   ```
 
-#### `incre2` (location=`global`)
+### `iam.googleapis.com/ServiceAccount` （3 件）
 
-- full name: `//iam.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/roles/incre2`
+#### `org-svc3-viewer@<SRC_SERVICE_PROJECT_ID_3>.iam.gserviceaccount.com` (location=`global`)
+
+- full name: `//iam.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/serviceAccounts/org-svc3-viewer@<SRC_SERVICE_PROJECT_ID_3>.iam.gserviceaccount.com`
 - 担当ステップ: `terraform_apply`
-- 期待 TF 型: `google_project_iam_custom_role`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_project_iam_custom_role)
+- 期待 TF 型: `google_service_account`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_service_account)
 - 推奨コマンド:
   ```bash
-  gcloud iam roles describe incre2 --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud iam roles create incre2 --project=<DST_SERVICE_PROJECT_ID_3> --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
+  gcloud iam service-accounts describe org-svc3-viewer@<SRC_SERVICE_PROJECT_ID_3>.iam.gserviceaccount.com --project=<SRC_SERVICE_PROJECT_ID_3>
+  gcloud iam service-accounts create org-svc3-viewer --project=<DST_SERVICE_PROJECT_ID_3> --display-name=<DISPLAY_NAME>
   ```
-
-#### `incre` (location=`global`)
-
-- full name: `//iam.googleapis.com/projects/<SRC_SERVICE_PROJECT_ID_3>/roles/incre`
-- 担当ステップ: `terraform_apply`
-- 期待 TF 型: `google_project_iam_custom_role`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_project_iam_custom_role)
-- 推奨コマンド:
-  ```bash
-  gcloud iam roles describe incre --project=<SRC_SERVICE_PROJECT_ID_3>
-  gcloud iam roles create incre --project=<DST_SERVICE_PROJECT_ID_3> --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
-  ```
-
-### `iam.googleapis.com/ServiceAccount` （2 件）
 
 #### `incredibuild@<SRC_SERVICE_PROJECT_ID_3>.iam.gserviceaccount.com` (location=`global`)
 
@@ -4061,4 +3905,4 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   ```
 
 ---
-合計欠落候補: **327** 件
+合計欠落候補: **315** 件
