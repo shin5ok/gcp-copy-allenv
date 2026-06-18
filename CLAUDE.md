@@ -90,3 +90,8 @@ make vmware-all # VMware → GCE フル処理
   - `🤖 Generated with Claude Code` などの行も付けない
   - 勝手にコミットやプッシュしない
 
+## ツール
+以下のツールを積極的に使う
+- GCP関連のコードは、Developer Knowledge APIを積極的に使う
+- それ以外はContext7で最新のドキュメントを確認する
+
