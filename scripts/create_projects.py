@@ -6,6 +6,7 @@
 - ログは sync_env.py と同じ logs/<timestamp>/dst.log 系統に書き出す。
 """
 import argparse
+import concurrent.futures
 import sys
 import os
 import time
@@ -62,7 +63,9 @@ class ProjectProvisioner:
         self.dry_run_override = dry_run_override
         self.verbose_override = verbose_override
         self.run_dir: str = ""
-        # 統計
+        self.parallel_jobs: int = 8
+        # 統計（並列 worker から書くため lock 保護）
+        self._lock = threading.Lock()
         self.created = 0
         self.skipped = 0
         self.failed = 0
@@ -81,6 +84,7 @@ class ProjectProvisioner:
         global_cfg = self.config.get('global', {})
         self.dry_run = global_cfg.get('dry_run', True)
         self.verbose = global_cfg.get('verbose_logging', True)
+        self.parallel_jobs = int(global_cfg.get('parallel_jobs', 8))
         if self.dry_run_override is not None:
             self.dry_run = self.dry_run_override
         if self.verbose_override is not None:
@@ -183,6 +187,71 @@ class ProjectProvisioner:
         )
         return res is not None and res != ""
 
+    def _provision_one(self, pid: str, folder_id: Optional[str],
+                       org_id: Optional[str], billing: str):
+        """1 プロジェクト分の describe → create → billing link → enable を実行。
+
+        並列 worker から呼ばれるため:
+        - カウンタ更新は `self._lock` で保護
+        - run_command は allow_fail=True で失敗を局所化（sys.exit で他 worker を巻き添えに
+          しない）。失敗時はその時点で counter を進めて return（後続ステップはスキップ）。
+        """
+        self.logger.info(f"  → {pid}")
+        if self.project_exists(pid):
+            self.logger.info(f"    ✓ {pid} は既存。作成をスキップ")
+            with self._lock:
+                self.skipped += 1
+        else:
+            cmd = f"gcloud projects create {pid}"
+            if folder_id:
+                cmd += f" --folder={folder_id}"
+            elif org_id:
+                cmd += f" --organization={org_id}"
+            res = self.run_command(
+                cmd, desc=f"Create {pid}",
+                explanation=f"新規 dst プロジェクト {pid} を作成",
+                allow_fail=True,
+            )
+            if res is None:
+                with self._lock:
+                    self.failed += 1
+                return
+            with self._lock:
+                self.created += 1
+
+        res = self.run_command(
+            f"gcloud beta billing projects link {pid} --billing-account={billing}",
+            desc=f"Link billing {pid}",
+            explanation=f"請求アカウント {billing} を {pid} に紐付け",
+            allow_fail=True,
+        )
+        if res is None:
+            with self._lock:
+                self.failed += 1
+            return
+
+        # Terraform の google_project_service / data ソースが依存する基盤 API も
+        # 必ず有効化する。CRM/ServiceUsage が無効だと sync_env.py の Step 4 で
+        # "Cloud Resource Manager API has not been used in project ... before" の
+        # 403 が出て apply が止まる。
+        prereq_apis = " ".join([
+            "compute.googleapis.com",
+            "dns.googleapis.com",
+            "cloudresourcemanager.googleapis.com",
+            "serviceusage.googleapis.com",
+            "iam.googleapis.com",
+            "iamcredentials.googleapis.com",
+        ])
+        res = self.run_command(
+            f"gcloud services enable {prereq_apis} --project={pid}",
+            desc=f"Enable APIs {pid}",
+            explanation=f"{pid} で Terraform 必須 API を有効化",
+            allow_fail=True,
+        )
+        if res is None:
+            with self._lock:
+                self.failed += 1
+
     def provision(self):
         self.load_config()
         self.logger.info("=" * 60)
@@ -214,43 +283,23 @@ class ProjectProvisioner:
             self.logger.info("dst プロジェクトが mapping にありません。何もしません。")
             return
 
-        for pid in projects:
-            self.logger.info(f"  → {pid}")
-            if self.project_exists(pid):
-                self.logger.info(f"    ✓ {pid} は既存。作成をスキップ")
-                self.skipped += 1
-            else:
-                cmd = f"gcloud projects create {pid}"
-                if folder_id:
-                    cmd += f" --folder={folder_id}"
-                elif org_id:
-                    cmd += f" --organization={org_id}"
-                self.run_command(cmd, desc=f"Create {pid}",
-                                 explanation=f"新規 dst プロジェクト {pid} を作成")
-                self.created += 1
+        self.logger.info(
+            f"  対象 dst プロジェクト: {len(projects)} 件 (parallel_jobs={self.parallel_jobs})"
+        )
 
-            self.run_command(
-                f"gcloud beta billing projects link {pid} --billing-account={billing}",
-                desc=f"Link billing {pid}",
-                explanation=f"請求アカウント {billing} を {pid} に紐付け",
-            )
-            # Terraform の google_project_service / data ソースが依存する基盤 API も
-            # 必ず有効化する。CRM/ServiceUsage が無効だと sync_env.py の Step 4 で
-            # "Cloud Resource Manager API has not been used in project ... before" の
-            # 403 が出て apply が止まる。
-            prereq_apis = " ".join([
-                "compute.googleapis.com",
-                "dns.googleapis.com",
-                "cloudresourcemanager.googleapis.com",
-                "serviceusage.googleapis.com",
-                "iam.googleapis.com",
-                "iamcredentials.googleapis.com",
-            ])
-            self.run_command(
-                f"gcloud services enable {prereq_apis} --project={pid}",
-                desc=f"Enable APIs {pid}",
-                explanation=f"{pid} で Terraform 必須 API を有効化",
-            )
+        def worker(pid: str):
+            self._provision_one(pid, folder_id, org_id, billing)
+
+        if self.parallel_jobs <= 1 or len(projects) <= 1:
+            for pid in projects:
+                worker(pid)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.parallel_jobs, thread_name_prefix="proj",
+            ) as ex:
+                futures = [ex.submit(worker, pid) for pid in projects]
+                for f in concurrent.futures.as_completed(futures):
+                    f.result()
 
         # サマリ
         bar = "━" * 60

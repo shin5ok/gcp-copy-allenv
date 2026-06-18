@@ -135,3 +135,88 @@ def test_provision_production(mock_run, temp_dir):
         "iamcredentials.googleapis.com",
     ):
         assert api in cmds[3], f"missing prereq API in enable command: {api}"
+
+
+@patch("subprocess.run")
+def test_provision_parallel_counters(mock_run, temp_dir):
+    """並列 worker から counter (created / failed) を更新しても整合する。"""
+    config_data = {
+        "global": {
+            "log_dir": os.path.join(temp_dir, "logs"),
+            "dry_run": False,
+            "parallel_jobs": 4,
+        },
+        "bootstrap": {"org_id": "111", "billing_account": "AAAA-BBBB-CCCC"},
+        "project_mapping": {
+            "host_project": {"src": "s-host", "dst": "d-host"},
+            "service_projects": [
+                {"src": "s-1", "dst": "d-1"},
+                {"src": "s-2", "dst": "d-2"},
+            ],
+        },
+    }
+    config_path = os.path.join(temp_dir, "config.yaml")
+    _write_yaml(config_path, config_data)
+
+    def side(args, **kw):
+        cmd = args[0] if isinstance(args, (list, tuple)) else args
+        if "projects describe" in cmd:
+            return MagicMock(returncode=1, stderr="Not found")
+        return MagicMock(returncode=0, stdout="OK", stderr="")
+
+    mock_run.side_effect = side
+    p = ProjectProvisioner(config_path, dry_run_override=False)
+    p.provision()
+
+    assert p.created == 3
+    assert p.skipped == 0
+    assert p.failed == 0
+    cmds = [call[0][0] for call in mock_run.call_args_list]
+    for pid in ("d-host", "d-1", "d-2"):
+        assert any(f"gcloud projects create {pid} --organization=111" in c for c in cmds)
+        assert any(f"billing projects link {pid}" in c for c in cmds)
+        assert any(f"services enable" in c and f"--project={pid}" in c for c in cmds)
+
+
+@patch("subprocess.run")
+def test_provision_parallel_failure_isolated(mock_run, temp_dir):
+    """1 つのプロジェクトの create が失敗しても他の worker は完走し、failed のみ加算される。"""
+    config_data = {
+        "global": {
+            "log_dir": os.path.join(temp_dir, "logs"),
+            "dry_run": False,
+            "parallel_jobs": 4,
+        },
+        "bootstrap": {"org_id": "111", "billing_account": "AAAA-BBBB-CCCC"},
+        "project_mapping": {
+            "host_project": {"src": "s-host", "dst": "d-host"},
+            "service_projects": [
+                {"src": "s-1", "dst": "d-bad"},
+                {"src": "s-2", "dst": "d-2"},
+            ],
+        },
+    }
+    config_path = os.path.join(temp_dir, "config.yaml")
+    _write_yaml(config_path, config_data)
+
+    def side(args, **kw):
+        cmd = args[0] if isinstance(args, (list, tuple)) else args
+        if "projects describe" in cmd:
+            return MagicMock(returncode=1, stderr="Not found")
+        if "projects create d-bad" in cmd:
+            return MagicMock(returncode=1, stderr="API error", stdout="")
+        return MagicMock(returncode=0, stdout="OK", stderr="")
+
+    mock_run.side_effect = side
+    p = ProjectProvisioner(config_path, dry_run_override=False)
+    p.provision()
+
+    assert p.failed == 1
+    assert p.created == 2
+    cmds = [call[0][0] for call in mock_run.call_args_list]
+    # d-bad の後続 (link / enable) は呼ばれない（failed で return しているため）
+    assert not any("billing projects link d-bad" in c for c in cmds)
+    assert not any(f"services enable" in c and "--project=d-bad" in c for c in cmds)
+    # 他プロジェクトは完走している
+    for pid in ("d-host", "d-2"):
+        assert any(f"billing projects link {pid}" in c for c in cmds)

@@ -49,14 +49,18 @@ make vmware-all # VMware → GCE フル処理
 
 | ステップ | 並列単位 | 備考 |
 |---|---|---|
+| 0a create-projects (provision) | dst プロジェクト | `create_projects.py:_provision_one` を ThreadPoolExecutor で並列化。counter は `self._lock` 保護 |
+| 0b SA preflight (`check_service_accounts`) | (SA, project) | `make plan` / `make run` の最初に毎回走る。token 発行 + testIamPermissions を並列化 |
 | 1 cai_scan | プロジェクト | src read-only |
 | 2 gce_snapshot | プロジェクト | 既存 |
 | 3 bulk_export | プロジェクト | 既存 |
+| 4 terraform_apply (init / plan / apply) | プロジェクト (Terraform ルート) | 各 `terraform/active/<src>/` は state 分離済。`_terraform_one_project` を `_parallel_for_each` で並列化 |
 | 4.5 network_firewall (classic rules) | ルール | `_sync_classic_firewall_rules` 内 |
 | 4.5 network_firewall (policy rules) | ルール | `_sync_fw_policy_rules` 内 |
 | 5 gce_restore (listing) | プロジェクト | VM/snap 一覧並列取得 |
 | 5 gce_restore (restore) | **VM** | flat (project, vm) units で並列 |
 | 5 secondary disks (create) | ディスク | attach は同一 VM 内で直列（409 回避） |
+| 5.5 power state (stop / suspend) | VM | `_finalize_vm_power_states` の pending を並列実行 |
 | 6 data_sync (GCS/BQ) | バケット / テーブル | 既存 |
 
 実装ルール:
