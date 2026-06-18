@@ -127,6 +127,21 @@ steps:
   terraform_apply:
     enabled: true
 
+  # [Step 4.5] host project のファイアウォールルール・ポリシーを dst に複製
+  # bulk-export は network_firewall_policy を出力しないため gcloud で直接同期する
+  network_firewall:
+    enabled: true
+    # Secure tag (tagValues/<数値ID>) は ORG スコープの permanent ID で、
+    # 別 ORG にコピーすると dst には存在せず rules create が
+    # 「Could not fetch resource:」で失敗する。
+    # dst ORG で同等タグを作成し、src→dst の tagValues をここにマッピングすると
+    # 該当ルールも複製される。未指定のタグを参照するルールは
+    # （FW を意図せず緩めないため）エラーにせずスキップし WARNING を出す。
+    # 例:
+    # secure_tag_map:
+    #   "tagValues/281483307237001": "tagValues/449632198855123"  # env=prod
+    secure_tag_map: {}
+
   # [Step 5] GCE VM 復元 (スナップショットから復元したディスクをVMに紐付け起動)
   gce_restore:
     enabled: true

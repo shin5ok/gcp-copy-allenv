@@ -77,9 +77,8 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud compute network-firewall-policies list",
     "gcloud compute network-firewall-policies describe",
     "gcloud compute network-firewall-policies create",
-    "gcloud compute network-firewall-policies rules list",
+    "gcloud compute network-firewall-policies rules describe",
     "gcloud compute network-firewall-policies rules create",
-    "gcloud compute network-firewall-policies associations list",
     "gcloud compute network-firewall-policies associations create",
     "gcloud services enable",
     "bq ls",
@@ -141,6 +140,21 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
 }
 
 
+def fw_rule_scope_flag(scope_flag: str) -> str:
+    """ポリシー scope flag を rules / associations サブコマンド用に変換する。
+
+    `network-firewall-policies` の list/describe/create はポリシー自体の scope を
+    `--global` / `--region=R` で指定するが、`rules ...` と `associations create`
+    サブコマンドは `--global-firewall-policy` / `--firewall-policy-region=R` を
+    要求する（gcloud CLI 仕様）。
+    """
+    if scope_flag == "--global":
+        return "--global-firewall-policy"
+    if scope_flag.startswith("--region="):
+        return "--firewall-policy-region=" + scope_flag.split("=", 1)[1]
+    return scope_flag
+
+
 def fw_policy_rule_layer4(rule: Dict[str, Any]) -> str:
     """FW policy rule の match.layer4Configs を gcloud --layer4-configs 文字列に変換する (ISSUE-02)。
 
@@ -163,18 +177,43 @@ def fw_policy_rule_layer4(rule: Dict[str, Any]) -> str:
     return ",".join(parts) if parts else "all"
 
 
+def fw_policy_rule_secure_tags(rule: Dict[str, Any]) -> List[str]:
+    """rule が参照する全 secure tag name (`tagValues/<id>` など) を返す。
+
+    `match.srcSecureTags` と `targetSecureTags` の両方を対象にする。
+    """
+    match = rule.get('match', {}) or {}
+    names = [t.get('name') for t in match.get('srcSecureTags') or [] if t.get('name')]
+    names += [t.get('name') for t in rule.get('targetSecureTags') or [] if t.get('name')]
+    return names
+
+
 def fw_policy_rule_flags(
     rule: Dict[str, Any], proj_id_map: Dict[str, str],
+    secure_tag_map: Optional[Dict[str, str]] = None,
 ) -> List[str]:
-    """FW policy rule dict を gcloud `rules create` 用の追加フラグリストに変換する (ISSUE-02)。
+    """FW policy rule dict を gcloud `rules create` 用の追加フラグリストに変換する。
 
     呼び出し側が prefix (`rules create <priority> --firewall-policy=... --action=... --direction=...
     --layer4-configs=...`) を作り、その後ろに append する想定。
 
-    対応フィールド: srcIpRanges / destIpRanges / srcSecureTags / targetSecureTags /
-    targetServiceAccounts / disabled / enableLogging / description /
-    srcNetworkScope / srcRegionCodes / destRegionCodes
+    REST API の FirewallPolicyRule スキーマ全フィールドに対応:
+      match 内 (リスト/文字列):
+        srcIpRanges / destIpRanges / srcRegionCodes / destRegionCodes /
+        srcThreatIntelligences / destThreatIntelligences /
+        srcAddressGroups / destAddressGroups / srcFqdns / destFqdns /
+        srcNetworks / srcSecureTags
+      match 内 (enum → 文字列):
+        srcNetworkScope (--src-network-context)
+      ルール直下:
+        targetSecureTags / targetServiceAccounts / disabled / enableLogging /
+        description / securityProfileGroup / tlsInspect
     SA email 中の src プロジェクト ID は proj_id_map で dst へ置換する。
+
+    secure tag (`tagValues/<id>`) は ORG スコープの permanent ID で別 ORG には存在しない。
+    `secure_tag_map` (src tagValues/... → dst tagValues/...) で dst の値へ変換する。
+    map に無いタグは無視する（呼び出し側が事前にスキップ判定する想定）。
+    `secure_tag_map=None` の場合は変換せずそのまま（同一 ORG コピー時の後方互換）。
     """
     flags: List[str] = []
     match = rule.get('match', {}) or {}
@@ -184,17 +223,41 @@ def fw_policy_rule_flags(
         if vals:
             flags.append(f"{flag}={','.join(str(v) for v in vals)}")
 
-    _join_or_skip('srcIpRanges',     '--src-ip-ranges', match)
-    _join_or_skip('destIpRanges',    '--dest-ip-ranges', match)
-    _join_or_skip('srcRegionCodes',  '--src-region-codes', match)
-    _join_or_skip('destRegionCodes', '--dest-region-codes', match)
+    # --- match 内リストフィールド (JSON key → gcloud flag) ---
+    _join_or_skip('srcIpRanges',            '--src-ip-ranges', match)
+    _join_or_skip('destIpRanges',           '--dest-ip-ranges', match)
+    _join_or_skip('srcRegionCodes',         '--src-region-codes', match)
+    _join_or_skip('destRegionCodes',        '--dest-region-codes', match)
+    _join_or_skip('srcThreatIntelligences',  '--src-threat-intelligence', match)
+    _join_or_skip('destThreatIntelligences', '--dest-threat-intelligence', match)
+    _join_or_skip('srcAddressGroups',        '--src-address-groups', match)
+    _join_or_skip('destAddressGroups',       '--dest-address-groups', match)
+    _join_or_skip('srcFqdns',               '--src-fqdns', match)
+    _join_or_skip('destFqdns',              '--dest-fqdns', match)
+    _join_or_skip('srcNetworks',            '--src-networks', match)
 
-    # secure tag は name (`tagValues/...` フル形式) で渡す
-    src_tags = [t.get('name') for t in match.get('srcSecureTags') or [] if t.get('name')]
+    # srcNetworkScope は enum 文字列 (INTERNET / NON_INTERNET / VPC_NETWORKS / INTRA_VPC)
+    # gcloud では --src-network-context に対応
+    src_net_scope = match.get('srcNetworkScope')
+    if src_net_scope:
+        flags.append(f"--src-network-context={src_net_scope}")
+
+    # secure tag は name (`tagValues/...` フル形式) で渡す。別 ORG コピー時は
+    # secure_tag_map で dst 側の値に変換する（map=None なら変換せずそのまま）。
+    def _remap_tags(names: List[str]) -> List[str]:
+        if secure_tag_map is None:
+            return names
+        return [secure_tag_map[n] for n in names if n in secure_tag_map]
+
+    src_tags = _remap_tags(
+        [t.get('name') for t in match.get('srcSecureTags') or [] if t.get('name')]
+    )
     if src_tags:
         flags.append(f"--src-secure-tags={','.join(src_tags)}")
 
-    tgt_tags = [t.get('name') for t in rule.get('targetSecureTags') or [] if t.get('name')]
+    tgt_tags = _remap_tags(
+        [t.get('name') for t in rule.get('targetSecureTags') or [] if t.get('name')]
+    )
     if tgt_tags:
         flags.append(f"--target-secure-tags={','.join(tgt_tags)}")
 
@@ -216,10 +279,41 @@ def fw_policy_rule_flags(
 
     desc = rule.get('description')
     if desc:
-        # description にはスペースを含むため shlex.quote で囲む
         flags.append(f"--description={shlex.quote(desc)}")
 
+    # securityProfileGroup / tlsInspect (Cloud NGFW L7 inspection)
+    spg = rule.get('securityProfileGroup')
+    if spg:
+        flags.append(f"--security-profile-group={spg}")
+
+    if rule.get('tlsInspect'):
+        flags.append("--tls-inspect")
+
     return flags
+
+
+def _parse_gcloud_describe_json(raw: Optional[str]) -> Dict[str, Any]:
+    """`gcloud ... describe --format=json` の出力を dict として安全に返す。
+
+    一部の gcloud SDK バージョン / リソース種では describe が単体オブジェクトでは
+    なく 1 要素配列 `[{...}]` で返ってくる（compute network-firewall-policies で
+    実機確認、AttributeError: 'list' object has no attribute 'get' を誘発）。
+    空文字 / JSON 解析失敗 / 想定外の型のいずれも空 dict にフォールバックする。
+    """
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+    if isinstance(obj, list):
+        # 1 要素配列形式を吸収。複数 / 空配列は「不明」として空 dict 扱い。
+        if len(obj) == 1 and isinstance(obj[0], dict):
+            return obj[0]
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    return {}
 
 
 def diff_coverage(asset_types: List[str]) -> Tuple[List[str], List[str]]:
@@ -1437,27 +1531,33 @@ class MigrationOrchestrator:
                 return json.dumps([{"name": "shared-policy"}])
             return json.dumps([])
 
-        if cmd.strip().startswith("gcloud compute network-firewall-policies rules list"):
-            logger.info(f"{tag}[MOCK] ファイアウォールポリシールール一覧をシミュレート")
-            return json.dumps([
-                {
-                    "priority": 1000, "action": "allow", "direction": "INGRESS",
-                    "match": {
-                        "srcIpRanges": ["10.0.0.0/8"],
-                        "layer4Configs": [
-                            {"ipProtocol": "tcp", "ports": ["80", "443"]},
-                            {"ipProtocol": "udp", "ports": ["53"]},
+        if (
+            cmd.strip().startswith("gcloud compute network-firewall-policies describe")
+            and "--format=json" in cmd
+        ):
+            logger.info(f"{tag}[MOCK] ネットワークファイアウォールポリシー describe をシミュレート")
+            # describe の出力に rules / associations を埋め込む（実 CLI と同じ構造）
+            return json.dumps({
+                "name": "shared-policy",
+                "rules": [
+                    {
+                        "priority": 1000, "action": "allow", "direction": "INGRESS",
+                        "match": {
+                            "srcIpRanges": ["10.0.0.0/8"],
+                            "layer4Configs": [
+                                {"ipProtocol": "tcp", "ports": ["80", "443"]},
+                                {"ipProtocol": "udp", "ports": ["53"]},
+                            ],
+                        },
+                        "targetServiceAccounts": [
+                            "app-sa@shingo-ar-sharedhost0926.iam.gserviceaccount.com",
                         ],
+                        "enableLogging": True,
+                        "description": "web ingress (mock)",
                     },
-                    "targetServiceAccounts": ["app-sa@shingo-ar-sharedhost0926.iam.gserviceaccount.com"],
-                    "enableLogging": True,
-                    "description": "web ingress (mock)",
-                },
-            ])
-
-        if cmd.strip().startswith("gcloud compute network-firewall-policies associations list"):
-            logger.info(f"{tag}[MOCK] ファイアウォールポリシーアソシエーション一覧をシミュレート")
-            return json.dumps([])
+                ],
+                "associations": [],
+            })
 
         if cmd.strip().startswith("gcloud storage buckets list"):
             logger.info(f"{tag}[MOCK] バケット一覧をシミュレート ({proj_id})")
@@ -2354,6 +2454,15 @@ resource "google_storage_bucket" "mock_bucket" {{
         if 'resource "google_compute_disk"' in content:
             return "disk は Step5（スナップショット復元）が管理するため除外"
 
+        # BigQuery dataset / table は Step 6 (data_sync) が `bq mk` / `bq cp` で
+        # 作る所有モデル（_ASSET_COVERAGE で data_sync 担当と宣言済み）。
+        # terraform 側に残すと「dataset 未作成のまま table を作ろうとして 404」
+        # （例: Not found: Dataset <proj>:<ds>）になる。
+        if 'resource "google_bigquery_dataset"' in content:
+            return "BQ dataset は Step6 (data_sync) が bq mk で作成するため除外"
+        if 'resource "google_bigquery_table"' in content:
+            return "BQ table は Step6 (data_sync) が bq cp で作成するため除外"
+
         # NAT 用に自動払い出しされる外部 IP は手動作成できない。
         if 'resource "google_compute_address"' in content and \
                 re.search(r'\bpurpose\s*=\s*"NAT_AUTO"', content):
@@ -2894,10 +3003,10 @@ resource "google_storage_bucket" "mock_bucket" {{
         except Exception:
             rules = []
 
-        for rule in rules:
+        def rule_worker(rule):
             name = rule.get('name', '')
             if not name:
-                continue
+                return
 
             if self._gcloud_exists(
                 f"gcloud compute firewall-rules describe {name} --project={dst_host} "
@@ -2905,7 +3014,7 @@ resource "google_storage_bucket" "mock_bucket" {{
                 dst_sa,
             ):
                 self.dst_logger.info(f"    FW rule '{name}' は既存。スキップ")
-                continue
+                return
 
             # ネットワーク名を src → dst に置換（URL 末尾から取得）
             net_url = rule.get('network', '')
@@ -2920,7 +3029,7 @@ resource "google_storage_bucket" "mock_bucket" {{
             action_flag, proto_list = self._fw_action_and_rules(allowed, denied)
             if not action_flag:
                 self.dst_logger.warning(f"    FW rule '{name}': allowed/denied が空のためスキップ")
-                continue
+                return
 
             cmd = (
                 f"gcloud compute firewall-rules create {name} "
@@ -2956,6 +3065,10 @@ resource "google_storage_bucket" "mock_bucket" {{
                 impersonate_sa=dst_sa, allow_fail=True,
             )
 
+        # 各 FW ルールは独立して create 可能（gcloud は個別 API 呼び出し）。
+        # 並列化でスループット向上。
+        self._parallel_for_each(rules, rule_worker, f"fw-rule-{dst_host}")
+
     @staticmethod
     def _fw_action_and_rules(allowed: list, denied: list) -> tuple:
         """allowed/denied リストから (--allow/--deny フラグ名, ルール文字列) を返す。"""
@@ -2988,14 +3101,20 @@ resource "google_storage_bucket" "mock_bucket" {{
         proj_map = self._build_proj_id_map()
 
         # global + region 両スコープを巡回する。region 検出は src の subnet 一覧から推定。
-        scopes: List[Tuple[str, str]] = [("--global", "global")]
+        # gcloud のフラグ仕様がサブコマンドごとに異なる:
+        #   - `list`              : `--regions=R1,R2,...`（複数形）
+        #   - `describe`/`create` : `--region=R`（単数, ポリシー scope）
+        #   - `rules ...` / `associations create`
+        #                         : `--firewall-policy-region=R` / `--global-firewall-policy`
+        # ここでは前者 2 種を tuple で持ち、3 番目は fw_rule_scope_flag() で変換する。
+        scopes: List[Tuple[str, str, str]] = [("--global", "--global", "global")]
         for region in sorted(self._discover_src_regions(src_host, src_sa)):
-            scopes.append((f"--region={region}", region))
+            scopes.append((f"--regions={region}", f"--region={region}", region))
 
-        for scope_flag, scope_label in scopes:
+        for list_scope_flag, scope_flag, scope_label in scopes:
             raw = self.run_command(
                 f"gcloud compute network-firewall-policies list "
-                f"--project={src_host} {scope_flag} --format=json",
+                f"--project={src_host} {list_scope_flag} --format=json",
                 side="src", logger=self.org_logger,
                 desc=f"List FW Policies {src_host} ({scope_label})",
                 explanation=f"{src_host} の FW ポリシー一覧取得 (scope={scope_label})",
@@ -3066,49 +3185,85 @@ resource "google_storage_bucket" "mock_bucket" {{
             src_host, dst_host, src_sa, dst_sa, proj_map,
         )
 
+    def _fw_secure_tag_map(self) -> Dict[str, str]:
+        """config の steps.network_firewall.secure_tag_map を返す（未設定なら空）。
+
+        src の secure tag (`tagValues/<id>`) は ORG スコープの permanent ID で
+        dst ORG には存在しないため、dst の値へ変換するための map。
+        """
+        m = (
+            self.config.get('steps', {})
+            .get('network_firewall', {})
+            .get('secure_tag_map', {})
+        )
+        return m if isinstance(m, dict) else {}
+
     def _sync_fw_policy_rules(
         self, pname: str, scope_flag: str, scope_label: str,
         src_host: str, dst_host: str,
         src_sa: Optional[str], dst_sa: Optional[str],
         proj_map: Dict[str, str],
     ):
-        rules_raw = self.run_command(
-            f"gcloud compute network-firewall-policies rules list "
-            f"--firewall-policy={pname} --project={src_host} {scope_flag} --format=json",
+        """ポリシー pname のルールを並列に作成する。
+
+        各ルールは異なる priority を持ち、独立して create できる（gcloud は
+        rule の priority 単位で個別 API 呼び出し）。`_parallel_for_each` で
+        スループットを稼ぐ（既存/未マップタグのスキップ判定も並列実行で OK）。
+        """
+        # `network-firewall-policies rules list` というサブコマンドは存在しない
+        # （gcloud 公式 CLI に未実装）。ルール一覧は `describe --format=json` の
+        # `rules` フィールドから取得する。
+        policy_raw = self.run_command(
+            f"gcloud compute network-firewall-policies describe {pname} "
+            f"--project={src_host} {scope_flag} --format=json",
             side="src", logger=self.org_logger,
-            desc=f"List FW Policy Rules {pname} ({scope_label})",
-            explanation=f"ポリシー '{pname}' のルール一覧取得",
+            desc=f"Describe FW Policy {pname} ({scope_label}) [rules]",
+            explanation=f"ポリシー '{pname}' の describe からルール一覧を抽出",
             impersonate_sa=src_sa, allow_fail=True,
         )
-        try:
-            fw_rules = json.loads(rules_raw) if rules_raw else []
-        except Exception:
-            fw_rules = []
+        policy_obj = _parse_gcloud_describe_json(policy_raw)
+        fw_rules = policy_obj.get('rules') or []
 
-        for r in fw_rules:
+        rule_scope_flag = fw_rule_scope_flag(scope_flag)
+        secure_tag_map = self._fw_secure_tag_map()
+
+        def rule_worker(r):
             prio = r.get('priority')
             action = r.get('action', 'allow')
             direction = r.get('direction', 'INGRESS')
             if prio is None:
-                continue
+                return
+
+            # secure tag は ORG スコープの permanent ID で別 ORG には存在しない。
+            # map 未定義のタグを参照するルールはエラーになる（Could not fetch resource）。
+            # FW を意図せず緩めないよう、create を試行せずスキップして警告する。
+            unmapped = [t for t in fw_policy_rule_secure_tags(r) if t not in secure_tag_map]
+            if unmapped:
+                self.dst_logger.warning(
+                    f"      ポリシールール {pname}/{prio} は dst ORG に存在しない "
+                    f"secure tag {unmapped} を参照するためスキップ。dst で同等タグを作成し "
+                    f"config の steps.network_firewall.secure_tag_map に "
+                    f"'<src tagValues/...>: <dst tagValues/...>' を追加すると複製されます。"
+                )
+                return
 
             if self._gcloud_exists(
                 f"gcloud compute network-firewall-policies rules describe {prio} "
-                f"--firewall-policy={pname} --project={dst_host} {scope_flag} "
+                f"--firewall-policy={pname} --project={dst_host} {rule_scope_flag} "
                 f"--format='value(priority)'",
                 dst_sa,
             ):
                 self.dst_logger.info(
                     f"      ポリシールール {pname}/{prio} は既存。スキップ"
                 )
-                continue
+                return
 
             layer4 = fw_policy_rule_layer4(r)
-            extra_flags = fw_policy_rule_flags(r, proj_map)
+            extra_flags = fw_policy_rule_flags(r, proj_map, secure_tag_map)
 
             rule_cmd = (
                 f"gcloud compute network-firewall-policies rules create {prio} "
-                f"--firewall-policy={pname} --project={dst_host} {scope_flag} "
+                f"--firewall-policy={pname} --project={dst_host} {rule_scope_flag} "
                 f"--action={action} --direction={direction} "
                 f"--layer4-configs={layer4}"
             )
@@ -3122,43 +3277,41 @@ resource "google_storage_bucket" "mock_bucket" {{
                 impersonate_sa=dst_sa, allow_fail=True,
             )
 
+        self._parallel_for_each(fw_rules, rule_worker, f"fw-rule-{pname}")
+
     def _sync_fw_policy_associations(
         self, pname: str, scope_flag: str, scope_label: str,
         src_host: str, dst_host: str,
         src_sa: Optional[str], dst_sa: Optional[str],
         proj_map: Dict[str, str],
     ):
-        # src の association を取得
-        assoc_raw = self.run_command(
-            f"gcloud compute network-firewall-policies associations list "
-            f"--firewall-policy={pname} --project={src_host} {scope_flag} --format=json",
+        # `network-firewall-policies associations list` は CLI に存在しない。
+        # describe の `associations` フィールドから取得する（src / dst 両方）。
+        src_raw = self.run_command(
+            f"gcloud compute network-firewall-policies describe {pname} "
+            f"--project={src_host} {scope_flag} --format=json",
             side="src", logger=self.org_logger,
-            desc=f"List FW Policy Assoc {pname} ({scope_label}) [src]",
-            explanation=f"ポリシー '{pname}' のアソシエーション一覧取得 (src)",
+            desc=f"Describe FW Policy {pname} ({scope_label}) [assoc src]",
+            explanation=f"ポリシー '{pname}' の describe から association を抽出 (src)",
             impersonate_sa=src_sa, allow_fail=True,
         )
-        try:
-            assocs = json.loads(assoc_raw) if assoc_raw else []
-        except Exception:
-            assocs = []
+        src_obj = _parse_gcloud_describe_json(src_raw)
+        assocs = src_obj.get('associations') or []
 
         if not assocs:
             return
 
-        # dst 側 association を list で取得し、name 集合で存在判定する
-        # （`associations describe --name=` は gcloud バージョンによって挙動が不安定）
-        dst_assoc_raw = self.run_command(
-            f"gcloud compute network-firewall-policies associations list "
-            f"--firewall-policy={pname} --project={dst_host} {scope_flag} --format=json",
+        # dst 側 association も describe から取得する。
+        dst_raw = self.run_command(
+            f"gcloud compute network-firewall-policies describe {pname} "
+            f"--project={dst_host} {scope_flag} --format=json",
             side="dst", logger=self.dst_logger,
-            desc=f"List FW Policy Assoc {pname} ({scope_label}) [dst]",
+            desc=f"Describe FW Policy {pname} ({scope_label}) [assoc dst]",
             explanation=f"ポリシー '{pname}' の dst 側 association を取得 (冪等判定)",
             impersonate_sa=dst_sa, allow_fail=True,
         )
-        try:
-            dst_assoc_list = json.loads(dst_assoc_raw) if dst_assoc_raw else []
-        except Exception:
-            dst_assoc_list = []
+        dst_obj = _parse_gcloud_describe_json(dst_raw)
+        dst_assoc_list = dst_obj.get('associations') or []
         existing_assoc_names = {a.get('name') for a in dst_assoc_list if a.get('name')}
 
         for assoc in assocs:
@@ -3179,7 +3332,7 @@ resource "google_storage_bucket" "mock_bucket" {{
 
             self.run_command(
                 f"gcloud compute network-firewall-policies associations create "
-                f"--firewall-policy={pname} --project={dst_host} {scope_flag} "
+                f"--firewall-policy={pname} --project={dst_host} {fw_rule_scope_flag(scope_flag)} "
                 f"--name={assoc_name} --network={dst_net_url}",
                 side="dst", logger=self.dst_logger,
                 desc=f"Create FW Policy Assoc {assoc_name} ({scope_label})",
@@ -3188,6 +3341,21 @@ resource "google_storage_bucket" "mock_bucket" {{
             )
 
     def step_gce_restore(self):
+        """Step 5: src VM をスナップショット経由で dst に復元する。
+
+        並列化方針:
+          1. _replicate_host_networks() は VM 作成の前提なのでシングルスレッドで先に完了させる。
+          2. プロジェクト単位の VM/snapshot 一覧取得は src read-only なので
+             _parallel_for_each で並列化（thread-prefix=gce-list）。
+          3. (project, vm) のフラット work unit に展開し、_restore_one_vm を
+             _parallel_for_each で並列実行（thread-prefix=gce-restore）。
+             VM 復元チェーン (stop→detach→delete→create→attach→start) はVM内で直列。
+
+        並列モードでは「snapshot 未検出」での sys.exit(1) を行わず、stats.failed
+        に記録して return する。他の VM の進行を巻き添えで止めないため。
+        run() 終了時に stats.failed > 0 なら main() が exit code 1 を返す
+        （Makefile/CI の検知挙動は保たれる）。
+        """
         pairs = list(self._iter_project_pairs())
         log_stage_header(self.dst_logger, 5, "GCE VM 復元（スナップショット → ディスク差し替え）", len(pairs))
 
@@ -3198,9 +3366,13 @@ resource "google_storage_bucket" "mock_bucket" {{
         # サブネットに作成する前に src host の VPC/subnet を dst host へ複製する。
         self._replicate_host_networks()
 
-        for src_proj, dst_proj, src_sa, dst_sa in pairs:
-            self.dst_logger.info(f"  → src '{src_proj}' → dst '{dst_proj}'")
+        # 1) プロジェクトごとの (vms, snapshots) を並列取得（src read-only）
+        project_data: Dict[str, Tuple[List[Dict], List[Dict], str, Optional[str], Optional[str]]] = {}
+        data_lock = threading.Lock()
 
+        def list_worker(pair):
+            src_proj, dst_proj, src_sa, dst_sa = pair
+            self.dst_logger.info(f"  → src '{src_proj}' → dst '{dst_proj}'")
             vm_json = self.run_command(
                 f"gcloud compute instances list --project={src_proj} --format=json",
                 side="src", logger=self.org_logger,
@@ -3210,13 +3382,12 @@ resource "google_storage_bucket" "mock_bucket" {{
             )
             if not vm_json:
                 self.dst_logger.info(f"    {src_proj}: VM 無し / 取得失敗")
-                continue
+                return
             try:
                 vms = json.loads(vm_json)
             except Exception as e:
-                self.dst_logger.error(f"    VM JSON 解析失敗: {e}")
-                continue
-
+                self.dst_logger.error(f"    VM JSON 解析失敗 ({src_proj}): {e}")
+                return
             snap_json = self.run_command(
                 f"gcloud compute snapshots list --project={src_proj} --format=json",
                 side="src", logger=self.org_logger,
@@ -3227,111 +3398,149 @@ resource "google_storage_bucket" "mock_bucket" {{
             try:
                 snapshots = json.loads(snap_json) if snap_json else []
             except Exception as e:
-                self.dst_logger.error(f"    Snapshot JSON 解析失敗: {e}")
-                continue
+                self.dst_logger.error(f"    Snapshot JSON 解析失敗 ({src_proj}): {e}")
+                return
+            with data_lock:
+                project_data[src_proj] = (vms, snapshots, dst_proj, src_sa, dst_sa)
 
+        self._parallel_for_each(pairs, list_worker, "gce-list")
+
+        # 2) (project, vm) のフラット work unit に展開し並列復元
+        units: List[Tuple[Dict, List[Dict], str, str, Optional[str], Optional[str]]] = []
+        for src_proj, (vms, snapshots, dst_proj, src_sa, dst_sa) in project_data.items():
             for vm in vms:
-                vm_name = vm.get('name')
-                if not vm_name:
-                    continue
-                zone = vm.get('zone', '').split('/')[-1]
-                machine_type = vm.get('machineType', '').split('/')[-1] or 'e2-micro'
-                boot_disk = next((d for d in vm.get('disks', []) if d.get('boot')), None)
-                if not boot_disk:
-                    continue
-                disk_name = boot_disk.get('source', '').split('/')[-1]
+                units.append((vm, snapshots, src_proj, dst_proj, src_sa, dst_sa))
 
-                snap_name = self._find_valid_snapshot(snapshots, disk_name, max_age_days)
-                if not snap_name:
-                    self.dst_logger.error(
-                        f"    ✗ {vm_name}: 有効スナップショットが無いため復元できません"
-                    )
-                    sys.exit(1)
+        if units:
+            self.dst_logger.info(
+                f"  並列復元開始: {len(units)} VM (parallel_jobs={self.parallel_jobs})"
+            )
 
-                dst_disk_name = vm_name
-                snap_path = f"projects/{src_proj}/global/snapshots/{snap_name}"
+        def restore_worker(unit):
+            vm, snapshots, src_proj, dst_proj, src_sa, dst_sa = unit
+            self._restore_one_vm(
+                vm, snapshots, src_proj, dst_proj, src_sa, dst_sa,
+                proj_map, max_age_days,
+            )
 
-                # VM/disk は Terraform(Step4) では作らず Step5 で管理する。dst に VM が
-                # 既にあるかで分岐: 無ければ snapshot 復元ディスクで新規作成、あれば
-                # ブートディスクを復元ディスクに差し替える（どちらも冪等）。
-                vm_exists = self._gcloud_exists(
-                    f"gcloud compute instances describe {vm_name} --zone={zone} "
-                    f"--project={dst_proj} --format='value(name)'",
-                    dst_sa,
-                )
-
-                if not vm_exists:
-                    self.dst_logger.info(
-                        f"    {vm_name} を新規作成して復元 (zone={zone}, type={machine_type}, snap={snap_name})"
-                    )
-                    self._create_disk_from_snapshot(dst_disk_name, snap_path, zone, dst_proj, dst_sa)
-                    nic = self._build_restore_nic(vm, proj_map, dst_proj, dst_sa)
-                    with tempfile.TemporaryDirectory(prefix=f"vm-{vm_name}-") as tmpdir:
-                        extra = self._build_vm_create_extra_args(vm, tmpdir)
-                        self.run_command(
-                            f"gcloud compute instances create {vm_name} --zone={zone} "
-                            f"--project={dst_proj} --machine-type={machine_type} {nic} "
-                            f"--disk=name={dst_disk_name},boot=yes,auto-delete=yes "
-                            f"{extra} --quiet",
-                            side="dst", logger=self.dst_logger,
-                            desc=f"Create VM {vm_name}",
-                            explanation="復元ディスクをブートに指定して dst VM を新規作成（metadata/tags/labels/SA/scheduling 引き継ぎ）",
-                            impersonate_sa=dst_sa,
-                        )
-                    self._attach_secondary_disks(
-                        vm, vm_name, zone, src_proj, dst_proj, dst_sa, snapshots, max_age_days
-                    )
-                    continue
-
-                self.dst_logger.info(
-                    f"    {vm_name} は既存。ブートディスクを復元ディスクに差し替え (snap={snap_name})"
-                )
-                src_ip = ((vm.get('networkInterfaces') or [{}])[0]).get('networkIP')
-                if src_ip:
-                    self._warn_if_dst_internal_ip_mismatch(vm_name, zone, dst_proj, dst_sa, src_ip)
-                self.run_command(
-                    f"gcloud compute instances stop {vm_name} --zone={zone} --project={dst_proj} --quiet",
-                    side="dst", logger=self.dst_logger,
-                    desc=f"Stop dst VM {vm_name}",
-                    explanation=f"dst の {vm_name} を停止し、ブートディスクを差し替え可能にする",
-                    impersonate_sa=dst_sa, allow_fail=True,
-                )
-                self.run_command(
-                    f"gcloud compute instances detach-disk {vm_name} --disk={dst_disk_name} "
-                    f"--zone={zone} --project={dst_proj} --quiet",
-                    side="dst", logger=self.dst_logger,
-                    desc=f"Detach disk {dst_disk_name}",
-                    explanation="現在のブートディスクをデタッチ",
-                    impersonate_sa=dst_sa, allow_fail=True,
-                )
-                self.run_command(
-                    f"gcloud compute disks delete {dst_disk_name} --zone={zone} --project={dst_proj} --quiet",
-                    side="dst", logger=self.dst_logger,
-                    desc=f"Delete placeholder disk {dst_disk_name}",
-                    explanation="差し替え前の旧ブートディスクを削除",
-                    impersonate_sa=dst_sa, allow_fail=True,
-                )
-                self._create_disk_from_snapshot(dst_disk_name, snap_path, zone, dst_proj, dst_sa)
-                self.run_command(
-                    f"gcloud compute instances attach-disk {vm_name} --disk={dst_disk_name} "
-                    f"--boot --zone={zone} --project={dst_proj} --quiet",
-                    side="dst", logger=self.dst_logger,
-                    desc=f"Attach disk {dst_disk_name}",
-                    explanation="復元ディスクをブートディスクとしてアタッチ",
-                    impersonate_sa=dst_sa,
-                )
-                self.run_command(
-                    f"gcloud compute instances start {vm_name} --zone={zone} --project={dst_proj} --quiet",
-                    side="dst", logger=self.dst_logger,
-                    desc=f"Start VM {vm_name}",
-                    explanation="復元ディスクで VM を起動",
-                    impersonate_sa=dst_sa,
-                )
-                self._attach_secondary_disks(
-                    vm, vm_name, zone, src_proj, dst_proj, dst_sa, snapshots, max_age_days
-                )
+        self._parallel_for_each(units, restore_worker, "gce-restore")
 
         self.dst_logger.info("  ✓ Step 5 完了")
+
+    def _restore_one_vm(
+        self, vm: Dict, snapshots: List[Dict],
+        src_proj: str, dst_proj: str,
+        src_sa: Optional[str], dst_sa: Optional[str],
+        proj_map: Dict[str, str], max_age_days: int,
+    ):
+        """1 VM 分の復元処理。step_gce_restore のループ本体を抽出したもの。
+
+        並列実行されるため、共有可変状態は触らない（StageStats はロック済み、
+        logger はスレッドセーフ）。VM 内の操作チェーン
+        (stop→detach→delete→create→attach→start) は依存があるため直列実行。
+        """
+        vm_name = vm.get('name')
+        if not vm_name:
+            return
+        zone = vm.get('zone', '').split('/')[-1]
+        machine_type = vm.get('machineType', '').split('/')[-1] or 'e2-micro'
+        boot_disk = next((d for d in vm.get('disks', []) if d.get('boot')), None)
+        if not boot_disk:
+            return
+        disk_name = boot_disk.get('source', '').split('/')[-1]
+
+        snap_name = self._find_valid_snapshot(snapshots, disk_name, max_age_days)
+        if not snap_name:
+            # 並列モードでは sys.exit せず failed に記録して return。
+            # 他 VM を巻き添えで止めないため。最終的に main() で exit 1。
+            msg = f"有効スナップショットが無いため復元不能 (disk={disk_name})"
+            self.dst_logger.error(f"    ✗ {vm_name}: {msg}")
+            self.stats.add_failure(f"Restore VM {vm_name}", msg)
+            self.stats.incr("failed")
+            return
+
+        dst_disk_name = vm_name
+        snap_path = f"projects/{src_proj}/global/snapshots/{snap_name}"
+
+        # VM/disk は Terraform(Step4) では作らず Step5 で管理する。dst に VM が
+        # 既にあるかで分岐: 無ければ snapshot 復元ディスクで新規作成、あれば
+        # ブートディスクを復元ディスクに差し替える（どちらも冪等）。
+        vm_exists = self._gcloud_exists(
+            f"gcloud compute instances describe {vm_name} --zone={zone} "
+            f"--project={dst_proj} --format='value(name)'",
+            dst_sa,
+        )
+
+        if not vm_exists:
+            self.dst_logger.info(
+                f"    {vm_name} を新規作成して復元 (zone={zone}, type={machine_type}, snap={snap_name})"
+            )
+            self._create_disk_from_snapshot(dst_disk_name, snap_path, zone, dst_proj, dst_sa)
+            nic = self._build_restore_nic(vm, proj_map, dst_proj, dst_sa)
+            with tempfile.TemporaryDirectory(prefix=f"vm-{vm_name}-") as tmpdir:
+                extra = self._build_vm_create_extra_args(vm, tmpdir)
+                self.run_command(
+                    f"gcloud compute instances create {vm_name} --zone={zone} "
+                    f"--project={dst_proj} --machine-type={machine_type} {nic} "
+                    f"--disk=name={dst_disk_name},boot=yes,auto-delete=yes "
+                    f"{extra} --quiet",
+                    side="dst", logger=self.dst_logger,
+                    desc=f"Create VM {vm_name}",
+                    explanation="復元ディスクをブートに指定して dst VM を新規作成（metadata/tags/labels/SA/scheduling 引き継ぎ）",
+                    impersonate_sa=dst_sa,
+                )
+            self._attach_secondary_disks(
+                vm, vm_name, zone, src_proj, dst_proj, dst_sa, snapshots, max_age_days
+            )
+            return
+
+        self.dst_logger.info(
+            f"    {vm_name} は既存。ブートディスクを復元ディスクに差し替え (snap={snap_name})"
+        )
+        src_ip = ((vm.get('networkInterfaces') or [{}])[0]).get('networkIP')
+        if src_ip:
+            self._warn_if_dst_internal_ip_mismatch(vm_name, zone, dst_proj, dst_sa, src_ip)
+        self.run_command(
+            f"gcloud compute instances stop {vm_name} --zone={zone} --project={dst_proj} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"Stop dst VM {vm_name}",
+            explanation=f"dst の {vm_name} を停止し、ブートディスクを差し替え可能にする",
+            impersonate_sa=dst_sa, allow_fail=True,
+        )
+        self.run_command(
+            f"gcloud compute instances detach-disk {vm_name} --disk={dst_disk_name} "
+            f"--zone={zone} --project={dst_proj} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"Detach disk {dst_disk_name}",
+            explanation="現在のブートディスクをデタッチ",
+            impersonate_sa=dst_sa, allow_fail=True,
+        )
+        self.run_command(
+            f"gcloud compute disks delete {dst_disk_name} --zone={zone} --project={dst_proj} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"Delete placeholder disk {dst_disk_name}",
+            explanation="差し替え前の旧ブートディスクを削除",
+            impersonate_sa=dst_sa, allow_fail=True,
+        )
+        self._create_disk_from_snapshot(dst_disk_name, snap_path, zone, dst_proj, dst_sa)
+        self.run_command(
+            f"gcloud compute instances attach-disk {vm_name} --disk={dst_disk_name} "
+            f"--boot --zone={zone} --project={dst_proj} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"Attach disk {dst_disk_name}",
+            explanation="復元ディスクをブートディスクとしてアタッチ",
+            impersonate_sa=dst_sa,
+        )
+        self.run_command(
+            f"gcloud compute instances start {vm_name} --zone={zone} --project={dst_proj} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"Start VM {vm_name}",
+            explanation="復元ディスクで VM を起動",
+            impersonate_sa=dst_sa,
+        )
+        self._attach_secondary_disks(
+            vm, vm_name, zone, src_proj, dst_proj, dst_sa, snapshots, max_age_days
+        )
 
     def _gcloud_exists(self, cmd: str, impersonate_sa: Optional[str]) -> bool:
         """read-only な describe 等で対象リソースの存在を確認する（stats を汚さない）。
@@ -3528,10 +3737,17 @@ resource "google_storage_bucket" "mock_bucket" {{
         - boot ディスクは Step5 メインフローが扱うのでスキップ
         - 各セカンダリは src 名と同じ disk 名で dst に作成
         - attach は冪等性のため allow_fail（既 attach は再 attach で失敗するのを許容）
+        - 複数セカンダリがある場合は `_create_disk_from_snapshot` を並列化
+          （独立操作のためスループット改善）。attach 自体は同一 VM への並列 attach で
+          競合する可能性があるためここでは直列。
         """
-        for d in vm.get('disks', []) or []:
-            if d.get('boot'):
-                continue
+        secondaries = [d for d in (vm.get('disks') or []) if not d.get('boot')]
+        if not secondaries:
+            return
+
+        # snapshot 解決 → 作成タスクリスト
+        plans: List[Tuple[str, str, str, str]] = []  # (src_disk_name, snap_path, device_name, mode_flag)
+        for d in secondaries:
             src_disk_name = (d.get('source') or '').split('/')[-1]
             if not src_disk_name:
                 continue
@@ -3542,13 +3758,23 @@ resource "google_storage_bucket" "mock_bucket" {{
                 )
                 continue
             snap_path = f"projects/{src_proj}/global/snapshots/{snap_name}"
-            self.dst_logger.info(
-                f"      セカンダリディスク復元: {src_disk_name} (snap={snap_name})"
-            )
-            self._create_disk_from_snapshot(src_disk_name, snap_path, zone, dst_proj, dst_sa)
             device_name = d.get('deviceName') or src_disk_name
             mode = d.get('mode') or 'READ_WRITE'
             mode_flag = "--mode=ro" if mode == 'READ_ONLY' else "--mode=rw"
+            plans.append((src_disk_name, snap_path, device_name, mode_flag))
+            self.dst_logger.info(
+                f"      セカンダリディスク復元: {src_disk_name} (snap={snap_name})"
+            )
+
+        # ディスク作成は独立操作。複数あれば並列化。
+        def create_worker(plan):
+            src_disk_name, snap_path, _device_name, _mode_flag = plan
+            self._create_disk_from_snapshot(src_disk_name, snap_path, zone, dst_proj, dst_sa)
+
+        self._parallel_for_each(plans, create_worker, f"sec-disk-{vm_name}")
+
+        # attach は同一 VM のメタデータ更新が走るため直列（同時 attach で 409 が出る）
+        for src_disk_name, _snap_path, device_name, mode_flag in plans:
             self.run_command(
                 f"gcloud compute instances attach-disk {vm_name} --disk={src_disk_name} "
                 f"--device-name={device_name} {mode_flag} "

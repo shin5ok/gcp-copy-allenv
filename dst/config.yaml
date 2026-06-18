@@ -61,20 +61,20 @@ project_mapping:
   # 共有VPCホストプロジェクト
   host_project:
     src: "shingo-ar-sharedhost0926"
-    dst: "shingo-ar-host2026060804"
+    dst: "shingo-ar-host2026061801"
     src_impersonate_service_account: "org-host-viewer@shingo-ar-sharedhost0926.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-    dst_impersonate_service_account: "dst-host-owner@shingo-ar-host2026060804.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+    dst_impersonate_service_account: "dst-host-owner@shingo-ar-host2026061801.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
   
   # サービスプロジェクトのリスト (複数指定可能)
   service_projects:
     - src: "shingo-ar-sharedservice0926-1"
-      dst: "shingo-ar-service2026060804-1"
+      dst: "shingo-ar-service2026061801-1"
       src_impersonate_service_account: "org-svc1-viewer@shingo-ar-sharedservice0926-1.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-      dst_impersonate_service_account: "dst-svc1-owner@shingo-ar-service2026060804-1.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+      dst_impersonate_service_account: "dst-svc1-owner@shingo-ar-service2026061801-1.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
     - src: "shingo-ar-sharedservice0926-3"
-      dst: "shingo-ar-service2026060804-3"
+      dst: "shingo-ar-service2026061801-3"
       src_impersonate_service_account: "org-svc3-viewer@shingo-ar-sharedservice0926-3.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-      dst_impersonate_service_account: "dst-svc3-owner@shingo-ar-service2026060804-3.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+      dst_impersonate_service_account: "dst-svc3-owner@shingo-ar-service2026061801-3.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
 
 # ------------------------------------------------------------------------------
 # 3. リネームルール設定 (Rename Rules)
@@ -131,6 +131,16 @@ steps:
   # bulk-export は network_firewall_policy を出力しないため gcloud で直接同期する
   network_firewall:
     enabled: true
+    # Secure tag (tagValues/<数値ID>) は ORG スコープの permanent ID で、
+    # 別 ORG にコピーすると dst には存在せず rules create が
+    # 「Could not fetch resource:」で失敗する。
+    # dst ORG で同等タグを作成し、src→dst の tagValues をここにマッピングすると
+    # 該当ルールも複製される。未指定のタグを参照するルールは
+    # （FW を意図せず緩めないため）エラーにせずスキップし WARNING を出す。
+    # 例:
+    # secure_tag_map:
+    #   "tagValues/281483307237001": "tagValues/449632198855123"  # env=prod
+    secure_tag_map: {}
 
   # [Step 5] GCE VM 復元 (スナップショットから復元したディスクをVMに紐付け起動)
   gce_restore:

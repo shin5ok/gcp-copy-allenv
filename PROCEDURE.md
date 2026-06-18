@@ -112,10 +112,15 @@
    - `google_storage_bucket` はリネーム後の実名で import して adopt
    - VM/disk は Step 4 では作らず Step 5 で管理（責務分離）
 2. **gce_restore**: 期限内スナップショットから dst にディスクを復元 → boot disk を差し替えて VM 起動（OS 状態・データごと復元）
+   - 並列化: `_replicate_host_networks()` の後、(project, vm) のフラット work unit に展開し VM 単位で並列復元（`parallel_jobs=8` 推奨）。VM 内の操作チェーン (stop→detach→delete→create→attach→start) は依存があるため直列。
+   - snapshot 未検出時の挙動: 並列モードで `sys.exit(1)` すると他 VM の進行を巻き添えで止めるため、`stats.failed` に記録して return する（最終的に `main()` で exit 1）。
 3. **data_sync**:
    - GCS: リネーム後バケットへ `gcloud storage rsync` で同期
    - BigQuery: src の location を継承してデータセット作成 → コピー
 4. **Network Firewall (Step 4.5)**: host の FW rules / policies を `gcloud` で冪等複製（Terraform で表現しきれない部分の補完）
+   - `network-firewall-policies` のサブコマンドごとに scope flag が異なる: `list`=`--regions=`（複数形）/ `describe`・`create`=`--global`・`--region=`（ポリシー本体）/ `rules ...`・`associations create`=`--global-firewall-policy`・`--firewall-policy-region=`。誤ると `unrecognized arguments`。`fw_rule_scope_flag()` で変換する。
+   - `fw_policy_rule_flags()` は REST API の FirewallPolicyRule 全フィールドに対応する。INGRESS ルールは `srcIpRanges / srcThreatIntelligences / srcAddressGroups / srcFqdns / srcSecureTags / srcRegionCodes / srcNetworkScope` のいずれかが必須（gcloud 仕様）。欠落すると `Must specify src_... for ingress direction` / `Could not fetch resource:` で失敗する。
+   - **Secure tag**（`tagValues/<数値ID>`）は ORG スコープの permanent ID で別 ORG には存在しない。そのまま渡すと `rules create` が `Could not fetch resource:` で失敗する。`config steps.network_firewall.secure_tag_map` に src→dst の tagValues を登録すると変換して複製。未登録タグを参照するルールは FW を意図せず緩めないようエラーにせずスキップし WARNING を出す。
 5. `bulk_export.skip_on_run: true` の場合は export/customize をスキップし `terraform/active/` を再利用（再実行高速化）
 
 ---
