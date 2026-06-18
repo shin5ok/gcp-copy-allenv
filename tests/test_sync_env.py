@@ -1202,3 +1202,119 @@ class TestRestoreOneVmFailureHandling:
             proj_map={}, max_age_days=30,
         )
         assert o.stats.failed == before_failed
+
+
+class TestRestoreOneVmStatusReconciliation:
+    """_restore_one_vm: src VM の status を dst に反映する。
+
+    新規作成パス: instances create で起動済 → src の状態に合わせて stop/suspend を追加発行
+    既存差し替えパス: stop → 差し替え後で停止中 → src の状態に合わせて start/suspend を発行
+                       TERMINATED の場合は start を発行しない（重要な挙動変更）
+    """
+    import datetime as _dt
+    from unittest.mock import patch as _patch
+
+    def _orchestrator(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["mock"] = False
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    @staticmethod
+    def _vm(status: str):
+        return {
+            "name": "vm1",
+            "zone": "projects/p/zones/asia-northeast1-a",
+            "machineType": "projects/p/zones/z/machineTypes/e2-micro",
+            "disks": [{"boot": True, "source": "projects/p/zones/z/disks/disk1"}],
+            "status": status,
+        }
+
+    @staticmethod
+    def _snapshots():
+        import datetime as dt
+        ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
+        return [{
+            "name": "snap-1",
+            "sourceDisk": "projects/p/zones/z/disks/disk1",
+            "creationTimestamp": ts,
+        }]
+
+    def _capture_calls(self, o, vm, vm_exists: bool):
+        from unittest.mock import patch
+        gcloud_seq = [vm_exists, False]  # 1: VM exists?  2: disk exists?
+
+        def gcloud_exists_side(*_a, **_kw):
+            return gcloud_seq.pop(0) if gcloud_seq else False
+
+        with patch.object(o, "run_command", return_value="") as mock_run, \
+             patch.object(o, "_gcloud_exists", side_effect=gcloud_exists_side), \
+             patch.object(o, "_attach_secondary_disks", return_value=None):
+            o._restore_one_vm(
+                vm, self._snapshots(),
+                src_proj="src-p", dst_proj="dst-p",
+                src_sa=None, dst_sa=None,
+                proj_map={}, max_age_days=30,
+            )
+        return [c.args[0] for c in mock_run.call_args_list]
+
+    @staticmethod
+    def _is_cmd(s: str, fragment: str) -> bool:
+        return fragment in s
+
+    def test_new_vm_running_keeps_running(self, temp_dir):
+        o = self._orchestrator(temp_dir)
+        calls = self._capture_calls(o, self._vm("RUNNING"), vm_exists=False)
+        assert any(self._is_cmd(c, "instances create vm1") for c in calls)
+        assert not any(self._is_cmd(c, "instances stop vm1") for c in calls)
+        assert not any(self._is_cmd(c, "instances suspend vm1") for c in calls)
+
+    def test_new_vm_terminated_stops_after_create(self, temp_dir):
+        o = self._orchestrator(temp_dir)
+        calls = self._capture_calls(o, self._vm("TERMINATED"), vm_exists=False)
+        create_idx = next(i for i, c in enumerate(calls) if "instances create vm1" in c)
+        stop_idx = next(i for i, c in enumerate(calls) if "instances stop vm1" in c)
+        assert stop_idx > create_idx
+        assert not any(self._is_cmd(c, "instances suspend vm1") for c in calls)
+
+    def test_new_vm_suspended_suspends_after_create(self, temp_dir):
+        o = self._orchestrator(temp_dir)
+        calls = self._capture_calls(o, self._vm("SUSPENDED"), vm_exists=False)
+        create_idx = next(i for i, c in enumerate(calls) if "instances create vm1" in c)
+        suspend_idx = next(i for i, c in enumerate(calls) if "instances suspend vm1" in c)
+        assert suspend_idx > create_idx
+        assert not any(self._is_cmd(c, "instances start vm1") for c in calls)
+        assert not any(self._is_cmd(c, "instances stop vm1") for c in calls)
+
+    def test_existing_vm_running_starts_at_end(self, temp_dir):
+        o = self._orchestrator(temp_dir)
+        calls = self._capture_calls(o, self._vm("RUNNING"), vm_exists=True)
+        attach_idx = next(
+            i for i, c in enumerate(calls)
+            if "instances attach-disk vm1" in c and "--boot" in c
+        )
+        start_idx = next(i for i, c in enumerate(calls) if "instances start vm1" in c)
+        assert start_idx > attach_idx
+        assert not any(self._is_cmd(c, "instances suspend vm1") for c in calls)
+
+    def test_existing_vm_terminated_skips_start(self, temp_dir):
+        o = self._orchestrator(temp_dir)
+        calls = self._capture_calls(o, self._vm("TERMINATED"), vm_exists=True)
+        # 直前 stop は差し替えのために発行される。
+        # しかし「末尾の start」は発行されてはならない（src が停止中だから）。
+        starts = [c for c in calls if "instances start vm1" in c]
+        assert starts == [], f"unexpected start commands: {starts}"
+        assert not any(self._is_cmd(c, "instances suspend vm1") for c in calls)
+
+    def test_existing_vm_suspended_starts_then_suspends(self, temp_dir):
+        o = self._orchestrator(temp_dir)
+        calls = self._capture_calls(o, self._vm("SUSPENDED"), vm_exists=True)
+        start_idx = next(i for i, c in enumerate(calls) if "instances start vm1" in c)
+        suspend_idx = next(i for i, c in enumerate(calls) if "instances suspend vm1" in c)
+        assert start_idx < suspend_idx
