@@ -1267,9 +1267,11 @@ class MigrationOrchestrator:
             targets.append((dst_sa, dst_proj, "dst", dst_perms))
 
         errors: List[str] = []
-        ok_count = 0
         checked_sas = set()
-        for sa, project, side, perms in targets:
+        sa_lock = threading.Lock()
+
+        def check_one(item):
+            sa, project, side, perms = item
             label = f"{side} SA '{sa}' (project={project})"
 
             # 1) 実在＋借用可否（アクセストークン発行）。stdout=token はログに出さない。
@@ -1278,33 +1280,36 @@ class MigrationOrchestrator:
             )
             if rc != 0 or not token.strip():
                 reason = err.strip().splitlines()[-1] if err.strip() else "原因不明"
-                errors.append(
-                    f"{label}: 借用（impersonate）できません。SA が存在しないか、"
-                    f"実行ユーザーに roles/iam.serviceAccountTokenCreator がありません。"
-                    f" 詳細: {reason[:300]}"
-                )
-                continue
+                with sa_lock:
+                    errors.append(
+                        f"{label}: 借用（impersonate）できません。SA が存在しないか、"
+                        f"実行ユーザーに roles/iam.serviceAccountTokenCreator がありません。"
+                        f" 詳細: {reason[:300]}"
+                    )
+                return
 
             # 2) 権限（借用トークンで testIamPermissions REST を実行）。
             granted = self._test_iam_permissions(token.strip(), project, perms)
             if granted is None:
-                # 検証不能（API 未有効・ネットワーク等）。借用は確認済みなので警告に留める。
                 self.org_logger.warning(
                     f"  [SA事前チェック] {label}: 権限を検証できませんでした"
                     f"（対象 API 未有効などの可能性）。借用は確認済みのため継続します。"
                 )
-                ok_count += 1
-                checked_sas.add(sa)
-                continue
+                with sa_lock:
+                    checked_sas.add(sa)
+                return
             missing = sorted(perms - granted)
             if missing:
-                errors.append(
-                    f"{label}: 必要権限が不足しています: {', '.join(missing)}"
-                )
-                continue
+                with sa_lock:
+                    errors.append(
+                        f"{label}: 必要権限が不足しています: {', '.join(missing)}"
+                    )
+                return
 
-            ok_count += 1
-            checked_sas.add(sa)
+            with sa_lock:
+                checked_sas.add(sa)
+
+        self._parallel_for_each(targets, check_one, "sa-preflight")
 
         if errors:
             has_dst_impersonate_failure = any(
@@ -2693,56 +2698,64 @@ resource "google_storage_bucket" "mock_bucket" {{
 
         proj_map = self._build_proj_id_map()
         sa_map = self._build_dst_sa_map()
-        self.dst_logger.info(f"  対象 Terraform ルート: {len(project_dirs)} 件")
-        for proj_dir in project_dirs:
-            self.dst_logger.info(f"  → Terraform ルート: {proj_dir}")
-            # dst プロジェクトが前回と変わった（= 別環境への移行）場合、前回の
-            # terraform.tfstate は旧プロジェクトのリソースを指したままで、import が
-            # 「既に state にある」と誤判定し、plan で新プロジェクトへ再作成 → 既存と
-            # 衝突（409）する。dst が変わっていれば state を破棄して import からやり直す。
-            dst_proj = proj_map.get(os.path.basename(proj_dir))
-            if not self.dry_run and not self.mock and dst_proj:
-                self._reset_stale_state_if_needed(proj_dir, dst_proj)
-                # google_project_service / data.google_project などは Cloud Resource
-                # Manager / Service Usage / IAM API に依存する。dst プロジェクトでこれらが
-                # 無効だと apply 中に「<api> has not been used in project ... before」の
-                # 403 で止まる。bootstrap で漏れていても自動で復旧できるよう init 前に
-                # 必ず有効化する（冪等）。
-                self._ensure_dst_prereq_apis(dst_proj, sa_map.get(os.path.basename(proj_dir)))
-            # bulk-export は provider 設定を生成しないため init は通るが import/plan で
-            # "Invalid provider configuration" になる。dst プロジェクトと借用 SA を
-            # 明示した provider.tf を毎回書き出して回避する（冪等）。
-            # ローカルファイル書きのみで dst への副作用は無いため dry_run でも実施し、
-            # plan が "Invalid provider configuration" で落ちるのを防ぐ。
-            if not self.mock and dst_proj:
-                self._write_provider_tf(
-                    proj_dir, dst_proj, sa_map.get(os.path.basename(proj_dir))
-                )
-            self.run_command(
-                "terraform init", side="local", logger=self.dst_logger,
-                desc=f"TF Init {os.path.basename(proj_dir)}",
-                explanation="Terraform 初期化",
-                cwd=proj_dir,
-            )
-            # apply 前に既存リソースを state に取り込み、再実行/汚れた dst でも
-            # "already exists" にならないようにする（冪等化）。dry_run ではスキップ。
-            if not self.dry_run and not self.mock:
-                self._terraform_import_existing(proj_dir)
-            self.run_command(
-                "terraform plan -out=tfplan", side="local", logger=self.dst_logger,
-                desc=f"TF Plan {os.path.basename(proj_dir)}",
-                explanation="差分を tfplan に保存して内容を確認可能に",
-                cwd=proj_dir,
-            )
-            self.dst_logger.info("    → tfplan を生成しました。dry_run でない場合のみ apply します。")
-            if not self.dry_run:
-                self.run_command(
-                    "terraform apply -auto-approve tfplan", side="local", logger=self.dst_logger,
-                    desc=f"TF Apply {os.path.basename(proj_dir)}",
-                    explanation="先ほど作成した tfplan を適用",
-                    cwd=proj_dir,
-                )
+        self.dst_logger.info(
+            f"  対象 Terraform ルート: {len(project_dirs)} 件 (parallel_jobs={self.parallel_jobs})"
+        )
+
+        # 各 proj_dir は独立 workdir（terraform/active/<src>/）で state も分離されているため
+        # 並列化しても干渉しない。dst プロジェクトもプロジェクトごとに異なるので API 競合も
+        # 起こりにくい（Shared VPC の host 設定は本ステップでは作らない / Step 5 が担当）。
+        def worker(proj_dir):
+            self._terraform_one_project(proj_dir, proj_map, sa_map)
+
+        self._parallel_for_each(project_dirs, worker, "tf-plan")
         self.dst_logger.info("  ✓ Step 4 完了")
+
+    def _terraform_one_project(self, proj_dir: str, proj_map: Dict[str, str],
+                                sa_map: Dict[str, Optional[str]]):
+        self.dst_logger.info(f"  → Terraform ルート: {proj_dir}")
+        # dst プロジェクトが前回と変わった（= 別環境への移行）場合、前回の
+        # terraform.tfstate は旧プロジェクトのリソースを指したままで、import が
+        # 「既に state にある」と誤判定し、plan で新プロジェクトへ再作成 → 既存と
+        # 衝突（409）する。dst が変わっていれば state を破棄して import からやり直す。
+        dst_proj = proj_map.get(os.path.basename(proj_dir))
+        if not self.dry_run and not self.mock and dst_proj:
+            self._reset_stale_state_if_needed(proj_dir, dst_proj)
+            # google_project_service / data.google_project などは Cloud Resource
+            # Manager / Service Usage / IAM API に依存する。dst プロジェクトでこれらが
+            # 無効だと apply 中に「<api> has not been used in project ... before」の
+            # 403 で止まる。bootstrap で漏れていても自動で復旧できるよう init 前に
+            # 必ず有効化する（冪等）。
+            self._ensure_dst_prereq_apis(dst_proj, sa_map.get(os.path.basename(proj_dir)))
+        # bulk-export は provider 設定を生成しないため init は通るが import/plan で
+        # "Invalid provider configuration" になる。dst プロジェクトと借用 SA を
+        # 明示した provider.tf を毎回書き出して回避する（冪等）。
+        if not self.mock and dst_proj:
+            self._write_provider_tf(
+                proj_dir, dst_proj, sa_map.get(os.path.basename(proj_dir))
+            )
+        self.run_command(
+            "terraform init", side="local", logger=self.dst_logger,
+            desc=f"TF Init {os.path.basename(proj_dir)}",
+            explanation="Terraform 初期化",
+            cwd=proj_dir,
+        )
+        if not self.dry_run and not self.mock:
+            self._terraform_import_existing(proj_dir)
+        self.run_command(
+            "terraform plan -out=tfplan", side="local", logger=self.dst_logger,
+            desc=f"TF Plan {os.path.basename(proj_dir)}",
+            explanation="差分を tfplan に保存して内容を確認可能に",
+            cwd=proj_dir,
+        )
+        self.dst_logger.info("    → tfplan を生成しました。dry_run でない場合のみ apply します。")
+        if not self.dry_run:
+            self.run_command(
+                "terraform apply -auto-approve tfplan", side="local", logger=self.dst_logger,
+                desc=f"TF Apply {os.path.basename(proj_dir)}",
+                explanation="先ほど作成した tfplan を適用",
+                cwd=proj_dir,
+            )
 
     def _reset_stale_state_if_needed(self, proj_dir: str, dst_proj: str):
         """active/<src> の terraform state が現在の dst プロジェクト用でなければ破棄する。
