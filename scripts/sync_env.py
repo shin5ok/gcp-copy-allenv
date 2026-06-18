@@ -38,6 +38,7 @@ _READ_ONLY_VERBS = (
 _WRITE_VERBS = (
     "create", "delete", "update", "add", "remove", "set",
     "enable", "disable", "attach", "detach", "stop", "start", "reset",
+    "suspend", "resume",
     "apply", "destroy", "mk", "cp", "rm", "rsync", "mv",
     "import", "patch", "replace",
 )
@@ -61,6 +62,8 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud storage buckets create",
     "gcloud compute instances stop",
     "gcloud compute instances start",
+    "gcloud compute instances suspend",
+    "gcloud compute instances resume",
     "gcloud compute instances detach-disk",
     "gcloud compute instances attach-disk",
     "gcloud compute disks delete",
@@ -3492,6 +3495,11 @@ resource "google_storage_bucket" "mock_bucket" {{
             self._attach_secondary_disks(
                 vm, vm_name, zone, src_proj, dst_proj, dst_sa, snapshots, max_age_days
             )
+            self._apply_target_status(
+                vm_name, zone, dst_proj, dst_sa,
+                src_status=vm.get('status', 'RUNNING'),
+                currently_running=True,
+            )
             return
 
         self.dst_logger.info(
@@ -3531,16 +3539,78 @@ resource "google_storage_bucket" "mock_bucket" {{
             explanation="復元ディスクをブートディスクとしてアタッチ",
             impersonate_sa=dst_sa,
         )
-        self.run_command(
-            f"gcloud compute instances start {vm_name} --zone={zone} --project={dst_proj} --quiet",
-            side="dst", logger=self.dst_logger,
-            desc=f"Start VM {vm_name}",
-            explanation="復元ディスクで VM を起動",
-            impersonate_sa=dst_sa,
-        )
         self._attach_secondary_disks(
             vm, vm_name, zone, src_proj, dst_proj, dst_sa, snapshots, max_age_days
         )
+        self._apply_target_status(
+            vm_name, zone, dst_proj, dst_sa,
+            src_status=vm.get('status', 'RUNNING'),
+            currently_running=False,
+        )
+
+    def _apply_target_status(
+        self, vm_name: str, zone: str, dst_proj: str, dst_sa: Optional[str],
+        src_status: str, currently_running: bool,
+    ):
+        """src VM の status に合わせて dst VM を RUNNING / TERMINATED / SUSPENDED に揃える。
+
+        `currently_running` は直前操作で dst が起動中か否か（呼び出し側が把握している前提）。
+        - 新規作成パス: instances create 直後で True
+        - 既存差し替えパス: stop → 差し替え後で False
+        transient 状態 (PROVISIONING / STAGING / STOPPING / REPAIRING / SUSPENDING) は
+        WARNING を出して RUNNING として扱う（最も無難な既定）。
+        """
+        s = (src_status or "RUNNING").upper()
+        if s == "TERMINATED":
+            target = "TERMINATED"
+        elif s == "SUSPENDED":
+            target = "SUSPENDED"
+        elif s == "RUNNING":
+            target = "RUNNING"
+        else:
+            self.dst_logger.warning(
+                f"    {vm_name}: src status={s} (transient/unknown) は RUNNING として扱います"
+            )
+            target = "RUNNING"
+
+        self.dst_logger.info(
+            f"    {vm_name}: dst の目標電源状態 = {target} (src status={s})"
+        )
+
+        if target == "RUNNING":
+            if not currently_running:
+                self.run_command(
+                    f"gcloud compute instances start {vm_name} --zone={zone} --project={dst_proj} --quiet",
+                    side="dst", logger=self.dst_logger,
+                    desc=f"Start VM {vm_name}",
+                    explanation=f"src が RUNNING のため dst {vm_name} を起動",
+                    impersonate_sa=dst_sa,
+                )
+        elif target == "TERMINATED":
+            if currently_running:
+                self.run_command(
+                    f"gcloud compute instances stop {vm_name} --zone={zone} --project={dst_proj} --quiet",
+                    side="dst", logger=self.dst_logger,
+                    desc=f"Stop VM {vm_name}",
+                    explanation=f"src が TERMINATED のため dst {vm_name} を停止",
+                    impersonate_sa=dst_sa, allow_fail=True,
+                )
+        elif target == "SUSPENDED":
+            if not currently_running:
+                self.run_command(
+                    f"gcloud compute instances start {vm_name} --zone={zone} --project={dst_proj} --quiet",
+                    side="dst", logger=self.dst_logger,
+                    desc=f"Start VM {vm_name}",
+                    explanation="suspend するため一旦起動",
+                    impersonate_sa=dst_sa,
+                )
+            self.run_command(
+                f"gcloud compute instances suspend {vm_name} --zone={zone} --project={dst_proj} --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Suspend VM {vm_name}",
+                explanation=f"src が SUSPENDED のため dst {vm_name} を suspend",
+                impersonate_sa=dst_sa,
+            )
 
     def _gcloud_exists(self, cmd: str, impersonate_sa: Optional[str]) -> bool:
         """read-only な describe 等で対象リソースの存在を確認する（stats を汚さない）。
