@@ -1,10 +1,10 @@
 .DEFAULT_GOAL := help
 .PHONY: setup run plan mock test projects projects-plan help clean clean-all \
         delete-projects delete-projects-plan \
-        bootstrap bootstrap-apply \
-        bootstrap-dst-sa bootstrap-dst-sa-apply \
-        bootstrap-cross-project bootstrap-cross-project-apply \
-        bootstrap-shared-vpc bootstrap-shared-vpc-apply \
+        bootstrap bootstrap-plan \
+        bootstrap-dst-sa bootstrap-dst-sa-plan \
+        bootstrap-cross-project bootstrap-cross-project-plan \
+        bootstrap-shared-vpc bootstrap-shared-vpc-plan \
         vmware-setup vmware-setup-apply \
         vmware-import vmware-import-apply \
         vmware-start vmware-start-apply \
@@ -85,8 +85,8 @@ delete-projects: setup
 	fi
 	uv run python3 scripts/delete_projects.py --pattern "$(PATTERN)" --no-dry-run $(ARGS)
 
-## bootstrap: dst SA / src 読取権限 / Shared VPC を順に dry-run（コマンド表示のみ）
-bootstrap:
+## bootstrap-plan: dst SA / src 読取権限 / Shared VPC を順に dry-run（コマンド表示のみ）
+bootstrap-plan:
 	@echo "===== [1/3] bootstrap_dst_sa.sh (dry-run) ====="
 	bash scripts/bootstrap_dst_sa.sh
 	@echo "===== [2/3] bootstrap_cross_project.sh (dry-run) ====="
@@ -94,8 +94,8 @@ bootstrap:
 	@echo "===== [3/3] bootstrap_shared_vpc.sh (dry-run) ====="
 	bash scripts/bootstrap_shared_vpc.sh
 
-## bootstrap-apply: 上記 3 つを --apply で実行（dst プロジェクトと src(ORG) に IAM/構成を書き込みます）
-bootstrap-apply:
+## bootstrap: 上記 3 つを --apply で実行（dst プロジェクトと src(ORG) に IAM/構成を書き込みます）
+bootstrap:
 	@echo "===== [1/3] bootstrap_dst_sa.sh --apply ====="
 	bash scripts/bootstrap_dst_sa.sh --apply
 	@echo "===== [2/3] bootstrap_cross_project.sh --apply ====="
@@ -103,22 +103,25 @@ bootstrap-apply:
 	@echo "===== [3/3] bootstrap_shared_vpc.sh --apply ====="
 	bash scripts/bootstrap_shared_vpc.sh --apply
 
-## bootstrap-dst-sa: dst SA 作成 + ロール付与（dry-run）
-bootstrap-dst-sa:
+## bootstrap-dst-sa-plan: dst SA 作成 + ロール付与（dry-run）
+bootstrap-dst-sa-plan:
 	bash scripts/bootstrap_dst_sa.sh
-bootstrap-dst-sa-apply:
+## bootstrap-dst-sa: 同上を --apply で実行
+bootstrap-dst-sa:
 	bash scripts/bootstrap_dst_sa.sh --apply
 
-## bootstrap-cross-project: dst SA に src 読取権限を付与（dry-run）
-bootstrap-cross-project:
+## bootstrap-cross-project-plan: dst SA に src 読取権限を付与（dry-run）
+bootstrap-cross-project-plan:
 	bash scripts/bootstrap_cross_project.sh
-bootstrap-cross-project-apply:
+## bootstrap-cross-project: 同上を --apply で実行
+bootstrap-cross-project:
 	bash scripts/bootstrap_cross_project.sh --apply
 
-## bootstrap-shared-vpc: host を Shared VPC 化し svc をアタッチ（dry-run）
-bootstrap-shared-vpc:
+## bootstrap-shared-vpc-plan: host を Shared VPC 化し svc をアタッチ（dry-run）
+bootstrap-shared-vpc-plan:
 	bash scripts/bootstrap_shared_vpc.sh
-bootstrap-shared-vpc-apply:
+## bootstrap-shared-vpc: 同上を --apply で実行
+bootstrap-shared-vpc:
 	bash scripts/bootstrap_shared_vpc.sh --apply
 
 # ==============================================================================

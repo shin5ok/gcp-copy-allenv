@@ -32,25 +32,25 @@
 
 ---
 
-## 2. `make bootstrap` → `make bootstrap-apply`
+## 2. `make bootstrap-plan` → `make bootstrap`
 
 **目的**: 「誰が、どのプロジェクトに、何を読み書きできるか」を整える。ここで権限と Shared VPC のトポロジが確定する。
 
-3 スクリプトを順次実行。dry-run で内容確認 → `--apply` で適用。
+3 スクリプトを順次実行。`bootstrap-plan` で内容確認 → `bootstrap` で適用（`projects*` と同じく裸 = 実適用 / `-plan` = dry-run）。
 
-### 2a. `bootstrap-dst-sa-apply` (`scripts/bootstrap_dst_sa.sh`)
+### 2a. `bootstrap-dst-sa` (`scripts/bootstrap_dst_sa.sh`)
 **役割**: dst 側の書き込み用 SA を作る。以降の書き込みはすべてこの SA を impersonate して行う。
 - 各 dst プロジェクトに dst SA を作成
 - 付与: `roles/editor` / `roles/storage.admin` / `roles/bigquery.admin`
 - 実行アカウントに `roles/iam.serviceAccountTokenCreator`（impersonate 用）
 
-### 2b. `bootstrap-cross-project-apply` (`scripts/bootstrap_cross_project.sh`)
+### 2b. `bootstrap-cross-project` (`scripts/bootstrap_cross_project.sh`)
 **役割**: dst SA が src を「覗ける」ようにする。src への書き込み権限は与えない。
 - 各 src プロジェクトに read-only カスタムロール `migrationSrcReader` を作成（compute/GCS/BQ/CAI の read 権限のみ）
 - 対応する dst SA に `migrationSrcReader` + `roles/bigquery.dataViewer` を付与
 - **src(ORG) への read-only IAM 書き込み**を伴うため、`sync_env.py` の ORG 保護からは意図的に分離
 
-### 2c. `bootstrap-shared-vpc-apply` (`scripts/bootstrap_shared_vpc.sh`)
+### 2c. `bootstrap-shared-vpc` (`scripts/bootstrap_shared_vpc.sh`)
 **役割**: dst 側のネットワーク構造（Shared VPC）を src と同型にする。
 - dst host を Shared VPC ホスト化
 - dst svc プロジェクトを host にアタッチ
