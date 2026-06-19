@@ -311,3 +311,61 @@ make test
 ### 仕様書
 - [`SPEC.md`](./SPEC.md) / [`dst/SPEC.md`](./dst/SPEC.md): 詳細仕様。
 - [`dst/PROCEDURE.md`](./dst/PROCEDURE.md): 推奨手順と要件。
+
+---
+
+## 📎 Appendix: コピー元 (ORG) 環境をゼロから構築する (`make org*`)
+
+> 通常運用では **不要** です。本ツールの主目的は「既存コピー元 → 新コピー先のクローン」であり、
+> コピー元は普通すでに存在しています。検証 / デモ用に「コピー元っぽい環境」を一から
+> 用意したい場合だけ以下を使ってください。
+
+`make org*` は `scripts/setup_org.sh` を呼び出し、[`org/ORG.md`](./org/ORG.md) に
+記述された構成（プロジェクト / VPC / Subnet / Router / NAT / Shared VPC / VM /
+初期スナップショット）を **冪等に**構築します。値の Single Source of Truth は
+`org/ORG.md` で、スクリプトは [`scripts/parse_org_md.py`](./scripts/parse_org_md.py)
+経由でマークダウン表をパースして読み取ります（IP・VM 名等はハードコードしません）。
+
+### コマンド
+
+| コマンド | 説明 |
+| :--- | :--- |
+| `make org-plan` | ドライラン（実行される `gcloud` コマンドの表示のみ） |
+| `make org` | 実際に作成（`--apply` 相当。host / svc プロジェクトに書き込みます） |
+
+### パラメータ (env)
+
+| 変数 | 既定 | 用途 |
+| :--- | :--- | :--- |
+| `ORG_MD` | `org/ORG.md` | 構成ファイル（別パスでプレビューする時に上書き） |
+| `PARALLEL_JOBS` | `8` | API enable / IP 予約 / VM 作成 / snapshot 作成の並列度上限。Compute Engine API の Quota（regional concurrent ops 500/project, snapshots 専用枠等）に余裕がある範囲で設定 |
+
+### 構築されるリソース（ORG.md の表から生成）
+
+1. Compute Engine API の有効化（host / svc1 / svc3）
+2. host project に VPC / Subnet × 2 / Cloud Router / Cloud NAT
+3. host を Shared VPC 化し、svc1 / svc3 をアタッチ
+4. svc1 / svc3 で **内部固定 IP** を予約
+5. svc1 に Debian VM、svc3 に Ubuntu VM をそれぞれ作成
+6. 各 VM の **初期スナップショット** (`<vm>-init-snap`) を作成
+
+各リソースは describe で存在確認し、既存ならスキップします（再実行安全）。
+
+### startup-script の自動付与
+
+`org/startup-scripts/{linux,windows}/` 配下の **実行可能ファイル** を
+lexicographic 順に連結し、VM の `--metadata-from-file=startup-script=...`
+（Windows は `windows-startup-script-ps1=...`）として登録します。
+ディレクトリ / 実行可能ファイルが無ければ自動スキップ。
+
+### 設定変更時
+
+`org/ORG.md` の表（VM 名 / IP / マシンタイプ / サブネット等）を編集 →
+`make org-plan` で差分確認 → `make org` で適用。スクリプト側のハードコードは無いので、
+新 VM の追加・IP 変更は ORG.md を直すだけで反映されます。
+
+### 前提
+
+- `python3` が PATH にあること（ORG.md パースに使用。stdlib のみで動くので `uv` 不要）
+- `gcloud` が PATH にあり、host / svc プロジェクトに対し Compute Admin / Compute Network Admin / Shared VPC Admin 相当の権限を持つアカウントで `gcloud auth login` 済みであること
+- 3 つのプロジェクト (host / svc1 / svc3) が billing 紐付け済みで存在すること

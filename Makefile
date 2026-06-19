@@ -5,6 +5,7 @@
         bootstrap-dst-sa bootstrap-dst-sa-plan \
         bootstrap-cross-project bootstrap-cross-project-plan \
         bootstrap-shared-vpc bootstrap-shared-vpc-plan \
+        org org-plan \
         vmware-setup vmware-setup-apply \
         vmware-import vmware-import-apply \
         vmware-start vmware-start-apply \
@@ -123,6 +124,14 @@ bootstrap-shared-vpc-plan:
 ## bootstrap-shared-vpc: 同上を --apply で実行
 bootstrap-shared-vpc:
 	bash scripts/bootstrap_shared_vpc.sh --apply
+
+## org-plan: org/ORG.md に定義された元環境（VPC/Subnet/NAT/VM）を dry-run
+org-plan:
+	bash scripts/setup_org.sh
+
+## org: 同上を --apply で実行（host/svc プロジェクトに書き込みます）
+org:
+	bash scripts/setup_org.sh --apply
 
 # ==============================================================================
 # VMware VMDK → GCE 化 (vmware/Makefile への委譲)
