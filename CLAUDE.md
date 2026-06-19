@@ -71,6 +71,14 @@ make vmware-all # VMware → GCE フル処理
 
 ## ハマりどころ（既知の落とし穴）
 
+### Terraform skip_on_run と `.dst_project` マーカー（Step 3 / 4）
+
+- `terraform/active/<src>/.dst_project` は **customize_hcl と `_reset_stale_state_if_needed` の両方が書く**。意味は「active/ が customize 済みの dst」と「state が apply 済みの dst」を兼ねる。
+- 旧実装では `_reset_stale_state_if_needed` (Step 4) だけが書いていたため、`make plan` (dry_run) では Step 4 がガード (`if not self.dry_run`) で素通りしてマーカーが残らず、次の `make run` で Step 3 skip_on_run が必ず stale 判定になり customize が毎回再実行されていた (regression)。
+- 現在は `customize_hcl` 末尾で `proj_map[name]` を書き込み、`make plan → make run` (同一 dst) で確実にスキップパスに乗る。
+- dry_run では `customize_hcl` が `.tf` を実書き出ししない (`if self.dry_run: continue`) ので、マーカーも更新しないこと。.tf と marker の整合が崩れる。
+- マーカーが「customize 済み」と「apply 済み」の両方の意味を持つようになったため、`_reset_stale_state_if_needed` は **マーカー一致でも state 本文に現 dst が無ければ stale** と判定する (state は apply でしか更新されない)。両判定を OR で評価する。
+
 ### GCE 復元と電源状態（Step 5 / 5.5）
 
 - `_restore_one_vm` は src.status に関わらず **常に VM を RUNNING で残す**（新規作成は `instances create` 直後、既存差し替えは末尾の `instances start`）。
@@ -95,6 +103,10 @@ make vmware-all # VMware → GCE フル処理
   - dst ORG で同等タグを作成し `config steps.network_firewall.secure_tag_map` に `src tagValues → dst tagValues` を登録すると変換して複製。
   - 未登録タグを参照するルールは **FW を意図せず緩めないようスキップ + WARNING**（エラーにしない）。`fw_policy_rule_flags(rule, proj_map, secure_tag_map)` / `_fw_secure_tag_map()` 参照。
 - 同種の「別 ORG では ID が変わるリソース」（org policy 制約、tag key/value、IAM の org スコープロール等）は同じパターンで config マッピング or スキップ＋WARNING を検討する。
+- **dst host VPC topology は Step 4.5 開始時点で存在している必要がある**。FW rule の `--network=` と FW policy association の `--network=` は dst host の `shared-vpc` 等を参照するため、未作成だと `Could not fetch resource: 'projects/<dst_host>/global/networks/<name>' was not found` で全 FW 操作が失敗する（regression）。
+  - dst host VPC の作成は `_replicate_host_networks()` の責務。元々は `step_gce_restore` (Step 5) からしか呼ばれず Step 4.5 が先に走って詰んでいたため、現在は **`step_network_firewall` の冒頭でも呼ぶ**。冪等 (`_gcloud_exists` ガード) なので Step 5 で再度呼ばれても describe のみで安全。
+  - 追加の防御として `_sync_classic_firewall_rules` 冒頭で参照される dst network を一括 pre-flight チェックし、`_sync_fw_policy_associations` でも assoc 単位で existence チェックして、未存在なら skip + WARNING に倒す（cryptic な API エラー量産を防ぐ）。
+  - Shared VPC ホスト化・サービスプロジェクト関連付け・networkUser 付与は別途 `bootstrap_shared_vpc.sh` の担当。VPC 自体は作らない点に注意。
 
 ## Git コミット
 
