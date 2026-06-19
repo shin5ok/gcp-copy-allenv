@@ -45,16 +45,16 @@
 - **ネットワークカード設定**: 外部IPなし（プライベートIPのみ、上記 Cloud NAT 経由でインターネット接続）
 
 ### 3.1. Service Project 1 (`<SRC_SERVICE_PROJECT_ID_1>`)
-
+# 
 OSはすべて **Debian 12** (`projects/debian-cloud/global/images/family/debian-12`) を使用します。
-
+# 
 | インスタンス名 | マシンタイプ | OSイメージ | ゾーン | サブネット | 内部固定IPアドレス |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `org-svc1-deb-e2-mic-01` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.11` |
-| `org-svc1-deb-e2-mic-02` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.12` |
-| `org-svc1-deb-e2-mic-03` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.13` |
-| `org-svc1-deb-n2-std2-01` | `n2-standard-2` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.14` |
-| `org-svc1-deb-n2-std2-02` | `n2-standard-2` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.15` |
+| `org-svc1-deb-e2-mic-101` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.110` |
+# | `org-svc1-deb-e2-mic-102` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.120` |
+# | `org-svc1-deb-e2-mic-103` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.130` |
+# | `org-svc1-deb-n2-std2-101` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.140` |
+# | `org-svc1-deb-n2-std2-102` | `e2-micro` | `debian-12` | `asia-northeast1-a` | `subnet-svc1` | `10.100.1.150` |
 
 ### 3.2. Service Project 3 (`<SRC_SERVICE_PROJECT_ID_3>`)
 
@@ -62,9 +62,9 @@ OSはすべて **Ubuntu 22.04 LTS** (`projects/ubuntu-os-cloud/global/images/fam
 
 | インスタンス名 | マシンタイプ | OSイメージ | ゾーン | サブネット | 内部固定IPアドレス |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `org-svc3-ub-e2-med-01` | `e2-medium` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.11` |
-| `org-svc3-ub-e2-med-02` | `e2-medium` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.12` |
-| `org-svc3-ub-e2-med-03` | `e2-medium` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.13` |
-| `org-svc3-ub-e2-mic-01` | `e2-micro` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.14` |
-| `org-svc3-ub-e2-mic-02` | `e2-micro` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.15` |
-| `org-svc3-ub-c2-std4-01` | `c2-standard-4` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.16` |
+| `org-svc3-ub-e2-med-301` | `e2-medium` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.111` |
+| `org-svc3-ub-e2-med-302` | `e2-medium` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.121` |
+| `org-svc3-ub-e2-med-303` | `e2-medium` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.131` |
+| `org-svc3-ub-e2-mic-301` | `e2-micro` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.141` |
+| `org-svc3-ub-e2-mic-302` | `e2-micro` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.151` |
+| `org-svc3-ub-c2-std4-301` | `e2-micro` | `ubuntu-2204-lts` | `asia-northeast1-a` | `subnet-svc3` | `10.100.3.161` |
