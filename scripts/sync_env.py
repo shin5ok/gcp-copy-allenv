@@ -2413,6 +2413,31 @@ resource "google_storage_bucket" "mock_bucket" {{
                     self.org_logger.error(f"    HCL カスタマイズ失敗 {raw_path}: {e}")
                     sys.exit(1)
 
+        # customize 済みの dst プロジェクト ID をプロジェクトごとに記録する。
+        # 次回 make run の Step 3 skip_on_run チェックがこのマーカーを参照して、
+        # 同じ dst のままなら customize を丸ごとスキップできるようにする。
+        # 旧実装では _reset_stale_state_if_needed (Step 4) だけがこのマーカーを
+        # 書いていたが、Step 4 は dry_run/mock では呼ばれないため `make plan` 後の
+        # `make run` で毎回 customize が再実行される regression があった。
+        # dry_run では .tf を実書き出ししない (上のループ内 `if self.dry_run: continue`)
+        # ため、マーカーも更新しないこと (.tf と marker の整合を保つ)。
+        if not self.dry_run and os.path.isdir(active_dir):
+            for name in sorted(os.listdir(active_dir)):
+                proj_dir = os.path.join(active_dir, name)
+                if not os.path.isdir(proj_dir):
+                    continue
+                dst_for = proj_map.get(name)
+                if not dst_for:
+                    continue
+                marker = os.path.join(proj_dir, ".dst_project")
+                try:
+                    with open(marker, "w", encoding="utf-8") as f:
+                        f.write(dst_for)
+                except OSError as e:
+                    self.org_logger.warning(
+                        f"  .dst_project マーカー書き出し失敗 {marker}: {e}"
+                    )
+
     def _escape_interpolations(self, content: str) -> str:
         """Terraform が補間として解釈する `${...}` / `%{...}` をエスケープする。
 
@@ -2760,9 +2785,15 @@ resource "google_storage_bucket" "mock_bucket" {{
     def _reset_stale_state_if_needed(self, proj_dir: str, dst_proj: str):
         """active/<src> の terraform state が現在の dst プロジェクト用でなければ破棄する。
 
-        - `.dst_project` マーカーがあり中身が現 dst と異なる → stale。
-        - マーカーが無い旧 state は、state 本文に現 dst プロジェクト ID が一度も
-          現れない（=別プロジェクト用）なら stale とみなす。
+        判定:
+        - `.dst_project` マーカー != 現 dst → 旧 customize 用の残骸。stale。
+        - マーカーが現 dst と一致していても、state 本文が現 dst を一切参照
+          していなければ別 dst で apply された state とみなして stale。
+          customize_hcl が plan 時にもマーカーを書く運用に変えた (Step 3
+          skip_on_run の高速パス対応) ため、「マーカー一致 = state も新鮮」
+          とは限らなくなった。state は apply でしか更新されないため
+          state 本文を独立に検査する必要がある。
+
         stale なら terraform.tfstate（+backup）、.terraform、lock を削除し、
         import からクリーンにやり直せるようにする。最後にマーカーを現 dst で更新。
         """
@@ -2771,15 +2802,16 @@ resource "google_storage_bucket" "mock_bucket" {{
         stale = False
         if os.path.exists(marker):
             try:
-                stale = open(marker, encoding="utf-8").read().strip() != dst_proj
+                if open(marker, encoding="utf-8").read().strip() != dst_proj:
+                    stale = True
             except OSError:
-                stale = False
-        elif os.path.exists(state):
+                pass
+        if not stale and os.path.exists(state):
             try:
                 txt = open(state, encoding="utf-8").read()
             except OSError:
                 txt = ""
-            # リソースを持つ state なのに現 dst プロジェクトを一切参照していない＝旧環境用。
+            # リソースを持つ state なのに現 dst プロジェクトを一度も参照しない＝旧環境用。
             if '"resources"' in txt and len(txt) > 200 and dst_proj not in txt:
                 stale = True
 
@@ -2983,6 +3015,14 @@ resource "google_storage_bucket" "mock_bucket" {{
         bulk-export は google_compute_network_firewall_policy を出力しない。
         classic firewall rule も Shared VPC ネットワーク URL が src を向くため
         terraform では適用困難。本ステップで gcloud を直接使い冪等に複製する。
+
+        前提: dst host の Shared VPC ネットワーク (例: shared-vpc) が存在していること。
+        FW rule / FW policy association は --network=<NAME> を要求するため、
+        dst host に VPC が無いと "Could not fetch resource" で失敗する。
+        以前は _replicate_host_networks() が step_gce_restore (Step 5) でのみ呼ばれて
+        いたため、Step 4.5 が先に走って全 FW 操作が失敗していた (regression)。
+        本ステップ冒頭で先に呼ぶことで解消。_replicate_host_networks は冪等
+        (_gcloud_exists ガード) なので Step 5 で再度呼ばれてもコストは describe のみ。
         """
         log_stage_header(self.dst_logger, 45, "Network Firewall 複製 (rules + policies)")
 
@@ -2995,6 +3035,13 @@ resource "google_storage_bucket" "mock_bucket" {{
         if not src_host or not dst_host:
             self.dst_logger.warning("  host_project が未設定のため network_firewall をスキップ")
             return
+
+        # dst host の VPC topology を Step 4.5 で先に用意する (bug fix)。
+        # Step 5 (gce_restore) でも同じ呼び出しがあるが冪等なので問題ない。
+        self._replicate_host_networks()
+        self.dst_logger.info(
+            f"  [Network] dst host {dst_host} VPC topology ready — FW 同期へ進む"
+        )
 
         self._sync_classic_firewall_rules(src_host, dst_host, src_sa, dst_sa)
         self._sync_network_firewall_policies(src_host, dst_host, src_sa, dst_sa)
@@ -3019,6 +3066,32 @@ resource "google_storage_bucket" "mock_bucket" {{
         except Exception:
             rules = []
 
+        # Pre-flight: 参照される dst ネットワークが本当に存在するか一度だけ確認する。
+        # _replicate_host_networks() は Step 4.5 冒頭で呼ばれているはずだが、何らかの
+        # 理由 (権限不足 / 部分失敗 / config の host_project ミスマッチ) で未作成だと
+        # rule 毎に "Could not fetch resource" が量産されるため、ここで一括 skip+WARN
+        # に倒す。dry_run/mock では _gcloud_exists が常に False を返すため、確認は
+        # スキップして全 rule の create パスを通す (今までの plan 挙動を維持)。
+        missing_dst_nets: set = set()
+        if not (self.dry_run or self.mock):
+            referenced_nets = {
+                (r.get('network') or '').split('/')[-1] or 'default'
+                for r in rules if r.get('name')
+            }
+            for net_name in sorted(referenced_nets):
+                if not self._gcloud_exists(
+                    f"gcloud compute networks describe {net_name} --project={dst_host} "
+                    f"--format='value(name)'",
+                    dst_sa,
+                ):
+                    missing_dst_nets.add(net_name)
+            if missing_dst_nets:
+                self.dst_logger.warning(
+                    f"  [FW Rules] dst host {dst_host} に未存在の network: "
+                    f"{sorted(missing_dst_nets)} — 参照する FW rule はスキップします "
+                    f"(bootstrap_shared_vpc.sh / _replicate_host_networks の結果を確認)"
+                )
+
         def rule_worker(rule):
             name = rule.get('name', '')
             if not name:
@@ -3035,6 +3108,13 @@ resource "google_storage_bucket" "mock_bucket" {{
             # ネットワーク名を src → dst に置換（URL 末尾から取得）
             net_url = rule.get('network', '')
             net_name = net_url.split('/')[-1] if net_url else 'default'
+
+            if net_name in missing_dst_nets:
+                self.dst_logger.warning(
+                    f"    FW rule '{name}': dst network '{net_name}' が "
+                    f"{dst_host} に未存在のためスキップ"
+                )
+                return
 
             direction = rule.get('direction', 'INGRESS')
             priority = rule.get('priority', 1000)
@@ -3346,6 +3426,23 @@ resource "google_storage_bucket" "mock_bucket" {{
                 )
                 continue
 
+            # dst network が無い状態で association create を叩くと
+            # "Could not fetch resource" で失敗する (regression 防止)。
+            # _replicate_host_networks() は Step 4.5 冒頭で済んでいるはずだが、
+            # 念のため確認して未存在なら skip + WARNING に倒す。
+            dst_net_name = dst_net_url.split('/')[-1] if dst_net_url else ''
+            if dst_net_name and not self._gcloud_exists(
+                f"gcloud compute networks describe {dst_net_name} --project={dst_host} "
+                f"--format='value(name)'",
+                dst_sa,
+            ):
+                self.dst_logger.warning(
+                    f"      Assoc '{assoc_name}': dst network '{dst_net_name}' が "
+                    f"{dst_host} に未存在のためスキップ "
+                    f"(bootstrap_shared_vpc.sh / _replicate_host_networks の結果を確認)"
+                )
+                continue
+
             self.run_command(
                 f"gcloud compute network-firewall-policies associations create "
                 f"--firewall-policy={pname} --project={dst_host} {fw_rule_scope_flag(scope_flag)} "
@@ -3380,6 +3477,10 @@ resource "google_storage_bucket" "mock_bucket" {{
 
         # bulk-export は Shared VPC のネットワーク定義を出力しないため、VM を共有
         # サブネットに作成する前に src host の VPC/subnet を dst host へ複製する。
+        # 通常は Step 4.5 (step_network_firewall) で既に作成済み。冪等なので
+        # ここでは _gcloud_exists で skip するだけで実 create は走らない。
+        # Step 5 単体実行 (network_firewall.enabled = false) でも動くよう、
+        # 呼び出しは残しておくこと。
         self._replicate_host_networks()
 
         # 1) プロジェクトごとの (vms, snapshots) を並列取得（src read-only）

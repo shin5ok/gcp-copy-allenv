@@ -119,8 +119,11 @@ steps:
     output_dir: "./terraform"
     # true にすると本番実行 (`make run` = --no-dry-run) では bulk-export と
     # customize を**スキップ**し、既存の terraform/active/ を再利用する。
+    # 判定は active/<src>/.dst_project マーカー (customize_hcl が現 dst で書き出す)
+    # と現 config の dst が一致するかで行う。一致するなら丸ごとスキップ、
+    # 一致しないが raw が残っていれば customize のみ再実行、それ以外は通常実行。
     # `make plan` (dry-run) には影響しない（plan では常に最新を取り直す）。
-    # 用途: make plan で生成済みの active をそのまま使って run を高速化したいとき。
+    # 用途: 前回 make run で生成済みの active を、同じ dst の次回 run で再利用したいとき。
     skip_on_run: false
 
   # [Step 4] dst へIaCでの再現 (Terraform適用)
