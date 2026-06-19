@@ -8,9 +8,9 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 「別ステップが担当」: Step 4.5 / Step 5 / Step 6 等で複製。bulk-export 単体での欠落は想定通り。
 - 「未登録」「bulk-export が出力しなかった」: 対応の検討が必要。
 
-## プロジェクト: `shingo-ar-sharedhost0926` → `shingo-ar-host2026061801`
+## プロジェクト: `shingo-ar-sharedhost0926` → `shingo-ar-host2026061900`
 
-- CAI 検出リソース: **62** 件 / TF 出力リソース: **43** 件 / 一致: **12** 件 / 欠落候補: **50** 件
+- CAI 検出リソース: **63** 件 / TF 出力リソース: **3** 件 / 一致: **0** 件 / 欠落候補: **63** 件
 
 ### `cloudbilling.googleapis.com/ProjectBillingInfo` （1 件）
 
@@ -54,6 +54,94 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # cloudresourcemanager.googleapis.com/Project は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
+### `compute.googleapis.com/Address` （2 件）
+
+#### `nat-auto-ip-10281266-0-1781794550182258` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/regions/asia-northeast1/addresses/nat-auto-ip-10281266-0-1781794550182258`
+- 担当ステップ: `terraform_apply`
+- 期待 TF 型: `google_compute_address/google_compute_global_address`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_address/google_compute_global_address)
+- 推奨コマンド:
+  ```bash
+  gcloud compute addresses describe nat-auto-ip-10281266-0-1781794550182258 --region=asia-northeast1 --project=shingo-ar-sharedhost0926
+  gcloud compute addresses create nat-auto-ip-10281266-0-1781794550182258 --project=shingo-ar-host2026061900 --region=asia-northeast1
+  ```
+
+#### `coordinator` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/global/addresses/coordinator`
+- 担当ステップ: `terraform_apply`
+- 期待 TF 型: `google_compute_address/google_compute_global_address`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_address/google_compute_global_address)
+- 推奨コマンド:
+  ```bash
+  gcloud compute addresses describe coordinator --global --project=shingo-ar-sharedhost0926
+  gcloud compute addresses create coordinator --project=shingo-ar-host2026061900 --global
+  ```
+
+### `compute.googleapis.com/Firewall` （5 件）
+
+#### `testrule30000` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/global/firewalls/testrule30000`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe testrule30000 --project=shingo-ar-sharedhost0926
+  gcloud compute firewall-rules create testrule30000 --project=shingo-ar-host2026061900 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
+#### `rdp` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/global/firewalls/rdp`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe rdp --project=shingo-ar-sharedhost0926
+  gcloud compute firewall-rules create rdp --project=shingo-ar-host2026061900 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
+#### `ssh` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/global/firewalls/ssh`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe ssh --project=shingo-ar-sharedhost0926
+  gcloud compute firewall-rules create ssh --project=shingo-ar-host2026061900 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
+#### `all-for-incredibuild` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/global/firewalls/all-for-incredibuild`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe all-for-incredibuild --project=shingo-ar-sharedhost0926
+  gcloud compute firewall-rules create all-for-incredibuild --project=shingo-ar-host2026061900 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
+#### `allow-shared-iap-ssh` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/global/firewalls/allow-shared-iap-ssh`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe allow-shared-iap-ssh --project=shingo-ar-sharedhost0926
+  gcloud compute firewall-rules create allow-shared-iap-ssh --project=shingo-ar-host2026061900 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
 ### `compute.googleapis.com/FirewallPolicy` （2 件）
 
 #### `test8000` (location=`global`)
@@ -65,7 +153,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute network-firewall-policies describe test8000 --global --project=shingo-ar-sharedhost0926
-  gcloud compute network-firewall-policies create test8000 --global --project=shingo-ar-host2026061801 --description=<DESC>
+  gcloud compute network-firewall-policies create test8000 --global --project=shingo-ar-host2026061900 --description=<DESC>
   ```
 
 #### `ssh-from-all` (location=`asia-northeast1`)
@@ -77,7 +165,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute network-firewall-policies describe ssh-from-all --global --project=shingo-ar-sharedhost0926
-  gcloud compute network-firewall-policies create ssh-from-all --global --project=shingo-ar-host2026061801 --description=<DESC>
+  gcloud compute network-firewall-policies create ssh-from-all --global --project=shingo-ar-host2026061900 --description=<DESC>
   ```
 
 ### `compute.googleapis.com/InstanceSettings` （3 件）
@@ -118,6 +206,20 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # compute.googleapis.com/InstanceSettings は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
+### `compute.googleapis.com/Network` （1 件）
+
+#### `shared-vpc` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/global/networks/shared-vpc`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_network`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_network)
+- 推奨コマンド:
+  ```bash
+  gcloud compute networks describe shared-vpc --project=shingo-ar-sharedhost0926
+  gcloud compute networks create shared-vpc --project=shingo-ar-host2026061900 --subnet-mode=custom
+  ```
+
 ### `compute.googleapis.com/Project` （1 件）
 
 #### `shingo-ar-sharedhost0926` (location=`global`)
@@ -143,7 +245,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-r-4461f276b01d2f9b --project=shingo-ar-sharedhost0926
-  gcloud compute routes create default-route-r-4461f276b01d2f9b --project=shingo-ar-host2026061801 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-r-4461f276b01d2f9b --project=shingo-ar-host2026061900 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-r-5b0ce4d4d24c5d20` (location=`global`)
@@ -155,7 +257,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-r-5b0ce4d4d24c5d20 --project=shingo-ar-sharedhost0926
-  gcloud compute routes create default-route-r-5b0ce4d4d24c5d20 --project=shingo-ar-host2026061801 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-r-5b0ce4d4d24c5d20 --project=shingo-ar-host2026061900 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-e7b27198104c4cc0` (location=`global`)
@@ -167,7 +269,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-e7b27198104c4cc0 --project=shingo-ar-sharedhost0926
-  gcloud compute routes create default-route-e7b27198104c4cc0 --project=shingo-ar-host2026061801 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-e7b27198104c4cc0 --project=shingo-ar-host2026061900 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-2d5c5b7662d1a301` (location=`global`)
@@ -179,7 +281,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-2d5c5b7662d1a301 --project=shingo-ar-sharedhost0926
-  gcloud compute routes create default-route-2d5c5b7662d1a301 --project=shingo-ar-host2026061801 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-2d5c5b7662d1a301 --project=shingo-ar-host2026061900 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-4a82a4f6a6983b3d` (location=`global`)
@@ -191,7 +293,71 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-4a82a4f6a6983b3d --project=shingo-ar-sharedhost0926
-  gcloud compute routes create default-route-4a82a4f6a6983b3d --project=shingo-ar-host2026061801 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-4a82a4f6a6983b3d --project=shingo-ar-host2026061900 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  ```
+
+### `compute.googleapis.com/Router` （1 件）
+
+#### `shared-router` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/regions/asia-northeast1/routers/shared-router`
+- 担当ステップ: `意図的対象外 (None)`
+- 期待 TF 型: `google_compute_router`
+- 判定理由: 意図的に対象外（マップで None 指定）
+- 推奨コマンド:
+  ```bash
+  gcloud compute routers describe shared-router --region=asia-northeast1 --project=shingo-ar-sharedhost0926
+  gcloud compute routers create shared-router --project=shingo-ar-host2026061900 --region=asia-northeast1 --network=<NETWORK> --asn=<ASN>
+  ```
+
+### `compute.googleapis.com/Subnetwork` （4 件）
+
+#### `subnet-svc3` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/regions/asia-northeast1/subnetworks/subnet-svc3`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_subnetwork`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_subnetwork)
+- 推奨コマンド:
+  ```bash
+  gcloud compute networks subnets describe subnet-svc3 --region=asia-northeast1 --project=shingo-ar-sharedhost0926
+  gcloud compute networks subnets create subnet-svc3 --project=shingo-ar-host2026061900 --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
+  ```
+
+#### `subnet-svc1` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/regions/asia-northeast1/subnetworks/subnet-svc1`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_subnetwork`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_subnetwork)
+- 推奨コマンド:
+  ```bash
+  gcloud compute networks subnets describe subnet-svc1 --region=asia-northeast1 --project=shingo-ar-sharedhost0926
+  gcloud compute networks subnets create subnet-svc1 --project=shingo-ar-host2026061900 --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
+  ```
+
+#### `tokyo-2` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/regions/asia-northeast1/subnetworks/tokyo-2`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_subnetwork`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_subnetwork)
+- 推奨コマンド:
+  ```bash
+  gcloud compute networks subnets describe tokyo-2 --region=asia-northeast1 --project=shingo-ar-sharedhost0926
+  gcloud compute networks subnets create tokyo-2 --project=shingo-ar-host2026061900 --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
+  ```
+
+#### `tokyo` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedhost0926/regions/asia-northeast1/subnetworks/tokyo`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_subnetwork`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_subnetwork)
+- 推奨コマンド:
+  ```bash
+  gcloud compute networks subnets describe tokyo --region=asia-northeast1 --project=shingo-ar-sharedhost0926
+  gcloud compute networks subnets create tokyo --project=shingo-ar-host2026061900 --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
   ```
 
 ### `iam.googleapis.com/Role` （1 件）
@@ -205,7 +371,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam roles describe migrationSrcReader --project=shingo-ar-sharedhost0926
-  gcloud iam roles create migrationSrcReader --project=shingo-ar-host2026061801 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
+  gcloud iam roles create migrationSrcReader --project=shingo-ar-host2026061900 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
   ```
 
 ### `iam.googleapis.com/ServiceAccount` （2 件）
@@ -219,7 +385,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam service-accounts describe org-host-viewer@shingo-ar-sharedhost0926.iam.gserviceaccount.com --project=shingo-ar-sharedhost0926
-  gcloud iam service-accounts create org-host-viewer --project=shingo-ar-host2026061801 --display-name=<DISPLAY_NAME>
+  gcloud iam service-accounts create org-host-viewer --project=shingo-ar-host2026061900 --display-name=<DISPLAY_NAME>
   ```
 
 #### `1035210593832-compute@developer.gserviceaccount.com` (location=`global`)
@@ -231,7 +397,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam service-accounts describe 1035210593832-compute@developer.gserviceaccount.com --project=shingo-ar-sharedhost0926
-  gcloud iam service-accounts create 1035210593832-compute --project=shingo-ar-host2026061801 --display-name=<DISPLAY_NAME>
+  gcloud iam service-accounts create 1035210593832-compute --project=shingo-ar-host2026061900 --display-name=<DISPLAY_NAME>
   ```
 
 ### `logging.googleapis.com/LogBucket` （2 件）
@@ -245,7 +411,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging buckets describe _Default --location=global --project=1035210593832
-  gcloud logging buckets create _Default --location=global --project=shingo-ar-host2026061801 --retention-days=<N>
+  gcloud logging buckets create _Default --location=global --project=shingo-ar-host2026061900 --retention-days=<N>
   ```
 
 #### `_Required` (location=`global`)
@@ -257,7 +423,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging buckets describe _Required --location=global --project=1035210593832
-  gcloud logging buckets create _Required --location=global --project=shingo-ar-host2026061801 --retention-days=<N>
+  gcloud logging buckets create _Required --location=global --project=shingo-ar-host2026061900 --retention-days=<N>
   ```
 
 ### `logging.googleapis.com/LogSink` （2 件）
@@ -271,7 +437,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging sinks describe _Required --project=1035210593832
-  gcloud logging sinks create _Required <DESTINATION> --project=shingo-ar-host2026061801 --log-filter='<FILTER>'
+  gcloud logging sinks create _Required <DESTINATION> --project=shingo-ar-host2026061900 --log-filter='<FILTER>'
   ```
 
 #### `_Default` (location=`global`)
@@ -283,7 +449,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging sinks describe _Default --project=1035210593832
-  gcloud logging sinks create _Default <DESTINATION> --project=shingo-ar-host2026061801 --log-filter='<FILTER>'
+  gcloud logging sinks create _Default <DESTINATION> --project=shingo-ar-host2026061900 --log-filter='<FILTER>'
   ```
 
 ### `serviceusage.googleapis.com/Service` （27 件）
@@ -297,7 +463,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:cloudtrace.googleapis.com'
-  gcloud services enable cloudtrace.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable cloudtrace.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `artifactregistry.googleapis.com` (location=`global`)
@@ -309,7 +475,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:artifactregistry.googleapis.com'
-  gcloud services enable artifactregistry.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable artifactregistry.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `compute.googleapis.com` (location=`global`)
@@ -321,7 +487,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:compute.googleapis.com'
-  gcloud services enable compute.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable compute.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `cloudapis.googleapis.com` (location=`global`)
@@ -333,7 +499,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:cloudapis.googleapis.com'
-  gcloud services enable cloudapis.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable cloudapis.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `storage.googleapis.com` (location=`global`)
@@ -345,7 +511,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:storage.googleapis.com'
-  gcloud services enable storage.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable storage.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `oslogin.googleapis.com` (location=`global`)
@@ -357,7 +523,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:oslogin.googleapis.com'
-  gcloud services enable oslogin.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable oslogin.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `iamcredentials.googleapis.com` (location=`global`)
@@ -369,7 +535,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:iamcredentials.googleapis.com'
-  gcloud services enable iamcredentials.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable iamcredentials.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `logging.googleapis.com` (location=`global`)
@@ -381,7 +547,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:logging.googleapis.com'
-  gcloud services enable logging.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable logging.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `telemetry.googleapis.com` (location=`global`)
@@ -393,7 +559,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:telemetry.googleapis.com'
-  gcloud services enable telemetry.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable telemetry.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `cloudasset.googleapis.com` (location=`global`)
@@ -405,7 +571,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:cloudasset.googleapis.com'
-  gcloud services enable cloudasset.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable cloudasset.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `storage-component.googleapis.com` (location=`global`)
@@ -417,7 +583,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:storage-component.googleapis.com'
-  gcloud services enable storage-component.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable storage-component.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `iam.googleapis.com` (location=`global`)
@@ -429,7 +595,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:iam.googleapis.com'
-  gcloud services enable iam.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable iam.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `servicemanagement.googleapis.com` (location=`global`)
@@ -441,7 +607,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:servicemanagement.googleapis.com'
-  gcloud services enable servicemanagement.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable servicemanagement.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `serviceusage.googleapis.com` (location=`global`)
@@ -453,7 +619,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:serviceusage.googleapis.com'
-  gcloud services enable serviceusage.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable serviceusage.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `sql-component.googleapis.com` (location=`global`)
@@ -465,7 +631,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:sql-component.googleapis.com'
-  gcloud services enable sql-component.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable sql-component.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `bigquery.googleapis.com` (location=`global`)
@@ -477,7 +643,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:bigquery.googleapis.com'
-  gcloud services enable bigquery.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable bigquery.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `cloudbuild.googleapis.com` (location=`global`)
@@ -489,7 +655,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:cloudbuild.googleapis.com'
-  gcloud services enable cloudbuild.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable cloudbuild.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `bigquerymigration.googleapis.com` (location=`global`)
@@ -501,7 +667,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:bigquerymigration.googleapis.com'
-  gcloud services enable bigquerymigration.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable bigquerymigration.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `monitoring.googleapis.com` (location=`global`)
@@ -513,7 +679,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:monitoring.googleapis.com'
-  gcloud services enable monitoring.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable monitoring.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `containerregistry.googleapis.com` (location=`global`)
@@ -525,7 +691,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:containerregistry.googleapis.com'
-  gcloud services enable containerregistry.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable containerregistry.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `servicecontrol.googleapis.com` (location=`global`)
@@ -537,7 +703,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:servicecontrol.googleapis.com'
-  gcloud services enable servicecontrol.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable servicecontrol.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `datastore.googleapis.com` (location=`global`)
@@ -549,7 +715,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:datastore.googleapis.com'
-  gcloud services enable datastore.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable datastore.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `cloudresourcemanager.googleapis.com` (location=`global`)
@@ -561,7 +727,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:cloudresourcemanager.googleapis.com'
-  gcloud services enable cloudresourcemanager.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable cloudresourcemanager.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `bigquerystorage.googleapis.com` (location=`global`)
@@ -573,7 +739,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:bigquerystorage.googleapis.com'
-  gcloud services enable bigquerystorage.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable bigquerystorage.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `pubsub.googleapis.com` (location=`global`)
@@ -585,7 +751,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:pubsub.googleapis.com'
-  gcloud services enable pubsub.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable pubsub.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `storage-api.googleapis.com` (location=`global`)
@@ -597,7 +763,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:storage-api.googleapis.com'
-  gcloud services enable storage-api.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable storage-api.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 #### `vmmigration.googleapis.com` (location=`global`)
@@ -609,7 +775,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1035210593832 --filter='config.name:vmmigration.googleapis.com'
-  gcloud services enable vmmigration.googleapis.com --project=shingo-ar-host2026061801
+  gcloud services enable vmmigration.googleapis.com --project=shingo-ar-host2026061900
   ```
 
 ### `storage.googleapis.com/Bucket` （2 件）
@@ -623,7 +789,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud storage buckets describe gs://shingo-ar-sharedhost0926
-  gcloud storage buckets create gs://<DST_BUCKET_NAME> --project=shingo-ar-host2026061801 --location=us-central1  # 名前は rename_rules.gcs を適用すること
+  gcloud storage buckets create gs://<DST_BUCKET_NAME> --project=shingo-ar-host2026061900 --location=us-central1  # 名前は rename_rules.gcs を適用すること
   ```
 
 #### `gcs-test-shingo-ar-sharedhost0926` (location=`asia`)
@@ -635,12 +801,12 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud storage buckets describe gs://gcs-test-shingo-ar-sharedhost0926
-  gcloud storage buckets create gs://<DST_BUCKET_NAME> --project=shingo-ar-host2026061801 --location=asia  # 名前は rename_rules.gcs を適用すること
+  gcloud storage buckets create gs://<DST_BUCKET_NAME> --project=shingo-ar-host2026061900 --location=asia  # 名前は rename_rules.gcs を適用すること
   ```
 
-## プロジェクト: `shingo-ar-sharedservice0926-1` → `shingo-ar-service2026061801-1`
+## プロジェクト: `shingo-ar-sharedservice0926-1` → `shingo-ar-service2026061900-1`
 
-- CAI 検出リソース: **102** 件 / TF 出力リソース: **24** 件 / 一致: **1** 件 / 欠落候補: **101** 件
+- CAI 検出リソース: **108** 件 / TF 出力リソース: **3** 件 / 一致: **1** 件 / 欠落候補: **107** 件
 
 ### `cloudbilling.googleapis.com/ProjectBillingInfo` （1 件）
 
@@ -670,7 +836,19 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # cloudresourcemanager.googleapis.com/Project は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
-### `compute.googleapis.com/Address` （5 件）
+### `compute.googleapis.com/Address` （6 件）
+
+#### `sharedvpcip` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-1/regions/asia-northeast1/addresses/sharedvpcip`
+- 担当ステップ: `terraform_apply`
+- 期待 TF 型: `google_compute_address/google_compute_global_address`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_address/google_compute_global_address)
+- 推奨コマンド:
+  ```bash
+  gcloud compute addresses describe sharedvpcip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-1
+  gcloud compute addresses create sharedvpcip --project=shingo-ar-service2026061900-1 --region=asia-northeast1
+  ```
 
 #### `org-svc1-deb-n2-std2-02-ip` (location=`asia-northeast1`)
 
@@ -681,7 +859,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc1-deb-n2-std2-02-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-1
-  gcloud compute addresses create org-svc1-deb-n2-std2-02-ip --project=shingo-ar-service2026061801-1 --region=asia-northeast1
+  gcloud compute addresses create org-svc1-deb-n2-std2-02-ip --project=shingo-ar-service2026061900-1 --region=asia-northeast1
   ```
 
 #### `org-svc1-deb-n2-std2-01-ip` (location=`asia-northeast1`)
@@ -693,7 +871,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc1-deb-n2-std2-01-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-1
-  gcloud compute addresses create org-svc1-deb-n2-std2-01-ip --project=shingo-ar-service2026061801-1 --region=asia-northeast1
+  gcloud compute addresses create org-svc1-deb-n2-std2-01-ip --project=shingo-ar-service2026061900-1 --region=asia-northeast1
   ```
 
 #### `org-svc1-deb-e2-mic-01-ip` (location=`asia-northeast1`)
@@ -705,7 +883,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc1-deb-e2-mic-01-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-1
-  gcloud compute addresses create org-svc1-deb-e2-mic-01-ip --project=shingo-ar-service2026061801-1 --region=asia-northeast1
+  gcloud compute addresses create org-svc1-deb-e2-mic-01-ip --project=shingo-ar-service2026061900-1 --region=asia-northeast1
   ```
 
 #### `org-svc1-deb-e2-mic-02-ip` (location=`asia-northeast1`)
@@ -717,7 +895,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc1-deb-e2-mic-02-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-1
-  gcloud compute addresses create org-svc1-deb-e2-mic-02-ip --project=shingo-ar-service2026061801-1 --region=asia-northeast1
+  gcloud compute addresses create org-svc1-deb-e2-mic-02-ip --project=shingo-ar-service2026061900-1 --region=asia-northeast1
   ```
 
 #### `org-svc1-deb-e2-mic-03-ip` (location=`asia-northeast1`)
@@ -729,10 +907,22 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc1-deb-e2-mic-03-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-1
-  gcloud compute addresses create org-svc1-deb-e2-mic-03-ip --project=shingo-ar-service2026061801-1 --region=asia-northeast1
+  gcloud compute addresses create org-svc1-deb-e2-mic-03-ip --project=shingo-ar-service2026061900-1 --region=asia-northeast1
   ```
 
-### `compute.googleapis.com/Disk` （8 件）
+### `compute.googleapis.com/Disk` （9 件）
+
+#### `fix-ip-vm` (location=`asia-northeast1-b`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-1/zones/asia-northeast1-b/disks/fix-ip-vm`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_disk/google_compute_region_disk`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_disk/google_compute_region_disk)
+- 推奨コマンド:
+  ```bash
+  gcloud compute disks describe fix-ip-vm --zone=asia-northeast1-b --project=shingo-ar-sharedservice0926-1
+  gcloud compute disks create fix-ip-vm --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-b --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  ```
 
 #### `centos8-from-vmv` (location=`asia-northeast1-a`)
 
@@ -743,7 +933,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe centos8-from-vmv --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute disks create centos8-from-vmv --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create centos8-from-vmv --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `windows` (location=`asia-northeast1-c`)
@@ -755,7 +945,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe windows --zone=asia-northeast1-c --project=shingo-ar-sharedservice0926-1
-  gcloud compute disks create windows --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-c --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create windows --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-c --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `org-svc1-deb-e2-mic-03` (location=`asia-northeast1-a`)
@@ -767,7 +957,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc1-deb-e2-mic-03 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute disks create org-svc1-deb-e2-mic-03 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc1-deb-e2-mic-03 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `org-svc1-deb-n2-std2-01` (location=`asia-northeast1-a`)
@@ -779,7 +969,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc1-deb-n2-std2-01 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute disks create org-svc1-deb-n2-std2-01 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc1-deb-n2-std2-01 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `org-svc1-deb-e2-mic-02` (location=`asia-northeast1-a`)
@@ -791,7 +981,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc1-deb-e2-mic-02 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute disks create org-svc1-deb-e2-mic-02 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc1-deb-e2-mic-02 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `org-svc1-deb-e2-mic-01` (location=`asia-northeast1-a`)
@@ -803,7 +993,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc1-deb-e2-mic-01 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute disks create org-svc1-deb-e2-mic-01 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc1-deb-e2-mic-01 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `org-svc1-deb-n2-std2-02` (location=`asia-northeast1-a`)
@@ -815,7 +1005,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc1-deb-n2-std2-02 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute disks create org-svc1-deb-n2-std2-02 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc1-deb-n2-std2-02 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `instance-1` (location=`asia-northeast1-b`)
@@ -827,7 +1017,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe instance-1 --zone=asia-northeast1-b --project=shingo-ar-sharedservice0926-1
-  gcloud compute disks create instance-1 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-b --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create instance-1 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-b --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 ### `compute.googleapis.com/Image` （8 件）
@@ -841,7 +1031,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe vmdk-imported-20260608-centos8t-boot --project=shingo-ar-sharedservice0926-1
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create vmdk-imported-20260608-centos8t-boot --project=shingo-ar-service2026061801-1 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create vmdk-imported-20260608-centos8t-boot --project=shingo-ar-service2026061900-1 --source-snapshot=<SNAPSHOT>
   ```
 
 #### `vmdk-imported-20260608-centos8v-boot` (location=`asia`)
@@ -853,7 +1043,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe vmdk-imported-20260608-centos8v-boot --project=shingo-ar-sharedservice0926-1
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create vmdk-imported-20260608-centos8v-boot --project=shingo-ar-service2026061801-1 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create vmdk-imported-20260608-centos8v-boot --project=shingo-ar-service2026061900-1 --source-snapshot=<SNAPSHOT>
   ```
 
 #### `vmdk-imported-20260608-boot` (location=`asia`)
@@ -865,7 +1055,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe vmdk-imported-20260608-boot --project=shingo-ar-sharedservice0926-1
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create vmdk-imported-20260608-boot --project=shingo-ar-service2026061801-1 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create vmdk-imported-20260608-boot --project=shingo-ar-service2026061900-1 --source-snapshot=<SNAPSHOT>
   ```
 
 #### `img-org-svc1-deb-n2-std4-02` (location=`asia`)
@@ -877,7 +1067,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe img-org-svc1-deb-n2-std4-02 --project=shingo-ar-sharedservice0926-1
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-n2-std4-02 --project=shingo-ar-service2026061801-1 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-n2-std4-02 --project=shingo-ar-service2026061900-1 --source-snapshot=<SNAPSHOT>
   ```
 
 #### `img-org-svc1-deb-n2-std4-01` (location=`asia`)
@@ -889,7 +1079,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe img-org-svc1-deb-n2-std4-01 --project=shingo-ar-sharedservice0926-1
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-n2-std4-01 --project=shingo-ar-service2026061801-1 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-n2-std4-01 --project=shingo-ar-service2026061900-1 --source-snapshot=<SNAPSHOT>
   ```
 
 #### `img-org-svc1-deb-e2-std4-03` (location=`asia`)
@@ -901,7 +1091,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe img-org-svc1-deb-e2-std4-03 --project=shingo-ar-sharedservice0926-1
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-e2-std4-03 --project=shingo-ar-service2026061801-1 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-e2-std4-03 --project=shingo-ar-service2026061900-1 --source-snapshot=<SNAPSHOT>
   ```
 
 #### `img-org-svc1-deb-e2-std4-02` (location=`asia`)
@@ -913,7 +1103,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe img-org-svc1-deb-e2-std4-02 --project=shingo-ar-sharedservice0926-1
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-e2-std4-02 --project=shingo-ar-service2026061801-1 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-e2-std4-02 --project=shingo-ar-service2026061900-1 --source-snapshot=<SNAPSHOT>
   ```
 
 #### `img-org-svc1-deb-e2-std4-01` (location=`asia`)
@@ -925,10 +1115,22 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe img-org-svc1-deb-e2-std4-01 --project=shingo-ar-sharedservice0926-1
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-e2-std4-01 --project=shingo-ar-service2026061801-1 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc1-deb-e2-std4-01 --project=shingo-ar-service2026061900-1 --source-snapshot=<SNAPSHOT>
   ```
 
 ### `compute.googleapis.com/Instance` （8 件）
+
+#### `fix-ip-vm` (location=`asia-northeast1-b`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-1/zones/asia-northeast1-b/instances/fix-ip-vm`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_instance`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_instance)
+- 推奨コマンド:
+  ```bash
+  gcloud compute instances describe fix-ip-vm --zone=asia-northeast1-b --project=shingo-ar-sharedservice0926-1
+  gcloud compute instances create fix-ip-vm --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-b --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  ```
 
 #### `centos8-from-vmv` (location=`asia-northeast1-a`)
 
@@ -939,7 +1141,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe centos8-from-vmv --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute instances create centos8-from-vmv --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create centos8-from-vmv --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `windows` (location=`asia-northeast1-c`)
@@ -951,7 +1153,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe windows --zone=asia-northeast1-c --project=shingo-ar-sharedservice0926-1
-  gcloud compute instances create windows --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-c --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create windows --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-c --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `org-svc1-deb-e2-mic-02` (location=`asia-northeast1-a`)
@@ -963,7 +1165,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe org-svc1-deb-e2-mic-02 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute instances create org-svc1-deb-e2-mic-02 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create org-svc1-deb-e2-mic-02 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `org-svc1-deb-n2-std2-01` (location=`asia-northeast1-a`)
@@ -975,7 +1177,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe org-svc1-deb-n2-std2-01 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute instances create org-svc1-deb-n2-std2-01 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create org-svc1-deb-n2-std2-01 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `org-svc1-deb-e2-mic-03` (location=`asia-northeast1-a`)
@@ -987,7 +1189,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe org-svc1-deb-e2-mic-03 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute instances create org-svc1-deb-e2-mic-03 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create org-svc1-deb-e2-mic-03 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `org-svc1-deb-n2-std2-02` (location=`asia-northeast1-a`)
@@ -999,19 +1201,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe org-svc1-deb-n2-std2-02 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute instances create org-svc1-deb-n2-std2-02 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
-  ```
-
-#### `org-svc1-deb-e2-mic-01` (location=`asia-northeast1-a`)
-
-- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-1/zones/asia-northeast1-a/instances/org-svc1-deb-e2-mic-01`
-- 担当ステップ: `gce_restore`
-- 期待 TF 型: `google_compute_instance`
-- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_instance)
-- 推奨コマンド:
-  ```bash
-  gcloud compute instances describe org-svc1-deb-e2-mic-01 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-1
-  gcloud compute instances create org-svc1-deb-e2-mic-01 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create org-svc1-deb-n2-std2-02 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `instance-1` (location=`asia-northeast1-b`)
@@ -1023,7 +1213,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe instance-1 --zone=asia-northeast1-b --project=shingo-ar-sharedservice0926-1
-  gcloud compute instances create instance-1 --project=shingo-ar-service2026061801-1 --zone=asia-northeast1-b --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create instance-1 --project=shingo-ar-service2026061900-1 --zone=asia-northeast1-b --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 ### `compute.googleapis.com/InstanceSettings` （3 件）
@@ -1078,7 +1268,33 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # compute.googleapis.com/Project は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
-### `compute.googleapis.com/Snapshot` （32 件）
+### `compute.googleapis.com/ResourcePolicy` （1 件）
+
+#### `default-schedule-1` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-1/regions/asia-northeast1/resourcePolicies/default-schedule-1`
+- 担当ステップ: `意図的対象外 (None)`
+- 期待 TF 型: `google_compute_resource_policy`
+- 判定理由: 意図的に対象外（マップで None 指定）
+- 推奨コマンド:
+  ```bash
+  gcloud compute resource-policies describe default-schedule-1 --region=asia-northeast1 --project=shingo-ar-sharedservice0926-1
+  gcloud compute resource-policies create snapshot-schedule default-schedule-1 --project=shingo-ar-service2026061900-1 --region=asia-northeast1 --max-retention-days=<N> --daily-schedule --start-time=<HH:MM>
+  ```
+
+### `compute.googleapis.com/Snapshot` （33 件）
+
+#### `backup-for-fix-ip-vm` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-1/global/snapshots/backup-for-fix-ip-vm`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_snapshot`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_snapshot)
+- 推奨コマンド:
+  ```bash
+  gcloud compute snapshots describe backup-for-fix-ip-vm --project=shingo-ar-sharedservice0926-1
+  # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
+  ```
 
 #### `windows-asia-northeast1-c-20260617184701-00v6d4t3` (location=`asia`)
 
@@ -1475,7 +1691,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam roles describe migrationSrcReader --project=shingo-ar-sharedservice0926-1
-  gcloud iam roles create migrationSrcReader --project=shingo-ar-service2026061801-1 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
+  gcloud iam roles create migrationSrcReader --project=shingo-ar-service2026061900-1 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
   ```
 
 ### `iam.googleapis.com/ServiceAccount` （2 件）
@@ -1489,7 +1705,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam service-accounts describe org-svc1-viewer@shingo-ar-sharedservice0926-1.iam.gserviceaccount.com --project=shingo-ar-sharedservice0926-1
-  gcloud iam service-accounts create org-svc1-viewer --project=shingo-ar-service2026061801-1 --display-name=<DISPLAY_NAME>
+  gcloud iam service-accounts create org-svc1-viewer --project=shingo-ar-service2026061900-1 --display-name=<DISPLAY_NAME>
   ```
 
 #### `1007606807581-compute@developer.gserviceaccount.com` (location=`global`)
@@ -1501,7 +1717,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam service-accounts describe 1007606807581-compute@developer.gserviceaccount.com --project=shingo-ar-sharedservice0926-1
-  gcloud iam service-accounts create 1007606807581-compute --project=shingo-ar-service2026061801-1 --display-name=<DISPLAY_NAME>
+  gcloud iam service-accounts create 1007606807581-compute --project=shingo-ar-service2026061900-1 --display-name=<DISPLAY_NAME>
   ```
 
 ### `logging.googleapis.com/LogBucket` （2 件）
@@ -1515,7 +1731,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging buckets describe _Default --location=global --project=1007606807581
-  gcloud logging buckets create _Default --location=global --project=shingo-ar-service2026061801-1 --retention-days=<N>
+  gcloud logging buckets create _Default --location=global --project=shingo-ar-service2026061900-1 --retention-days=<N>
   ```
 
 #### `_Required` (location=`global`)
@@ -1527,7 +1743,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging buckets describe _Required --location=global --project=1007606807581
-  gcloud logging buckets create _Required --location=global --project=shingo-ar-service2026061801-1 --retention-days=<N>
+  gcloud logging buckets create _Required --location=global --project=shingo-ar-service2026061900-1 --retention-days=<N>
   ```
 
 ### `logging.googleapis.com/LogSink` （2 件）
@@ -1541,7 +1757,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging sinks describe _Required --project=1007606807581
-  gcloud logging sinks create _Required <DESTINATION> --project=shingo-ar-service2026061801-1 --log-filter='<FILTER>'
+  gcloud logging sinks create _Required <DESTINATION> --project=shingo-ar-service2026061900-1 --log-filter='<FILTER>'
   ```
 
 #### `_Default` (location=`global`)
@@ -1553,10 +1769,10 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging sinks describe _Default --project=1007606807581
-  gcloud logging sinks create _Default <DESTINATION> --project=shingo-ar-service2026061801-1 --log-filter='<FILTER>'
+  gcloud logging sinks create _Default <DESTINATION> --project=shingo-ar-service2026061900-1 --log-filter='<FILTER>'
   ```
 
-### `osconfig.googleapis.com/OSPolicyAssignment` （1 件）
+### `osconfig.googleapis.com/OSPolicyAssignment` （2 件）
 
 #### `goog-ops-agent-v2-template-1-7-0-asia-northeast1-c` (location=`asia-northeast1-c`)
 
@@ -1570,7 +1786,31 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # osconfig.googleapis.com/OSPolicyAssignment は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
-### `osconfig.googleapis.com/OSPolicyAssignmentReport` （1 件）
+#### `goog-ops-agent-v2-template-1-7-0-asia-northeast1-b` (location=`asia-northeast1-b`)
+
+- full name: `//osconfig.googleapis.com/projects/1007606807581/locations/asia-northeast1-b/osPolicyAssignments/goog-ops-agent-v2-template-1-7-0-asia-northeast1-b`
+- 担当ステップ: `意図的対象外 (None)`
+- 期待 TF 型: `なし`
+- 判定理由: 意図的に対象外（マップで None 指定）
+- 推奨コマンド:
+  ```bash
+  gcloud asset describe '//osconfig.googleapis.com/projects/1007606807581/locations/asia-northeast1-b/osPolicyAssignments/goog-ops-agent-v2-template-1-7-0-asia-northeast1-b' --project=1007606807581
+  # osconfig.googleapis.com/OSPolicyAssignment は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
+  ```
+
+### `osconfig.googleapis.com/OSPolicyAssignmentReport` （2 件）
+
+#### `report` (location=`asia-northeast1-b`)
+
+- full name: `//osconfig.googleapis.com/projects/1007606807581/locations/asia-northeast1-b/instances/3955167452418652164/osPolicyAssignments/goog-ops-agent-v2-template-1-7-0-asia-northeast1-b/report`
+- 担当ステップ: `意図的対象外 (None)`
+- 期待 TF 型: `なし`
+- 判定理由: 意図的に対象外（マップで None 指定）
+- 推奨コマンド:
+  ```bash
+  gcloud asset describe '//osconfig.googleapis.com/projects/1007606807581/locations/asia-northeast1-b/instances/3955167452418652164/osPolicyAssignments/goog-ops-agent-v2-template-1-7-0-asia-northeast1-b/report' --project=1007606807581
+  # osconfig.googleapis.com/OSPolicyAssignmentReport は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
+  ```
 
 #### `report` (location=`asia-northeast1-c`)
 
@@ -1595,7 +1835,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:bigquerystorage.googleapis.com'
-  gcloud services enable bigquerystorage.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable bigquerystorage.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `sql-component.googleapis.com` (location=`global`)
@@ -1607,7 +1847,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:sql-component.googleapis.com'
-  gcloud services enable sql-component.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable sql-component.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `storage-component.googleapis.com` (location=`global`)
@@ -1619,7 +1859,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:storage-component.googleapis.com'
-  gcloud services enable storage-component.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable storage-component.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `logging.googleapis.com` (location=`global`)
@@ -1631,7 +1871,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:logging.googleapis.com'
-  gcloud services enable logging.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable logging.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `cloudasset.googleapis.com` (location=`global`)
@@ -1643,7 +1883,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:cloudasset.googleapis.com'
-  gcloud services enable cloudasset.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable cloudasset.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `serviceusage.googleapis.com` (location=`global`)
@@ -1655,7 +1895,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:serviceusage.googleapis.com'
-  gcloud services enable serviceusage.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable serviceusage.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `compute.googleapis.com` (location=`global`)
@@ -1667,7 +1907,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:compute.googleapis.com'
-  gcloud services enable compute.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable compute.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `servicemanagement.googleapis.com` (location=`global`)
@@ -1679,7 +1919,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:servicemanagement.googleapis.com'
-  gcloud services enable servicemanagement.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable servicemanagement.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `vmmigration.googleapis.com` (location=`global`)
@@ -1691,7 +1931,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:vmmigration.googleapis.com'
-  gcloud services enable vmmigration.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable vmmigration.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `osconfig.googleapis.com` (location=`global`)
@@ -1703,7 +1943,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:osconfig.googleapis.com'
-  gcloud services enable osconfig.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable osconfig.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `monitoring.googleapis.com` (location=`global`)
@@ -1715,7 +1955,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:monitoring.googleapis.com'
-  gcloud services enable monitoring.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable monitoring.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `iam.googleapis.com` (location=`global`)
@@ -1727,7 +1967,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:iam.googleapis.com'
-  gcloud services enable iam.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable iam.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `cloudapis.googleapis.com` (location=`global`)
@@ -1739,7 +1979,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:cloudapis.googleapis.com'
-  gcloud services enable cloudapis.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable cloudapis.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `datastore.googleapis.com` (location=`global`)
@@ -1751,7 +1991,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:datastore.googleapis.com'
-  gcloud services enable datastore.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable datastore.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `oslogin.googleapis.com` (location=`global`)
@@ -1763,7 +2003,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:oslogin.googleapis.com'
-  gcloud services enable oslogin.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable oslogin.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `bigquerymigration.googleapis.com` (location=`global`)
@@ -1775,7 +2015,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:bigquerymigration.googleapis.com'
-  gcloud services enable bigquerymigration.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable bigquerymigration.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `storage-api.googleapis.com` (location=`global`)
@@ -1787,7 +2027,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:storage-api.googleapis.com'
-  gcloud services enable storage-api.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable storage-api.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `cloudtrace.googleapis.com` (location=`global`)
@@ -1799,7 +2039,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:cloudtrace.googleapis.com'
-  gcloud services enable cloudtrace.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable cloudtrace.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `iamcredentials.googleapis.com` (location=`global`)
@@ -1811,7 +2051,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:iamcredentials.googleapis.com'
-  gcloud services enable iamcredentials.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable iamcredentials.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `storage.googleapis.com` (location=`global`)
@@ -1823,7 +2063,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:storage.googleapis.com'
-  gcloud services enable storage.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable storage.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 #### `bigquery.googleapis.com` (location=`global`)
@@ -1835,7 +2075,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1007606807581 --filter='config.name:bigquery.googleapis.com'
-  gcloud services enable bigquery.googleapis.com --project=shingo-ar-service2026061801-1
+  gcloud services enable bigquery.googleapis.com --project=shingo-ar-service2026061900-1
   ```
 
 ### `vmmigration.googleapis.com/ImageImport` （3 件）
@@ -1890,9 +2130,9 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # vmmigration.googleapis.com/TargetProject は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
-## プロジェクト: `shingo-ar-sharedservice0926-3` → `shingo-ar-service2026061801-3`
+## プロジェクト: `shingo-ar-sharedservice0926-3` → `shingo-ar-service2026061900-3`
 
-- CAI 検出リソース: **177** 件 / TF 出力リソース: **37** 件 / 一致: **13** 件 / 欠落候補: **164** 件
+- CAI 検出リソース: **177** 件 / TF 出力リソース: **3** 件 / 一致: **0** 件 / 欠落候補: **177** 件
 
 ### `bigquery.googleapis.com/Dataset` （2 件）
 
@@ -1905,7 +2145,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   bq --project_id=shingo-ar-sharedservice0926-3 show --format=prettyjson dataset_bar
-  bq --project_id=shingo-ar-service2026061801-3 mk --location=US --dataset shingo-ar-service2026061801-3:dataset_bar
+  bq --project_id=shingo-ar-service2026061900-3 mk --location=US --dataset shingo-ar-service2026061900-3:dataset_bar
   ```
 
 #### `dataset_foo` (location=`US`)
@@ -1917,7 +2157,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   bq --project_id=shingo-ar-sharedservice0926-3 show --format=prettyjson dataset_foo
-  bq --project_id=shingo-ar-service2026061801-3 mk --location=US --dataset shingo-ar-service2026061801-3:dataset_foo
+  bq --project_id=shingo-ar-service2026061900-3 mk --location=US --dataset shingo-ar-service2026061900-3:dataset_foo
   ```
 
 ### `bigquery.googleapis.com/Table` （2 件）
@@ -1931,7 +2171,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   bq --project_id=shingo-ar-sharedservice0926-3 show --format=prettyjson shingo-ar-sharedservice0926-3:dataset_bar.item_purchase_logs_all_json
-  bq --project_id=shingo-ar-service2026061801-3 cp shingo-ar-sharedservice0926-3:dataset_bar.item_purchase_logs_all_json shingo-ar-service2026061801-3:dataset_bar.item_purchase_logs_all_json  # 通常は Step 6 (data_sync) が担当
+  bq --project_id=shingo-ar-service2026061900-3 cp shingo-ar-sharedservice0926-3:dataset_bar.item_purchase_logs_all_json shingo-ar-service2026061900-3:dataset_bar.item_purchase_logs_all_json  # 通常は Step 6 (data_sync) が担当
   ```
 
 #### `game_players_json` (location=`US`)
@@ -1943,7 +2183,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   bq --project_id=shingo-ar-sharedservice0926-3 show --format=prettyjson shingo-ar-sharedservice0926-3:dataset_foo.game_players_json
-  bq --project_id=shingo-ar-service2026061801-3 cp shingo-ar-sharedservice0926-3:dataset_foo.game_players_json shingo-ar-service2026061801-3:dataset_foo.game_players_json  # 通常は Step 6 (data_sync) が担当
+  bq --project_id=shingo-ar-service2026061900-3 cp shingo-ar-sharedservice0926-3:dataset_foo.game_players_json shingo-ar-service2026061900-3:dataset_foo.game_players_json  # 通常は Step 6 (data_sync) が担当
   ```
 
 ### `cloudbilling.googleapis.com/ProjectBillingInfo` （1 件）
@@ -1974,7 +2214,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # cloudresourcemanager.googleapis.com/Project は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
-### `compute.googleapis.com/Address` （6 件）
+### `compute.googleapis.com/Address` （7 件）
 
 #### `org-svc3-ub-c2-std4-01-ip` (location=`asia-northeast1`)
 
@@ -1985,7 +2225,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc3-ub-c2-std4-01-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute addresses create org-svc3-ub-c2-std4-01-ip --project=shingo-ar-service2026061801-3 --region=asia-northeast1
+  gcloud compute addresses create org-svc3-ub-c2-std4-01-ip --project=shingo-ar-service2026061900-3 --region=asia-northeast1
   ```
 
 #### `org-svc3-ub-e2-med-02-ip` (location=`asia-northeast1`)
@@ -1997,7 +2237,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc3-ub-e2-med-02-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute addresses create org-svc3-ub-e2-med-02-ip --project=shingo-ar-service2026061801-3 --region=asia-northeast1
+  gcloud compute addresses create org-svc3-ub-e2-med-02-ip --project=shingo-ar-service2026061900-3 --region=asia-northeast1
   ```
 
 #### `org-svc3-ub-e2-med-01-ip` (location=`asia-northeast1`)
@@ -2009,7 +2249,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc3-ub-e2-med-01-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute addresses create org-svc3-ub-e2-med-01-ip --project=shingo-ar-service2026061801-3 --region=asia-northeast1
+  gcloud compute addresses create org-svc3-ub-e2-med-01-ip --project=shingo-ar-service2026061900-3 --region=asia-northeast1
   ```
 
 #### `org-svc3-ub-e2-mic-01-ip` (location=`asia-northeast1`)
@@ -2021,7 +2261,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc3-ub-e2-mic-01-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute addresses create org-svc3-ub-e2-mic-01-ip --project=shingo-ar-service2026061801-3 --region=asia-northeast1
+  gcloud compute addresses create org-svc3-ub-e2-mic-01-ip --project=shingo-ar-service2026061900-3 --region=asia-northeast1
   ```
 
 #### `org-svc3-ub-e2-mic-02-ip` (location=`asia-northeast1`)
@@ -2033,7 +2273,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc3-ub-e2-mic-02-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute addresses create org-svc3-ub-e2-mic-02-ip --project=shingo-ar-service2026061801-3 --region=asia-northeast1
+  gcloud compute addresses create org-svc3-ub-e2-mic-02-ip --project=shingo-ar-service2026061900-3 --region=asia-northeast1
   ```
 
 #### `org-svc3-ub-e2-med-03-ip` (location=`asia-northeast1`)
@@ -2045,7 +2285,19 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute addresses describe org-svc3-ub-e2-med-03-ip --region=asia-northeast1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute addresses create org-svc3-ub-e2-med-03-ip --project=shingo-ar-service2026061801-3 --region=asia-northeast1
+  gcloud compute addresses create org-svc3-ub-e2-med-03-ip --project=shingo-ar-service2026061900-3 --region=asia-northeast1
+  ```
+
+#### `test` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-3/regions/asia-northeast1/addresses/test`
+- 担当ステップ: `terraform_apply`
+- 期待 TF 型: `google_compute_address/google_compute_global_address`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_address/google_compute_global_address)
+- 推奨コマンド:
+  ```bash
+  gcloud compute addresses describe test --region=asia-northeast1 --project=shingo-ar-sharedservice0926-3
+  gcloud compute addresses create test --project=shingo-ar-service2026061900-3 --region=asia-northeast1
   ```
 
 ### `compute.googleapis.com/Disk` （6 件）
@@ -2059,7 +2311,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc3-ub-c2-std4-01 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute disks create org-svc3-ub-c2-std4-01 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc3-ub-c2-std4-01 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `org-svc3-ub-e2-med-02` (location=`asia-northeast1-a`)
@@ -2071,7 +2323,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc3-ub-e2-med-02 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute disks create org-svc3-ub-e2-med-02 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc3-ub-e2-med-02 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `org-svc3-ub-e2-mic-02` (location=`asia-northeast1-a`)
@@ -2083,7 +2335,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc3-ub-e2-mic-02 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute disks create org-svc3-ub-e2-mic-02 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc3-ub-e2-mic-02 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `org-svc3-ub-e2-mic-01` (location=`asia-northeast1-a`)
@@ -2095,7 +2347,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc3-ub-e2-mic-01 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute disks create org-svc3-ub-e2-mic-01 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc3-ub-e2-mic-01 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `org-svc3-ub-e2-med-03` (location=`asia-northeast1-a`)
@@ -2107,7 +2359,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc3-ub-e2-med-03 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute disks create org-svc3-ub-e2-med-03 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc3-ub-e2-med-03 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
   ```
 
 #### `org-svc3-ub-e2-med-01` (location=`asia-northeast1-a`)
@@ -2119,7 +2371,93 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute disks describe org-svc3-ub-e2-med-01 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute disks create org-svc3-ub-e2-med-01 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  gcloud compute disks create org-svc3-ub-e2-med-01 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)
+  ```
+
+### `compute.googleapis.com/Firewall` （7 件）
+
+#### `test` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-3/global/firewalls/test`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe test --project=shingo-ar-sharedservice0926-3
+  gcloud compute firewall-rules create test --project=shingo-ar-service2026061900-3 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
+#### `deny` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-3/global/firewalls/deny`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe deny --project=shingo-ar-sharedservice0926-3
+  gcloud compute firewall-rules create deny --project=shingo-ar-service2026061900-3 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
+#### `ib-network-allow-internal` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-3/global/firewalls/ib-network-allow-internal`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe ib-network-allow-internal --project=shingo-ar-sharedservice0926-3
+  gcloud compute firewall-rules create ib-network-allow-internal --project=shingo-ar-service2026061900-3 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
+#### `default-allow-ssh` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-3/global/firewalls/default-allow-ssh`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe default-allow-ssh --project=shingo-ar-sharedservice0926-3
+  gcloud compute firewall-rules create default-allow-ssh --project=shingo-ar-service2026061900-3 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
+#### `default-allow-internal` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-3/global/firewalls/default-allow-internal`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe default-allow-internal --project=shingo-ar-sharedservice0926-3
+  gcloud compute firewall-rules create default-allow-internal --project=shingo-ar-service2026061900-3 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
+#### `default-allow-rdp` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-3/global/firewalls/default-allow-rdp`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe default-allow-rdp --project=shingo-ar-sharedservice0926-3
+  gcloud compute firewall-rules create default-allow-rdp --project=shingo-ar-service2026061900-3 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
+  ```
+
+#### `default-allow-icmp` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-3/global/firewalls/default-allow-icmp`
+- 担当ステップ: `network_firewall`
+- 期待 TF 型: `google_compute_firewall`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_firewall)
+- 推奨コマンド:
+  ```bash
+  gcloud compute firewall-rules describe default-allow-icmp --project=shingo-ar-sharedservice0926-3
+  gcloud compute firewall-rules create default-allow-icmp --project=shingo-ar-service2026061900-3 --network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> --rules=<PROTO:PORT,...>
   ```
 
 ### `compute.googleapis.com/Image` （4 件）
@@ -2133,7 +2471,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe img-org-svc3-ub-e2-med-03 --project=shingo-ar-sharedservice0926-3
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc3-ub-e2-med-03 --project=shingo-ar-service2026061801-3 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc3-ub-e2-med-03 --project=shingo-ar-service2026061900-3 --source-snapshot=<SNAPSHOT>
   ```
 
 #### `img-org-svc3-ub-e2-med-02` (location=`asia`)
@@ -2145,7 +2483,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe img-org-svc3-ub-e2-med-02 --project=shingo-ar-sharedservice0926-3
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc3-ub-e2-med-02 --project=shingo-ar-service2026061801-3 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc3-ub-e2-med-02 --project=shingo-ar-service2026061900-3 --source-snapshot=<SNAPSHOT>
   ```
 
 #### `img-org-svc3-ub-e2-med-01` (location=`asia`)
@@ -2157,7 +2495,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe img-org-svc3-ub-e2-med-01 --project=shingo-ar-sharedservice0926-3
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc3-ub-e2-med-01 --project=shingo-ar-service2026061801-3 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc3-ub-e2-med-01 --project=shingo-ar-service2026061900-3 --source-snapshot=<SNAPSHOT>
   ```
 
 #### `img-org-svc3-ub-c2-std4-01` (location=`asia`)
@@ -2169,7 +2507,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute images describe img-org-svc3-ub-c2-std4-01 --project=shingo-ar-sharedservice0926-3
-  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc3-ub-c2-std4-01 --project=shingo-ar-service2026061801-3 --source-snapshot=<SNAPSHOT>
+  # image は使用しない方針（snapshot 由来）。必要なら gcloud compute images create img-org-svc3-ub-c2-std4-01 --project=shingo-ar-service2026061900-3 --source-snapshot=<SNAPSHOT>
   ```
 
 ### `compute.googleapis.com/Instance` （6 件）
@@ -2183,7 +2521,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe org-svc3-ub-c2-std4-01 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute instances create org-svc3-ub-c2-std4-01 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create org-svc3-ub-c2-std4-01 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `org-svc3-ub-e2-med-01` (location=`asia-northeast1-a`)
@@ -2195,7 +2533,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe org-svc3-ub-e2-med-01 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute instances create org-svc3-ub-e2-med-01 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create org-svc3-ub-e2-med-01 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `org-svc3-ub-e2-med-03` (location=`asia-northeast1-a`)
@@ -2207,7 +2545,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe org-svc3-ub-e2-med-03 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute instances create org-svc3-ub-e2-med-03 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create org-svc3-ub-e2-med-03 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `org-svc3-ub-e2-mic-01` (location=`asia-northeast1-a`)
@@ -2219,7 +2557,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe org-svc3-ub-e2-mic-01 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute instances create org-svc3-ub-e2-mic-01 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create org-svc3-ub-e2-mic-01 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `org-svc3-ub-e2-med-02` (location=`asia-northeast1-a`)
@@ -2231,7 +2569,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe org-svc3-ub-e2-med-02 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute instances create org-svc3-ub-e2-med-02 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create org-svc3-ub-e2-med-02 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 #### `org-svc3-ub-e2-mic-02` (location=`asia-northeast1-a`)
@@ -2243,7 +2581,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute instances describe org-svc3-ub-e2-mic-02 --zone=asia-northeast1-a --project=shingo-ar-sharedservice0926-3
-  gcloud compute instances create org-svc3-ub-e2-mic-02 --project=shingo-ar-service2026061801-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
+  gcloud compute instances create org-svc3-ub-e2-mic-02 --project=shingo-ar-service2026061900-3 --zone=asia-northeast1-a --machine-type=<MACHINE_TYPE> --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当
   ```
 
 ### `compute.googleapis.com/InstanceSettings` （3 件）
@@ -2284,7 +2622,19 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # compute.googleapis.com/InstanceSettings は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。
   ```
 
-### `compute.googleapis.com/Network` （1 件）
+### `compute.googleapis.com/Network` （2 件）
+
+#### `ib-network` (location=`global`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-3/global/networks/ib-network`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_network`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_network)
+- 推奨コマンド:
+  ```bash
+  gcloud compute networks describe ib-network --project=shingo-ar-sharedservice0926-3
+  gcloud compute networks create ib-network --project=shingo-ar-service2026061900-3 --subnet-mode=custom
+  ```
 
 #### `default` (location=`global`)
 
@@ -2295,7 +2645,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks describe default --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks create default --project=shingo-ar-service2026061801-3 --subnet-mode=custom
+  gcloud compute networks create default --project=shingo-ar-service2026061900-3 --subnet-mode=custom
   ```
 
 ### `compute.googleapis.com/Project` （1 件）
@@ -2323,7 +2673,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-r-98d048215189550b --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-r-98d048215189550b --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-r-98d048215189550b --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-r-11f907f3279696b5` (location=`global`)
@@ -2335,7 +2685,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-r-11f907f3279696b5 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-r-11f907f3279696b5 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-r-11f907f3279696b5 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-d11f2034c4aeb51e` (location=`global`)
@@ -2347,7 +2697,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-d11f2034c4aeb51e --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-d11f2034c4aeb51e --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-d11f2034c4aeb51e --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-3fe82b14c98b7cdf` (location=`global`)
@@ -2359,7 +2709,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-3fe82b14c98b7cdf --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-3fe82b14c98b7cdf --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-3fe82b14c98b7cdf --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-de5c154989722050` (location=`global`)
@@ -2371,7 +2721,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-de5c154989722050 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-de5c154989722050 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-de5c154989722050 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-522dfd5a9228c0e4` (location=`global`)
@@ -2383,7 +2733,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-522dfd5a9228c0e4 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-522dfd5a9228c0e4 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-522dfd5a9228c0e4 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-893caa5ad4a6657c` (location=`global`)
@@ -2395,7 +2745,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-893caa5ad4a6657c --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-893caa5ad4a6657c --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-893caa5ad4a6657c --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-57660cdbff324af4` (location=`global`)
@@ -2407,7 +2757,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-57660cdbff324af4 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-57660cdbff324af4 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-57660cdbff324af4 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-09c2c7b1ab514ff6` (location=`global`)
@@ -2419,7 +2769,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-09c2c7b1ab514ff6 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-09c2c7b1ab514ff6 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-09c2c7b1ab514ff6 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-c8973eb1c13ac479` (location=`global`)
@@ -2431,7 +2781,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-c8973eb1c13ac479 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-c8973eb1c13ac479 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-c8973eb1c13ac479 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-42c467ae5fed1ac0` (location=`global`)
@@ -2443,7 +2793,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-42c467ae5fed1ac0 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-42c467ae5fed1ac0 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-42c467ae5fed1ac0 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-e755856d9b20ba36` (location=`global`)
@@ -2455,7 +2805,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-e755856d9b20ba36 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-e755856d9b20ba36 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-e755856d9b20ba36 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-0a66d0cc9c75cc8b` (location=`global`)
@@ -2467,7 +2817,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-0a66d0cc9c75cc8b --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-0a66d0cc9c75cc8b --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-0a66d0cc9c75cc8b --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-2c3846332a2bc3e0` (location=`global`)
@@ -2479,7 +2829,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-2c3846332a2bc3e0 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-2c3846332a2bc3e0 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-2c3846332a2bc3e0 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-2369d72760b8807f` (location=`global`)
@@ -2491,7 +2841,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-2369d72760b8807f --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-2369d72760b8807f --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-2369d72760b8807f --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-b7740d025b045e64` (location=`global`)
@@ -2503,7 +2853,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-b7740d025b045e64 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-b7740d025b045e64 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-b7740d025b045e64 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-4402e07ee1f2aeec` (location=`global`)
@@ -2515,7 +2865,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-4402e07ee1f2aeec --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-4402e07ee1f2aeec --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-4402e07ee1f2aeec --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-51f46281a5f33c88` (location=`global`)
@@ -2527,7 +2877,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-51f46281a5f33c88 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-51f46281a5f33c88 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-51f46281a5f33c88 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-ba1b19c510ed59d0` (location=`global`)
@@ -2539,7 +2889,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-ba1b19c510ed59d0 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-ba1b19c510ed59d0 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-ba1b19c510ed59d0 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-60c15ba7ae600fc8` (location=`global`)
@@ -2551,7 +2901,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-60c15ba7ae600fc8 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-60c15ba7ae600fc8 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-60c15ba7ae600fc8 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-9dde7ae8184c3852` (location=`global`)
@@ -2563,7 +2913,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-9dde7ae8184c3852 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-9dde7ae8184c3852 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-9dde7ae8184c3852 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-55547ff6ba2ae8e8` (location=`global`)
@@ -2575,7 +2925,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-55547ff6ba2ae8e8 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-55547ff6ba2ae8e8 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-55547ff6ba2ae8e8 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-485b9b21cd18f53c` (location=`global`)
@@ -2587,7 +2937,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-485b9b21cd18f53c --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-485b9b21cd18f53c --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-485b9b21cd18f53c --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-67a144c3c4144632` (location=`global`)
@@ -2599,7 +2949,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-67a144c3c4144632 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-67a144c3c4144632 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-67a144c3c4144632 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-10327149af16388b` (location=`global`)
@@ -2611,7 +2961,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-10327149af16388b --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-10327149af16388b --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-10327149af16388b --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-bd63b42c414571ce` (location=`global`)
@@ -2623,7 +2973,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-bd63b42c414571ce --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-bd63b42c414571ce --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-bd63b42c414571ce --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-9e9d115beaec855b` (location=`global`)
@@ -2635,7 +2985,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-9e9d115beaec855b --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-9e9d115beaec855b --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-9e9d115beaec855b --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-05ea1a0ec1214c63` (location=`global`)
@@ -2647,7 +2997,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-05ea1a0ec1214c63 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-05ea1a0ec1214c63 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-05ea1a0ec1214c63 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-5b4b0c3510dd4c63` (location=`global`)
@@ -2659,7 +3009,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-5b4b0c3510dd4c63 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-5b4b0c3510dd4c63 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-5b4b0c3510dd4c63 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-3cb551462fd6d6d5` (location=`global`)
@@ -2671,7 +3021,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-3cb551462fd6d6d5 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-3cb551462fd6d6d5 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-3cb551462fd6d6d5 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-0c0a16c7a37a0d3f` (location=`global`)
@@ -2683,7 +3033,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-0c0a16c7a37a0d3f --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-0c0a16c7a37a0d3f --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-0c0a16c7a37a0d3f --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-17612d48b7875af0` (location=`global`)
@@ -2695,7 +3045,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-17612d48b7875af0 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-17612d48b7875af0 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-17612d48b7875af0 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-11e87903139ccd22` (location=`global`)
@@ -2707,7 +3057,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-11e87903139ccd22 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-11e87903139ccd22 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-11e87903139ccd22 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-45f2ff727e2416b8` (location=`global`)
@@ -2719,7 +3069,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-45f2ff727e2416b8 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-45f2ff727e2416b8 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-45f2ff727e2416b8 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-58fd01a24169e46d` (location=`global`)
@@ -2731,7 +3081,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-58fd01a24169e46d --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-58fd01a24169e46d --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-58fd01a24169e46d --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-8367b740ba1fb361` (location=`global`)
@@ -2743,7 +3093,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-8367b740ba1fb361 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-8367b740ba1fb361 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-8367b740ba1fb361 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-b3369bd0128f75e6` (location=`global`)
@@ -2755,7 +3105,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-b3369bd0128f75e6 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-b3369bd0128f75e6 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-b3369bd0128f75e6 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-111246bc0783214c` (location=`global`)
@@ -2767,7 +3117,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-111246bc0783214c --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-111246bc0783214c --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-111246bc0783214c --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-2de92a3dadc51467` (location=`global`)
@@ -2779,7 +3129,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-2de92a3dadc51467 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-2de92a3dadc51467 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-2de92a3dadc51467 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-b74117b3eb2f1ec9` (location=`global`)
@@ -2791,7 +3141,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-b74117b3eb2f1ec9 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-b74117b3eb2f1ec9 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-b74117b3eb2f1ec9 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-3c185c4503f8f32f` (location=`global`)
@@ -2803,7 +3153,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-3c185c4503f8f32f --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-3c185c4503f8f32f --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-3c185c4503f8f32f --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-e73e5fcce9e01700` (location=`global`)
@@ -2815,7 +3165,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-e73e5fcce9e01700 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-e73e5fcce9e01700 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-e73e5fcce9e01700 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-988a7668582a422b` (location=`global`)
@@ -2827,7 +3177,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-988a7668582a422b --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-988a7668582a422b --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-988a7668582a422b --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-fb0320b87f0aa00d` (location=`global`)
@@ -2839,7 +3189,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-fb0320b87f0aa00d --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-fb0320b87f0aa00d --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-fb0320b87f0aa00d --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-7ca7d814326a7c78` (location=`global`)
@@ -2851,7 +3201,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-7ca7d814326a7c78 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-7ca7d814326a7c78 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-7ca7d814326a7c78 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-d3cb1dfc35875d6f` (location=`global`)
@@ -2863,7 +3213,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-d3cb1dfc35875d6f --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-d3cb1dfc35875d6f --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-d3cb1dfc35875d6f --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-90e4a484caccf593` (location=`global`)
@@ -2875,7 +3225,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-90e4a484caccf593 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-90e4a484caccf593 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-90e4a484caccf593 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 #### `default-route-2c546851f7c5d132` (location=`global`)
@@ -2887,7 +3237,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute routes describe default-route-2c546851f7c5d132 --project=shingo-ar-sharedservice0926-3
-  gcloud compute routes create default-route-2c546851f7c5d132 --project=shingo-ar-service2026061801-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
+  gcloud compute routes create default-route-2c546851f7c5d132 --project=shingo-ar-service2026061900-3 --network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>
   ```
 
 ### `compute.googleapis.com/Snapshot` （6 件）
@@ -2964,7 +3314,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
   # snapshot は src 側からの参照で復元する設計のため dst 作成は不要 (Step 5 gce_restore が source-snapshot として直接使用)
   ```
 
-### `compute.googleapis.com/Subnetwork` （45 件）
+### `compute.googleapis.com/Subnetwork` （46 件）
 
 #### `default` (location=`asia-southeast3`)
 
@@ -2975,7 +3325,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=asia-southeast3 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=asia-southeast3 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=asia-southeast3 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-north2`)
@@ -2987,7 +3337,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-north2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-north2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-north2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`northamerica-south1`)
@@ -2999,7 +3349,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=northamerica-south1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=northamerica-south1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=northamerica-south1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-west8`)
@@ -3011,7 +3361,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-west8 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-west8 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-west8 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`africa-south1`)
@@ -3023,7 +3373,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=africa-south1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=africa-south1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=africa-south1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`me-central2`)
@@ -3035,7 +3385,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=me-central2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=me-central2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=me-central2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-west10`)
@@ -3047,7 +3397,19 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-west10 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-west10 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-west10 --network=<NETWORK> --range=<CIDR>
+  ```
+
+#### `tokyo` (location=`asia-northeast1`)
+
+- full name: `//compute.googleapis.com/projects/shingo-ar-sharedservice0926-3/regions/asia-northeast1/subnetworks/tokyo`
+- 担当ステップ: `gce_restore`
+- 期待 TF 型: `google_compute_subnetwork`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_compute_subnetwork)
+- 推奨コマンド:
+  ```bash
+  gcloud compute networks subnets describe tokyo --region=asia-northeast1 --project=shingo-ar-sharedservice0926-3
+  gcloud compute networks subnets create tokyo --project=shingo-ar-service2026061900-3 --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`me-central1`)
@@ -3059,7 +3421,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=me-central1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=me-central1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=me-central1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-west12`)
@@ -3071,7 +3433,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-west12 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-west12 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-west12 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-east7`)
@@ -3083,7 +3445,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-east7 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-east7 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-east7 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-north1`)
@@ -3095,7 +3457,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-north1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-north1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-north1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`southamerica-east1`)
@@ -3107,7 +3469,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=southamerica-east1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=southamerica-east1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=southamerica-east1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-west2`)
@@ -3119,7 +3481,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-west2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-west2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-west2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-west4`)
@@ -3131,7 +3493,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-west4 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-west4 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-west4 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`asia-northeast2`)
@@ -3143,7 +3505,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=asia-northeast2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=asia-northeast2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=asia-northeast2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`asia-south1`)
@@ -3155,7 +3517,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=asia-south1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=asia-south1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=asia-south1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-central2`)
@@ -3167,7 +3529,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-central2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-central2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-central2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-west1`)
@@ -3179,7 +3541,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-west1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-west1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-west1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`asia-east1`)
@@ -3191,7 +3553,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=asia-east1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=asia-east1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=asia-east1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-south1`)
@@ -3203,7 +3565,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-south1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-south1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-south1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-east4`)
@@ -3215,7 +3577,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-east4 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-east4 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-east4 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`northamerica-northeast1`)
@@ -3227,7 +3589,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=northamerica-northeast1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=northamerica-northeast1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=northamerica-northeast1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-west4`)
@@ -3239,7 +3601,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-west4 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-west4 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-west4 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-west6`)
@@ -3251,7 +3613,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-west6 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-west6 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-west6 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-southwest1`)
@@ -3263,7 +3625,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-southwest1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-southwest1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-southwest1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`asia-southeast1`)
@@ -3275,7 +3637,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=asia-southeast1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=asia-southeast1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=asia-southeast1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-west9`)
@@ -3287,7 +3649,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-west9 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-west9 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-west9 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`me-west1`)
@@ -3299,7 +3661,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=me-west1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=me-west1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=me-west1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-west3`)
@@ -3311,7 +3673,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-west3 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-west3 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-west3 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-east5`)
@@ -3323,7 +3685,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-east5 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-east5 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-east5 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`australia-southeast1`)
@@ -3335,7 +3697,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=australia-southeast1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=australia-southeast1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=australia-southeast1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`asia-south2`)
@@ -3347,7 +3709,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=asia-south2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=asia-south2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=asia-south2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-west2`)
@@ -3359,7 +3721,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-west2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-west2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-west2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-west8`)
@@ -3371,7 +3733,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-west8 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-west8 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-west8 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`asia-southeast2`)
@@ -3383,7 +3745,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=asia-southeast2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=asia-southeast2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=asia-southeast2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`australia-southeast2`)
@@ -3395,7 +3757,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=australia-southeast2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=australia-southeast2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=australia-southeast2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`asia-east2`)
@@ -3407,7 +3769,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=asia-east2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=asia-east2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=asia-east2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`northamerica-northeast2`)
@@ -3419,7 +3781,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=northamerica-northeast2 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=northamerica-northeast2 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=northamerica-northeast2 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-east1`)
@@ -3431,7 +3793,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-east1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-east1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-east1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-west1`)
@@ -3443,7 +3805,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-west1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-west1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-west1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`asia-northeast1`)
@@ -3455,7 +3817,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=asia-northeast1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=asia-northeast1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`europe-west3`)
@@ -3467,7 +3829,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=europe-west3 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=europe-west3 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=europe-west3 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`southamerica-west1`)
@@ -3479,7 +3841,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=southamerica-west1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=southamerica-west1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=southamerica-west1 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`asia-northeast3`)
@@ -3491,7 +3853,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=asia-northeast3 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=asia-northeast3 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=asia-northeast3 --network=<NETWORK> --range=<CIDR>
   ```
 
 #### `default` (location=`us-central1`)
@@ -3503,10 +3865,22 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud compute networks subnets describe default --region=us-central1 --project=shingo-ar-sharedservice0926-3
-  gcloud compute networks subnets create default --project=shingo-ar-service2026061801-3 --region=us-central1 --network=<NETWORK> --range=<CIDR>
+  gcloud compute networks subnets create default --project=shingo-ar-service2026061900-3 --region=us-central1 --network=<NETWORK> --range=<CIDR>
   ```
 
-### `iam.googleapis.com/Role` （2 件）
+### `iam.googleapis.com/Role` （5 件）
+
+#### `incre3` (location=`global`)
+
+- full name: `//iam.googleapis.com/projects/shingo-ar-sharedservice0926-3/roles/incre3`
+- 担当ステップ: `terraform_apply`
+- 期待 TF 型: `google_project_iam_custom_role`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_project_iam_custom_role)
+- 推奨コマンド:
+  ```bash
+  gcloud iam roles describe incre3 --project=shingo-ar-sharedservice0926-3
+  gcloud iam roles create incre3 --project=shingo-ar-service2026061900-3 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
+  ```
 
 #### `Incre` (location=`global`)
 
@@ -3517,7 +3891,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam roles describe Incre --project=shingo-ar-sharedservice0926-3
-  gcloud iam roles create Incre --project=shingo-ar-service2026061801-3 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
+  gcloud iam roles create Incre --project=shingo-ar-service2026061900-3 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
   ```
 
 #### `migrationSrcReader` (location=`global`)
@@ -3529,7 +3903,31 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam roles describe migrationSrcReader --project=shingo-ar-sharedservice0926-3
-  gcloud iam roles create migrationSrcReader --project=shingo-ar-service2026061801-3 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
+  gcloud iam roles create migrationSrcReader --project=shingo-ar-service2026061900-3 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
+  ```
+
+#### `incre2` (location=`global`)
+
+- full name: `//iam.googleapis.com/projects/shingo-ar-sharedservice0926-3/roles/incre2`
+- 担当ステップ: `terraform_apply`
+- 期待 TF 型: `google_project_iam_custom_role`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_project_iam_custom_role)
+- 推奨コマンド:
+  ```bash
+  gcloud iam roles describe incre2 --project=shingo-ar-sharedservice0926-3
+  gcloud iam roles create incre2 --project=shingo-ar-service2026061900-3 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
+  ```
+
+#### `incre` (location=`global`)
+
+- full name: `//iam.googleapis.com/projects/shingo-ar-sharedservice0926-3/roles/incre`
+- 担当ステップ: `terraform_apply`
+- 期待 TF 型: `google_project_iam_custom_role`
+- 判定理由: bulk-export が出力しなかった (期待 TF 型: google_project_iam_custom_role)
+- 推奨コマンド:
+  ```bash
+  gcloud iam roles describe incre --project=shingo-ar-sharedservice0926-3
+  gcloud iam roles create incre --project=shingo-ar-service2026061900-3 --title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA
   ```
 
 ### `iam.googleapis.com/ServiceAccount` （3 件）
@@ -3543,7 +3941,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam service-accounts describe org-svc3-viewer@shingo-ar-sharedservice0926-3.iam.gserviceaccount.com --project=shingo-ar-sharedservice0926-3
-  gcloud iam service-accounts create org-svc3-viewer --project=shingo-ar-service2026061801-3 --display-name=<DISPLAY_NAME>
+  gcloud iam service-accounts create org-svc3-viewer --project=shingo-ar-service2026061900-3 --display-name=<DISPLAY_NAME>
   ```
 
 #### `incredibuild@shingo-ar-sharedservice0926-3.iam.gserviceaccount.com` (location=`global`)
@@ -3555,7 +3953,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam service-accounts describe incredibuild@shingo-ar-sharedservice0926-3.iam.gserviceaccount.com --project=shingo-ar-sharedservice0926-3
-  gcloud iam service-accounts create incredibuild --project=shingo-ar-service2026061801-3 --display-name=<DISPLAY_NAME>
+  gcloud iam service-accounts create incredibuild --project=shingo-ar-service2026061900-3 --display-name=<DISPLAY_NAME>
   ```
 
 #### `1033858800454-compute@developer.gserviceaccount.com` (location=`global`)
@@ -3567,7 +3965,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud iam service-accounts describe 1033858800454-compute@developer.gserviceaccount.com --project=shingo-ar-sharedservice0926-3
-  gcloud iam service-accounts create 1033858800454-compute --project=shingo-ar-service2026061801-3 --display-name=<DISPLAY_NAME>
+  gcloud iam service-accounts create 1033858800454-compute --project=shingo-ar-service2026061900-3 --display-name=<DISPLAY_NAME>
   ```
 
 ### `iam.googleapis.com/ServiceAccountKey` （2 件）
@@ -3607,7 +4005,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging buckets describe _Default --location=global --project=1033858800454
-  gcloud logging buckets create _Default --location=global --project=shingo-ar-service2026061801-3 --retention-days=<N>
+  gcloud logging buckets create _Default --location=global --project=shingo-ar-service2026061900-3 --retention-days=<N>
   ```
 
 #### `_Required` (location=`global`)
@@ -3619,7 +4017,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging buckets describe _Required --location=global --project=1033858800454
-  gcloud logging buckets create _Required --location=global --project=shingo-ar-service2026061801-3 --retention-days=<N>
+  gcloud logging buckets create _Required --location=global --project=shingo-ar-service2026061900-3 --retention-days=<N>
   ```
 
 ### `logging.googleapis.com/LogSink` （2 件）
@@ -3633,7 +4031,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging sinks describe _Required --project=1033858800454
-  gcloud logging sinks create _Required <DESTINATION> --project=shingo-ar-service2026061801-3 --log-filter='<FILTER>'
+  gcloud logging sinks create _Required <DESTINATION> --project=shingo-ar-service2026061900-3 --log-filter='<FILTER>'
   ```
 
 #### `_Default` (location=`global`)
@@ -3645,7 +4043,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud logging sinks describe _Default --project=1033858800454
-  gcloud logging sinks create _Default <DESTINATION> --project=shingo-ar-service2026061801-3 --log-filter='<FILTER>'
+  gcloud logging sinks create _Default <DESTINATION> --project=shingo-ar-service2026061900-3 --log-filter='<FILTER>'
   ```
 
 ### `serviceusage.googleapis.com/Service` （19 件）
@@ -3659,7 +4057,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:storage-component.googleapis.com'
-  gcloud services enable storage-component.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable storage-component.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `cloudtrace.googleapis.com` (location=`global`)
@@ -3671,7 +4069,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:cloudtrace.googleapis.com'
-  gcloud services enable cloudtrace.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable cloudtrace.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `oslogin.googleapis.com` (location=`global`)
@@ -3683,7 +4081,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:oslogin.googleapis.com'
-  gcloud services enable oslogin.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable oslogin.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `logging.googleapis.com` (location=`global`)
@@ -3695,7 +4093,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:logging.googleapis.com'
-  gcloud services enable logging.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable logging.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `cloudapis.googleapis.com` (location=`global`)
@@ -3707,7 +4105,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:cloudapis.googleapis.com'
-  gcloud services enable cloudapis.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable cloudapis.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `cloudasset.googleapis.com` (location=`global`)
@@ -3719,7 +4117,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:cloudasset.googleapis.com'
-  gcloud services enable cloudasset.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable cloudasset.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `sql-component.googleapis.com` (location=`global`)
@@ -3731,7 +4129,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:sql-component.googleapis.com'
-  gcloud services enable sql-component.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable sql-component.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `bigquerystorage.googleapis.com` (location=`global`)
@@ -3743,7 +4141,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:bigquerystorage.googleapis.com'
-  gcloud services enable bigquerystorage.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable bigquerystorage.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `cloudaicompanion.googleapis.com` (location=`global`)
@@ -3755,7 +4153,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:cloudaicompanion.googleapis.com'
-  gcloud services enable cloudaicompanion.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable cloudaicompanion.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `bigquerymigration.googleapis.com` (location=`global`)
@@ -3767,7 +4165,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:bigquerymigration.googleapis.com'
-  gcloud services enable bigquerymigration.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable bigquerymigration.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `bigquery.googleapis.com` (location=`global`)
@@ -3779,7 +4177,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:bigquery.googleapis.com'
-  gcloud services enable bigquery.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable bigquery.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `monitoring.googleapis.com` (location=`global`)
@@ -3791,7 +4189,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:monitoring.googleapis.com'
-  gcloud services enable monitoring.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable monitoring.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `serviceusage.googleapis.com` (location=`global`)
@@ -3803,7 +4201,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:serviceusage.googleapis.com'
-  gcloud services enable serviceusage.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable serviceusage.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `datastore.googleapis.com` (location=`global`)
@@ -3815,7 +4213,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:datastore.googleapis.com'
-  gcloud services enable datastore.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable datastore.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `compute.googleapis.com` (location=`global`)
@@ -3827,7 +4225,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:compute.googleapis.com'
-  gcloud services enable compute.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable compute.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `storage.googleapis.com` (location=`global`)
@@ -3839,7 +4237,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:storage.googleapis.com'
-  gcloud services enable storage.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable storage.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `cloudresourcemanager.googleapis.com` (location=`global`)
@@ -3851,7 +4249,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:cloudresourcemanager.googleapis.com'
-  gcloud services enable cloudresourcemanager.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable cloudresourcemanager.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `servicemanagement.googleapis.com` (location=`global`)
@@ -3863,7 +4261,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:servicemanagement.googleapis.com'
-  gcloud services enable servicemanagement.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable servicemanagement.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 #### `storage-api.googleapis.com` (location=`global`)
@@ -3875,7 +4273,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud services list --enabled --project=1033858800454 --filter='config.name:storage-api.googleapis.com'
-  gcloud services enable storage-api.googleapis.com --project=shingo-ar-service2026061801-3
+  gcloud services enable storage-api.googleapis.com --project=shingo-ar-service2026061900-3
   ```
 
 ### `storage.googleapis.com/Bucket` （2 件）
@@ -3889,7 +4287,7 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud storage buckets describe gs://shingo-ar-test
-  gcloud storage buckets create gs://<DST_BUCKET_NAME> --project=shingo-ar-service2026061801-3 --location=us  # 名前は rename_rules.gcs を適用すること
+  gcloud storage buckets create gs://<DST_BUCKET_NAME> --project=shingo-ar-service2026061900-3 --location=us  # 名前は rename_rules.gcs を適用すること
   ```
 
 #### `shingo-ar-sharedservice0926-3` (location=`us`)
@@ -3901,8 +4299,8 @@ Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、
 - 推奨コマンド:
   ```bash
   gcloud storage buckets describe gs://shingo-ar-sharedservice0926-3
-  gcloud storage buckets create gs://<DST_BUCKET_NAME> --project=shingo-ar-service2026061801-3 --location=us  # 名前は rename_rules.gcs を適用すること
+  gcloud storage buckets create gs://<DST_BUCKET_NAME> --project=shingo-ar-service2026061900-3 --location=us  # 名前は rename_rules.gcs を適用すること
   ```
 
 ---
-合計欠落候補: **315** 件
+合計欠落候補: **347** 件
