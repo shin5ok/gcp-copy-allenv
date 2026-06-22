@@ -125,11 +125,15 @@
 3. **data_sync**:
    - GCS: リネーム後バケットへ `gcloud storage rsync` で同期
    - BigQuery: src の location を継承してデータセット作成 → コピー
-4. **Network Firewall (Step 4.5)**: host の FW rules / policies を `gcloud` で冪等複製（Terraform で表現しきれない部分の補完）
+4. **Network Firewall (Step 4.5)**: host の FW rules / policies を `gcloud` で冪等複製（Terraform で表現しきれない部分の補完）。実際のコード上は Step 4 (terraform_apply) の直後・Step 5 (gce_restore) の前に走る。
+   - **冒頭で `_replicate_host_networks()` を呼び、dst host の Shared VPC ネットワーク (例: `shared-vpc`) と subnet を src host と同型に複製**する。FW rule / FW policy association は `--network=<NAME>` を要求するため、これが無いと `Could not fetch resource: 'projects/<dst_host>/global/networks/<name>' was not found` で全 FW 操作が失敗する。冪等 (`_gcloud_exists` ガード) で、Step 5 から再度呼ばれても describe のみ。
+   - 防御的に `_sync_classic_firewall_rules` は参照される dst network を一括 pre-flight チェック、`_sync_fw_policy_associations` は assoc 単位で existence チェックし、未存在の network を参照する rule/assoc は cryptic な API エラーを量産せず skip + WARNING に倒す。
    - `network-firewall-policies` のサブコマンドごとに scope flag が異なる: `list`=`--regions=`（複数形）/ `describe`・`create`=`--global`・`--region=`（ポリシー本体）/ `rules ...`・`associations create`=`--global-firewall-policy`・`--firewall-policy-region=`。誤ると `unrecognized arguments`。`fw_rule_scope_flag()` で変換する。
    - `fw_policy_rule_flags()` は REST API の FirewallPolicyRule 全フィールドに対応する。INGRESS ルールは `srcIpRanges / srcThreatIntelligences / srcAddressGroups / srcFqdns / srcSecureTags / srcRegionCodes / srcNetworkScope` のいずれかが必須（gcloud 仕様）。欠落すると `Must specify src_... for ingress direction` / `Could not fetch resource:` で失敗する。
    - **Secure tag**（`tagValues/<数値ID>`）は ORG スコープの permanent ID で別 ORG には存在しない。そのまま渡すと `rules create` が `Could not fetch resource:` で失敗する。`config steps.network_firewall.secure_tag_map` に src→dst の tagValues を登録すると変換して複製。未登録タグを参照するルールは FW を意図せず緩めないようエラーにせずスキップし WARNING を出す。
 5. `bulk_export.skip_on_run: true` の場合は export/customize をスキップし `terraform/active/` を再利用（再実行高速化）
+   - 判定は `terraform/active/<src>/.dst_project` マーカーが現 config の dst と一致するかで行う。一致すれば export と customize を**完全スキップ**、不一致でも `terraform/raw/` が残っていれば customize のみ再実行（bulk-export 自体は省略）。
+   - マーカーは `customize_hcl` 末尾と Step 4 の `_reset_stale_state_if_needed` の両方が書く（plan/run・skip_on_run 間で整合）。dry_run では `customize_hcl` が `.tf` を実書き出ししないためマーカーも更新しない（plan で書き出すと .tf と marker が乖離するため）。
 
 ---
 
