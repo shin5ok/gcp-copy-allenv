@@ -144,6 +144,25 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
     "osconfig.googleapis.com/OSPolicyAssignmentReport": None,
 }
 
+# 専用ステップが dst へリソースを複製するため、bulk-export 出力に無くても想定内
+# （手動対応不要）。DIFF.md からは除外し件数だけ集計する。
+_AUTO_HANDLED_STEPS = frozenset({"gce_restore", "network_firewall", "data_sync"})
+
+
+def _needs_manual_recreate(atype: str, coverage_step: Optional[str]) -> bool:
+    """DIFF.md に載せるべき（手動で dst 作成/調整が要る）欠落かを判定する。
+
+    - `_ASSET_COVERAGE` 未登録: 複製漏れの可能性 → 要手動。
+    - coverage_step is None（意図的対象外）: 不要。
+    - gce_restore / network_firewall / data_sync: 専用ステップが複製 → 不要。
+    - terraform_apply / bulk_export 等: bulk-export が出すはずが欠落 → 要手動。
+    """
+    if atype not in _ASSET_COVERAGE:
+        return True
+    if coverage_step is None:
+        return False
+    return coverage_step not in _AUTO_HANDLED_STEPS
+
 
 def fw_rule_scope_flag(scope_flag: str) -> str:
     """ポリシー scope flag を rules / associations サブコマンド用に変換する。
@@ -471,12 +490,10 @@ def gcloud_recreate_command(
 ) -> List[str]:
     """欠落リソースを dst に作るための gcloud コマンド列を生成する。
 
-    生成方針:
-      1) src 側で詳細を取得する `gcloud ... describe` を先に提示（read-only、安全）
-      2) dst 側で作成する `gcloud ... create` を提示（必要な値は <PLACEHOLDER> で示す）
-
-    完全な引数を網羅できない種別は generic な `gcloud asset` ベースの調査コマンドだけを
-    返す。短い 1 ライナを目指し、ログでも DIFF.md でも読みやすい長さに留める。
+    生成方針: dst 側で作成する `gcloud ... create` 系のみを返す（必要な値は
+    <PLACEHOLDER> で示す）。src 側の describe / list など read 操作は DIFF.md の
+    ノイズになるため含めない。完全な引数を網羅できない種別は再作成方針を示す
+    コメント行のみを返す。短い 1 ライナを目指す。
     """
     src_proj = ""
     m = re.match(r"^//[^/]+/projects/([^/]+)/", full_name)
@@ -485,91 +502,76 @@ def gcloud_recreate_command(
 
     loc = location or "global"
     sn = short_name or "<RESOURCE_NAME>"
-    src_flag = f"--project={src_proj}" if src_proj else ""
     dst_flag = f"--project={dst_project}" if dst_project else "--project=<DST_PROJECT>"
 
     if asset_type == "compute.googleapis.com/Network":
         return [
-            f"gcloud compute networks describe {sn} {src_flag}",
             f"gcloud compute networks create {sn} {dst_flag} --subnet-mode=custom",
         ]
     if asset_type == "compute.googleapis.com/Subnetwork":
         return [
-            f"gcloud compute networks subnets describe {sn} --region={loc} {src_flag}",
             f"gcloud compute networks subnets create {sn} {dst_flag} "
             f"--region={loc} --network=<NETWORK> --range=<CIDR>",
         ]
     if asset_type == "compute.googleapis.com/Firewall":
         return [
-            f"gcloud compute firewall-rules describe {sn} {src_flag}",
             f"gcloud compute firewall-rules create {sn} {dst_flag} "
             f"--network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> "
             f"--rules=<PROTO:PORT,...>",
         ]
     if asset_type == "compute.googleapis.com/FirewallPolicy":
         return [
-            f"gcloud compute network-firewall-policies describe {sn} --global {src_flag}",
             f"gcloud compute network-firewall-policies create {sn} --global {dst_flag} "
             f"--description=<DESC>",
         ]
     if asset_type == "compute.googleapis.com/Router":
         return [
-            f"gcloud compute routers describe {sn} --region={loc} {src_flag}",
             f"gcloud compute routers create {sn} {dst_flag} --region={loc} "
             f"--network=<NETWORK> --asn=<ASN>",
         ]
     if asset_type == "compute.googleapis.com/Route":
         return [
-            f"gcloud compute routes describe {sn} {src_flag}",
             f"gcloud compute routes create {sn} {dst_flag} "
             f"--network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>",
         ]
     if asset_type == "compute.googleapis.com/Address":
         region_flag = f"--region={loc}" if loc and loc != "global" else "--global"
         return [
-            f"gcloud compute addresses describe {sn} {region_flag} {src_flag}",
             f"gcloud compute addresses create {sn} {dst_flag} {region_flag}",
         ]
     if asset_type == "compute.googleapis.com/Instance":
         return [
-            f"gcloud compute instances describe {sn} --zone={loc} {src_flag}",
             f"gcloud compute instances create {sn} {dst_flag} "
             f"--zone={loc} --machine-type=<MACHINE_TYPE> "
             f"--source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当",
         ]
     if asset_type == "compute.googleapis.com/Disk":
         return [
-            f"gcloud compute disks describe {sn} --zone={loc} {src_flag}",
             f"gcloud compute disks create {sn} {dst_flag} "
             f"--zone={loc} --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)",
         ]
     if asset_type == "compute.googleapis.com/Snapshot":
         return [
-            f"gcloud compute snapshots describe {sn} {src_flag}",
             f"# snapshot は src 側からの参照で復元する設計のため dst 作成は不要 "
             f"(Step 5 gce_restore が source-snapshot として直接使用)",
         ]
     if asset_type == "compute.googleapis.com/Image":
         return [
-            f"gcloud compute images describe {sn} {src_flag}",
             f"# image は使用しない方針（snapshot 由来）。必要なら "
             f"gcloud compute images create {sn} {dst_flag} --source-snapshot=<SNAPSHOT>",
         ]
     if asset_type == "compute.googleapis.com/ResourcePolicy":
         return [
-            f"gcloud compute resource-policies describe {sn} --region={loc} {src_flag}",
             f"gcloud compute resource-policies create snapshot-schedule {sn} {dst_flag} "
             f"--region={loc} --max-retention-days=<N> --daily-schedule --start-time=<HH:MM>",
         ]
     if asset_type == "storage.googleapis.com/Bucket":
         return [
-            f"gcloud storage buckets describe gs://{sn}",
             f"gcloud storage buckets create gs://<DST_BUCKET_NAME> "
             f"{dst_flag} --location={loc}  # 名前は rename_rules.gcs を適用すること",
         ]
     if asset_type == "bigquery.googleapis.com/Dataset":
         return [
-            f"bq --project_id={src_proj or '<SRC>'} show --format=prettyjson {sn}",
             f"bq --project_id={dst_project or '<DST>'} mk --location={loc} "
             f"--dataset {dst_project or '<DST>'}:{sn}",
         ]
@@ -580,8 +582,6 @@ def gcloud_recreate_command(
         if mm:
             ds, sn = mm.group(1), mm.group(2)
         return [
-            f"bq --project_id={src_proj or '<SRC>'} show --format=prettyjson "
-            f"{src_proj or '<SRC>'}:{ds or '<DATASET>'}.{sn}",
             f"bq --project_id={dst_project or '<DST>'} cp "
             f"{src_proj or '<SRC>'}:{ds or '<DATASET>'}.{sn} "
             f"{dst_project or '<DST>'}:{ds or '<DATASET>'}.{sn}  "
@@ -590,7 +590,6 @@ def gcloud_recreate_command(
     if asset_type == "iam.googleapis.com/Role":
         # full name: //iam.googleapis.com/projects/<p>/roles/<roleId>
         return [
-            f"gcloud iam roles describe {sn} {src_flag}",
             f"gcloud iam roles create {sn} {dst_flag} "
             f"--title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA",
         ]
@@ -599,31 +598,26 @@ def gcloud_recreate_command(
         # short_name は email 全体。create の引数は accountId（email の @ より前）。
         account_id = sn.split("@", 1)[0] if "@" in sn else sn
         return [
-            f"gcloud iam service-accounts describe {sn} {src_flag}",
             f"gcloud iam service-accounts create {account_id} {dst_flag} "
             f"--display-name=<DISPLAY_NAME>",
         ]
     if asset_type == "serviceusage.googleapis.com/Service":
         return [
-            f"gcloud services list --enabled {src_flag} --filter='config.name:{sn}'",
             f"gcloud services enable {sn} {dst_flag}",
         ]
     if asset_type == "logging.googleapis.com/LogSink":
         return [
-            f"gcloud logging sinks describe {sn} {src_flag}",
             f"gcloud logging sinks create {sn} <DESTINATION> {dst_flag} "
             f"--log-filter='<FILTER>'",
         ]
     if asset_type == "logging.googleapis.com/LogBucket":
         # full name: //logging.googleapis.com/projects/<p>/locations/<loc>/buckets/<id>
         return [
-            f"gcloud logging buckets describe {sn} --location={loc} {src_flag}",
             f"gcloud logging buckets create {sn} --location={loc} {dst_flag} "
             f"--retention-days=<N>",
         ]
     # generic fallback
     return [
-        f"gcloud asset describe '{full_name}' {src_flag}",
         f"# {asset_type} は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。",
     ]
 
@@ -662,6 +656,7 @@ def analyze_cai_tf_diff(
     missing: List[Dict[str, Any]] = []
     unknown_types: set = set()
     covered = 0
+    auto_handled = 0  # 専用ステップ複製 / 意図的対象外（DIFF.md からは除外、件数のみ）
 
     for r in cai_records:
         atype = r.get("asset_type", "")
@@ -695,6 +690,12 @@ def analyze_cai_tf_diff(
         else:
             reason = f"別ステップ '{coverage_step}' が複製を担当（bulk-export 出力対象外）"
 
+        # DIFF.md は手動で dst 作成/調整が要るものだけに絞る（量が多すぎるため）。
+        # 専用ステップ複製分・意図的対象外は件数だけ数えてスキップする。
+        if not _needs_manual_recreate(atype, coverage_step):
+            auto_handled += 1
+            continue
+
         missing.append({
             "asset_type": atype,
             "short_name": short,
@@ -712,6 +713,7 @@ def analyze_cai_tf_diff(
         "cai_total": len(cai_records),
         "tf_total": sum(len(v) for v in tf_resources.values()),
         "covered": covered,
+        "auto_handled": auto_handled,
         "missing": missing,
         "unknown_types": sorted(unknown_types),
     }
@@ -726,12 +728,17 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
     lines.append("# CAI ↔ Terraform bulk-export 差分レポート")
     lines.append("")
     lines.append("Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、")
-    lines.append("`gcloud beta resource-config bulk-export` の出力に**含まれなかった**ものを")
+    lines.append("bulk-export / terraform で **自動再現されず、手動で dst 作成・調整が必要なもの** だけを")
     lines.append("プロジェクトごとに列挙し、dst 側に再現するための gcloud コマンドを併記します。")
+    lines.append("（read 操作の describe / list は省き、作成系コマンドのみ掲載）")
     lines.append("")
-    lines.append("- 「意図的に対象外」: `_ASSET_COVERAGE` で None 指定。実害なしとして除外可。")
-    lines.append("- 「別ステップが担当」: Step 4.5 / Step 5 / Step 6 等で複製。bulk-export 単体での欠落は想定通り。")
-    lines.append("- 「未登録」「bulk-export が出力しなかった」: 対応の検討が必要。")
+    lines.append("掲載対象（要手動対応）:")
+    lines.append("- 「未登録」: `_ASSET_COVERAGE` に無い assetType（複製漏れの可能性）。")
+    lines.append("- 「bulk-export が出力しなかった」: terraform_apply 担当のはずが TF 出力に無い。")
+    lines.append("")
+    lines.append("非掲載（自動処理 / 対象外。件数のみ集計）:")
+    lines.append("- 専用ステップ（Step 4.5 network_firewall / Step 5 gce_restore / Step 6 data_sync）が複製。")
+    lines.append("- `_ASSET_COVERAGE` で None 指定の意図的対象外（実害なし）。")
     lines.append("")
 
     grand_total = 0
@@ -744,7 +751,8 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
             f"- CAI 検出リソース: **{r['cai_total']}** 件"
             f" / TF 出力リソース: **{r['tf_total']}** 件"
             f" / 一致: **{r['covered']}** 件"
-            f" / 欠落候補: **{len(r['missing'])}** 件"
+            f" / 要手動対応: **{len(r['missing'])}** 件"
+            f" / 自動処理・対象外: **{r.get('auto_handled', 0)}** 件"
         )
         if r["unknown_types"]:
             lines.append(
@@ -752,7 +760,7 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
             )
         lines.append("")
         if not r["missing"]:
-            lines.append("欠落候補なし。 ✓")
+            lines.append("要手動対応の欠落なし。 ✓")
             lines.append("")
             continue
 
@@ -784,7 +792,7 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
                 lines.append("  ```")
                 lines.append("")
     lines.append("---")
-    lines.append(f"合計欠落候補: **{grand_total}** 件")
+    lines.append(f"合計（要手動対応）: **{grand_total}** 件")
     return "\n".join(lines) + "\n"
 
 
@@ -1212,7 +1220,7 @@ class MigrationOrchestrator:
         def enabled(name: str) -> bool:
             return steps.get(name, {}).get('enabled', False)
 
-        gcloud_steps = ("cai_scan", "gce_snapshot", "bulk_export", "gce_restore", "data_sync")
+        gcloud_steps = ("cai_scan", "gce_snapshot", "bulk_export", "gce_restore", "data_sync", "vpc_sc")
 
         # (ツール名, 必要か, 不足時の説明)
         required = [
@@ -1799,7 +1807,8 @@ resource "google_storage_bucket" "mock_bucket" {{
             self.org_logger.info(
                 f"  {src_proj}: CAI {report['cai_total']} 件 / "
                 f"TF {report['tf_total']} 件 / 一致 {report['covered']} 件 / "
-                f"欠落 {len(report['missing'])} 件"
+                f"要手動 {len(report['missing'])} 件 / "
+                f"自動・対象外 {report.get('auto_handled', 0)} 件"
             )
 
         if not reports:
