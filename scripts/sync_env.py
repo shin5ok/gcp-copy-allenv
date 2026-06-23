@@ -20,6 +20,7 @@ import shlex
 import tempfile
 import time
 import datetime
+import ipaddress
 import threading
 import concurrent.futures
 from typing import Dict, List, Optional, Any, Tuple
@@ -83,6 +84,9 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud compute network-firewall-policies rules describe",
     "gcloud compute network-firewall-policies rules create",
     "gcloud compute network-firewall-policies associations create",
+    "gcloud compute routes create",
+    "gcloud compute routes describe",
+    "gcloud compute instances add-tags",
     "gcloud services enable",
     "bq ls",
     "bq show",
@@ -809,6 +813,9 @@ _DST_PERMS_BY_STEP = {
     "gce_restore":      ("compute.instances.start", "compute.instances.stop",
                          "compute.disks.create", "compute.disks.delete",
                          "compute.instances.attachDisk", "compute.instances.detachDisk"),
+    "nat_gateway":      ("compute.instances.create", "compute.addresses.create",
+                         "compute.routes.create", "compute.firewalls.create",
+                         "compute.instances.setTags"),
     "data_sync":        ("storage.objects.create",
                          "bigquery.datasets.create", "bigquery.tables.create"),
 }
@@ -938,6 +945,27 @@ def _first_meaningful_line(stderr: Optional[str], stdout: Optional[str], limit: 
     return "(理由不明)"
 
 
+def compute_nat_private_ip(cidr: str, last_octet: int) -> str:
+    """サブネット CIDR と第4オクテットから NAT GW の内部 IP を算出する（純関数）。
+
+    - last_octet は 250〜254（>=250 かつ /24 のブロードキャスト .255 を避ける）。
+    - ネットワークアドレスの上位3オクテット + last_octet を採用し、その IP が
+      サブネットの利用可能ホスト範囲内（network/broadcast を除く）であることを保証。
+    - /24 以外のマスクにも対応。算出 IP が範囲外なら ValueError（不通 IP の握り潰し回避）。
+    """
+    if not isinstance(last_octet, int) or not (250 <= last_octet <= 254):
+        raise ValueError(f"last_octet は 250〜254 の整数で指定してください: {last_octet!r}")
+    net = ipaddress.ip_network(cidr, strict=False)
+    base = net.network_address.packed
+    candidate = ipaddress.ip_address(bytes(base[:3]) + bytes([last_octet]))
+    if candidate not in net.hosts():
+        raise ValueError(
+            f"算出 IP {candidate} はサブネット {cidr} の利用可能ホスト範囲外です "
+            f"(第4オクテット {last_octet} を見直すか、より広いサブネットを指定してください)"
+        )
+    return str(candidate)
+
+
 # ---------------------------------------------------------------------------
 # 統計（スレッドセーフ）
 # ---------------------------------------------------------------------------
@@ -1034,6 +1062,19 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
             dst = ent.get('dst')
             if dst and dst in src_ids:
                 errors.append(f"{label}: dst '{dst}' は他の src と同じ ID です（ORG を上書きするリスク）")
+
+    # NAT ゲートウェイ（enabled のときのみ検証）
+    nat = (config.get('steps') or {}).get('nat_gateway') or {}
+    if isinstance(nat, dict) and nat.get('enabled'):
+        octet = nat.get('private_ip_last_octet', 250)
+        if not isinstance(octet, int) or not (250 <= octet <= 254):
+            errors.append(
+                f"steps.nat_gateway.private_ip_last_octet は 250〜254 の整数で指定してください "
+                f"(現在: {octet!r})"
+            )
+        for req in ('network', 'subnet', 'region', 'zone'):
+            if not nat.get(req):
+                errors.append(f"steps.nat_gateway.{req} が未指定です")
 
     return errors
 
@@ -1133,7 +1174,7 @@ class MigrationOrchestrator:
         def enabled(name: str) -> bool:
             return steps.get(name, {}).get('enabled', False)
 
-        gcloud_steps = ("cai_scan", "gce_snapshot", "bulk_export", "gce_restore", "data_sync")
+        gcloud_steps = ("cai_scan", "gce_snapshot", "bulk_export", "gce_restore", "nat_gateway", "data_sync")
 
         # (ツール名, 必要か, 不足時の説明)
         required = [
@@ -1333,6 +1374,132 @@ class MigrationOrchestrator:
             f"（検証は代表的な権限のみ）"
         )
 
+    # ----- NAT ゲートウェイの前提（org policy）事前チェック -----
+    def _read_effective_list_policy_allowed(
+        self, constraint: str, project: str,
+    ) -> Tuple[Optional[bool], str]:
+        """list 制約の effective org policy を読み、対象が「全許可」かを判定する（read-only）。
+
+        v1 `gcloud resource-manager org-policies describe --effective` を使う
+        （cloudresourcemanager 経由なので Org Policy API 無効でも読める）。
+        返り値 (allowed, detail):
+          True  : allValues=ALLOW もしくは list 制限なし（既定許可）
+          False : allValues=DENY / allowedValues or deniedValues で制限あり
+          None  : 読めなかった（API/権限/ネットワーク） → 検証不能
+        まず呼び出し元の資格情報で、失敗したら NAT の dst SA 借用で再試行する。
+        """
+        attempts = [os.environ.copy()]
+        nat_sa = getattr(self, "_nat_precheck_sa", None)
+        if nat_sa:
+            env_sa = os.environ.copy()
+            env_sa['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = nat_sa
+            attempts.append(env_sa)
+        cmd = (
+            f"gcloud resource-manager org-policies describe {constraint} "
+            f"--project={project} --effective --format=json"
+        )
+        last_detail = "read failed"
+        for env in attempts:
+            try:
+                res = subprocess.run(
+                    cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=60, env=env,
+                )
+            except Exception as e:
+                last_detail = str(e)
+                continue
+            if res.returncode != 0:
+                last_detail = _first_meaningful_line(res.stderr, res.stdout)
+                continue
+            try:
+                pol = json.loads(res.stdout or "{}")
+            except Exception:
+                last_detail = "policy JSON parse 失敗"
+                continue
+            lp = pol.get("listPolicy")
+            if not lp:
+                return True, "list policy 未設定（既定で許可）"
+            all_values = lp.get("allValues")
+            if all_values == "ALLOW":
+                return True, "allValues=ALLOW"
+            if all_values == "DENY":
+                return False, "allValues=DENY（全拒否）"
+            if lp.get("deniedValues"):
+                return False, f"deniedValues={lp.get('deniedValues')}"
+            if lp.get("allowedValues"):
+                return False, (
+                    f"allowedValues={lp.get('allowedValues')} "
+                    f"（NAT GW が許可対象に含まれているか要確認）"
+                )
+            return True, "list 制限なし（既定で許可）"
+        return None, last_detail
+
+    def check_nat_prerequisites(self):
+        """NAT ゲートウェイ有効時、構築に必要な org policy を make plan/run の前に検証する。
+
+        NAT GW は IP forwarding（`--can-ip-forward`）と public IP が必須。それぞれ
+        org policy `constraints/compute.vmCanIpForward` / `constraints/compute.vmExternalIpAccess`
+        が org/folder から継承されて拒否されていると `instances create` が
+        `Constraint ... violated` で失敗する。これらは org スコープのため dst SA からは
+        変更できない（自動設定はしない方針）。揃っていなければ手動の設定手順を提示して
+        **fail-fast で停止**する（make plan で気付けるように）。
+        """
+        steps = self.config.get('steps', {})
+        nat = steps.get('nat_gateway', {}) or {}
+        if not nat.get('enabled'):
+            return
+        if self.mock:
+            self.org_logger.info("  [NAT事前チェック] Mock モードのため org policy 検証をスキップ")
+            return
+
+        host = self.config.get('project_mapping', {}).get('host_project', {})
+        dst_host = host.get('dst')
+        nat_proj, nat_sa = self._resolve_nat_project(nat, dst_host, host.get('dst_impersonate_service_account'))
+        if not nat_proj:
+            return
+        self._nat_precheck_sa = nat_sa  # _read_effective_list_policy_allowed のフォールバック用
+
+        # (constraint, 何のために必要か)
+        required = [
+            ("constraints/compute.vmCanIpForward",
+             "NAT GW の IP forwarding (--can-ip-forward)"),
+            ("constraints/compute.vmExternalIpAccess",
+             "NAT GW の public IP 付与"),
+        ]
+        problems: List[Tuple[str, str, str]] = []  # (constraint, 用途, 詳細)
+        for constraint, purpose in required:
+            allowed, detail = self._read_effective_list_policy_allowed(constraint, nat_proj)
+            if allowed is True:
+                self.org_logger.info(f"  [NAT事前チェック] OK: {constraint} ({detail})")
+            elif allowed is False:
+                problems.append((constraint, purpose, f"現在のポリシー: {detail}"))
+            else:
+                problems.append((constraint, purpose, f"検証不能（{detail}）"))
+
+        if not problems:
+            self.org_logger.info(f"  [NAT事前チェック] OK: NAT GW 構築の org policy 前提を確認 ({nat_proj})")
+            return
+
+        # 失敗: 手動 remediation を提示して停止（自動設定はしない方針）。
+        # コマンドはコピペでそのまま動くよう、実 project ID を直書きし printf でファイル生成する。
+        print("=" * 60, file=sys.stderr)
+        print(" [NAT事前チェック] NAT ゲートウェイ構築の前提が満たされていません。処理を中止します:", file=sys.stderr)
+        for constraint, purpose, detail in problems:
+            print(f"  - {constraint} が {purpose} を許可していません。{detail}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(" 対処（org admin 権限で各制約を project スコープで許可してください。自動設定はしません）:", file=sys.stderr)
+        print(f"   gcloud services enable orgpolicy.googleapis.com --project={nat_proj}", file=sys.stderr)
+        for constraint, _purpose, _detail in problems:
+            cname = constraint.split('/')[-1]
+            body = f"name: projects/{nat_proj}/policies/{cname}\\nspec:\\n  rules:\\n  - allowAll: true\\n"
+            print(f"   printf '{body}' > /tmp/{cname}.yaml && gcloud org-policies set-policy /tmp/{cname}.yaml", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(" ※「検証不能」の場合: 上記設定に加え、ポリシーを読めるよう実行者または dst SA に", file=sys.stderr)
+        print("    roles/orgpolicy.policyViewer を付与し、Cloud Resource Manager API を有効化してください。", file=sys.stderr)
+        print(" 詳細手順: PROCEDURE.md「NAT 前提条件」", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        sys.exit(1)
+
     # ----- 安全に外部コマンドを実行 -----
     def run_command(
         self,
@@ -1496,6 +1663,11 @@ class MigrationOrchestrator:
                  "creationTimestamp": now},
             ])
 
+        if cmd.strip().startswith("gcloud compute networks subnets describe"):
+            logger.info(f"{tag}[MOCK] サブネット describe をシミュレート ({proj_id})")
+            # --format='value(ipCidrRange)' なので生の文字列を返す
+            return "10.100.1.0/24"
+
         if cmd.strip().startswith("gcloud compute networks subnets list"):
             logger.info(f"{tag}[MOCK] サブネット一覧をシミュレート ({proj_id})")
             return json.dumps([
@@ -1635,6 +1807,7 @@ resource "google_storage_bucket" "mock_bucket" {{
         self.load_config()
         self.check_prerequisites()
         self.check_service_accounts()
+        self.check_nat_prerequisites()
 
         self.org_logger.info("=" * 60)
         self.org_logger.info(" copy-all-env  移行オーケストレータ  開始")
@@ -1664,6 +1837,8 @@ resource "google_storage_bucket" "mock_bucket" {{
                 self.step_network_firewall()
             if steps.get('gce_restore', {}).get('enabled', False):
                 self.step_gce_restore()
+            if steps.get('nat_gateway', {}).get('enabled', False):
+                self.step_nat_gateway()
             if steps.get('data_sync', {}).get('enabled', False):
                 self.step_data_sync()
             # 最後に CAI vs bulk-export tf 差分レポートを出力。
@@ -4190,6 +4365,371 @@ resource "google_storage_bucket" "mock_bucket" {{
                     explanation=f"dst host に サブネット {sname}（{region},{cidr}）を作成",
                     impersonate_sa=dst_sa,
                 )
+
+    # ============================================================
+    # Step 5.7: NAT Gateway (Debian + iptables masquerade + bind9)
+    # ============================================================
+    def step_nat_gateway(self):
+        """dst に NAT ゲートウェイ GCE を構築し、他 VM の default gw を NAT 経由にする。
+
+        - Debian VM（public IP + 内部 IP 第4オクテット>=250）を can-ip-forward で作成。
+        - startup-script で IP forwarding + iptables MASQUERADE + bind9 resolver を設定。
+        - tag 付き 0.0.0.0/0 ルートで client VM の egress を NAT 経由にする
+          （NAT GW 自身には client tag を付けずループを回避）。
+        - auto_tag_clients=true なら復元済み dst VM（NAT GW を除く）に client tag を自動付与。
+        前提: dst host の VPC/サブネットが存在（_replicate_host_networks 済み・Step5 で実施）。
+        """
+        log_stage_header(self.dst_logger, 57, "NAT ゲートウェイ構築（masquerade + bind9 + default route）")
+        cfg = self.config.get('steps', {}).get('nat_gateway', {}) or {}
+        host = self.config.get('project_mapping', {}).get('host_project', {})
+        dst_host = host.get('dst')
+        dst_sa = host.get('dst_impersonate_service_account')
+        if not dst_host:
+            self.dst_logger.warning("  NAT GW: dst host が未設定のためスキップ")
+            return
+
+        net = cfg.get('network')
+        subnet = cfg.get('subnet')
+        region = cfg.get('region')
+        zone = cfg.get('zone')
+        name = cfg.get('instance_name', 'nat-gw-01')
+        if not (net and subnet and region and zone):
+            self.dst_logger.error("  NAT GW: network/subnet/region/zone が未指定のためスキップ")
+            self.stats.add_failure("NAT GW", "network/subnet/region/zone 未指定")
+            self.stats.incr("failed")
+            return
+
+        nat_proj, nat_sa = self._resolve_nat_project(cfg, dst_host, dst_sa)
+
+        # 0) dst host の VPC/subnet を先に用意（NAT は VPC 前提）。gce_restore (Step5) を
+        #    無効化して NAT だけ単独実行しても network 未存在で詰まないようにする。
+        #    冪等（_gcloud_exists ガード）なので Step5 で再度呼ばれても describe のみ。
+        self._replicate_host_networks()
+
+        # 1) サブネット CIDR を取得し内部 IP を算出（第4オクテット >= 250）
+        cidr = self._get_subnet_cidr(net, subnet, region, dst_host, dst_sa)
+        if not cidr:
+            self.dst_logger.error(f"  NAT GW: サブネット {subnet}({region}) の CIDR を取得できずスキップ")
+            self.stats.add_failure("NAT GW", "subnet CIDR 取得失敗")
+            self.stats.incr("failed")
+            return
+        try:
+            priv_ip = compute_nat_private_ip(cidr, int(cfg.get('private_ip_last_octet', 250)))
+        except ValueError as e:
+            self.dst_logger.error(f"  NAT GW: 内部 IP 算出失敗 ({e})")
+            self.stats.add_failure("NAT GW", str(e))
+            self.stats.incr("failed")
+            return
+        self.dst_logger.info(f"  NAT GW: {name} を {nat_proj} / {subnet}({cidr}) に内部IP {priv_ip} で構築")
+
+        # 2) 内部 IP を静的予約（既存 _reserve_internal_ip を流用）
+        subnet_uri = f"projects/{dst_host}/regions/{region}/subnetworks/{subnet}"
+        addr_name = self._internal_addr_name(name, priv_ip)
+        self._reserve_internal_ip(nat_proj, nat_sa, region, subnet_uri, priv_ip, addr_name)
+
+        # 3) NAT GW VM を作成（冪等）
+        self._create_nat_instance(cfg, nat_proj, nat_sa, dst_host, net, subnet, region, zone, name, priv_ip)
+
+        # 4) ファイアウォール（冪等）
+        if cfg.get('create_firewall_rules', True):
+            self._create_nat_firewall_rules(cfg, dst_host, dst_sa, net, cidr, name)
+
+        # 5) 0.0.0.0/0 リダイレクトルート（冪等・tag scoped）
+        self._create_nat_route(cfg, dst_host, dst_sa, net, name, zone, nat_proj, priv_ip)
+
+        # 6) client VM への tag 自動付与（NAT GW 自身は除外）
+        if cfg.get('auto_tag_clients', False):
+            self._tag_nat_clients(cfg, name)
+
+        self.dst_logger.info("  ✓ Step 5.7 完了")
+
+    def _resolve_nat_project(self, cfg: Dict, dst_host: str, dst_sa: Optional[str]):
+        """NAT GW を作成する (project_id, impersonate_sa) を解決する。
+
+        project="host"（既定）→ dst host。dst サービスプロジェクト ID 指定時はその SA を使う。
+        mapping に無い ID は host SA を流用して試す（WARNING）。
+        """
+        proj = cfg.get('project', 'host')
+        if proj in ('host', '', None):
+            return dst_host, dst_sa
+        for svc in self.config.get('project_mapping', {}).get('service_projects', []):
+            if svc.get('dst') == proj:
+                return proj, svc.get('dst_impersonate_service_account')
+        self.dst_logger.warning(f"  NAT GW: project='{proj}' は mapping に無いため host SA を流用")
+        return proj, dst_sa
+
+    def _get_subnet_cidr(self, net: str, subnet: str, region: str,
+                         dst_host: str, dst_sa: Optional[str]) -> Optional[str]:
+        """dst host のサブネット CIDR を取得（read-only describe）。
+
+        dry-run（非 mock）では side=dst の describe がスキップされ値が取れないため、
+        計画表示用に仮 CIDR を返して以降のコマンド表示を継続する。mock では
+        _simulate_command がダミー CIDR を返す。実 run では実値を返す。
+        """
+        out = self.run_command(
+            f"gcloud compute networks subnets describe {subnet} --region={region} "
+            f"--project={dst_host} --format='value(ipCidrRange)'",
+            side="dst", logger=self.dst_logger,
+            desc=f"Describe subnet {subnet}",
+            explanation="NAT GW の内部 IP を算出するためサブネット CIDR を取得",
+            impersonate_sa=dst_sa, allow_fail=True,
+        )
+        if out and out.strip():
+            return out.strip()
+        if self.dry_run and not self.mock:
+            self.dst_logger.info("  [DRY RUN] サブネット CIDR 不明。仮 CIDR 10.0.0.0/24 で計画表示")
+            return "10.0.0.0/24"
+        return None
+
+    def _create_nat_instance(self, cfg: Dict, nat_proj: str, nat_sa: Optional[str],
+                             dst_host: str, net: str, subnet: str, region: str,
+                             zone: str, name: str, priv_ip: str):
+        """Debian NAT GW VM を作成する（冪等）。public IP + can-ip-forward + startup-script。"""
+        if self._gcloud_exists(
+            f"gcloud compute instances describe {name} --zone={zone} "
+            f"--project={nat_proj} --format='value(name)'",
+            nat_sa,
+        ):
+            self.dst_logger.info(f"    NAT GW {name} は既存。再利用")
+            return
+
+        nic = (
+            f"--network-interface=network=projects/{dst_host}/global/networks/{net},"
+            f"subnet=projects/{dst_host}/regions/{region}/subnetworks/{subnet},"
+            f"private-network-ip={priv_ip}"
+        )
+        ext = cfg.get('external_ip', 'ephemeral')
+        if ext and ext != 'ephemeral':
+            nic += f",address={ext}"   # 予約済み static external address 名
+        # ephemeral の場合は no-address を付けない → gcloud が ephemeral 外部 IP を自動採番
+
+        mt = cfg.get('machine_type', 'e2-small')
+        imgf = cfg.get('image_family', 'debian-12')
+        imgp = cfg.get('image_project', 'debian-cloud')
+        gw_tag = cfg.get('nat_gateway_tag', 'nat-gateway')
+        with tempfile.TemporaryDirectory(prefix=f"nat-{name}-") as tmpdir:
+            spath = os.path.join(tmpdir, "startup.sh")
+            with open(spath, "w", encoding="utf-8") as f:
+                f.write(self._nat_startup_script(cfg, priv_ip))
+            self.run_command(
+                f"gcloud compute instances create {name} --zone={zone} "
+                f"--project={nat_proj} --machine-type={mt} "
+                f"--image-family={imgf} --image-project={imgp} "
+                f"--can-ip-forward {nic} "
+                f"--tags={gw_tag} "
+                f"--metadata-from-file=startup-script={spath} --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Create NAT GW {name}",
+                explanation="Debian NAT GW を作成（public IP + IP forward + iptables masquerade + bind9）",
+                impersonate_sa=nat_sa,
+            )
+
+    def _nat_startup_script(self, cfg: Dict, priv_ip: str) -> str:
+        """NAT GW の startup-script を生成する（IP forward + masquerade + bind9）。"""
+        dns = cfg.get('dns', {}) or {}
+        forwarders = dns.get('forwarders') or ["169.254.169.254"]
+        allow_ranges = dns.get('allow_query_ranges') or [
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+        ]
+        enable_bind = dns.get('enable_bind', True)
+        fwd_block = " ".join(f"{f};" for f in forwarders)
+        allow_block = " ".join(f"{r};" for r in allow_ranges)
+
+        script = """#!/bin/bash
+set -eux
+# first-boot のミラー一時失敗に備えた apt リトライ（5 回）。set -e を保ったまま transient を吸収。
+apt_retry() { for _i in $(seq 1 5); do apt-get "$@" && return 0; sleep 10; done; return 1; }
+# ===== IP forwarding =====
+echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-nat.conf
+sysctl -w net.ipv4.ip_forward=1
+# ===== egress NIC = default route の iface（boot race に備えてリトライ＋ガード）=====
+EXT_IF=$(ip -o route show default | awk '{print $5; exit}')
+if [ -z "$EXT_IF" ]; then
+  for _i in $(seq 1 30); do EXT_IF=$(ip -o route show default | awk '{print $5; exit}'); [ -n "$EXT_IF" ] && break; sleep 2; done
+fi
+[ -n "$EXT_IF" ] || { echo 'NAT: default route iface not found' >&2; exit 1; }
+# ===== iptables IP masquerade =====
+iptables -t nat -C POSTROUTING -o "$EXT_IF" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$EXT_IF" -j MASQUERADE
+iptables -C FORWARD -i "$EXT_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$EXT_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -C FORWARD -o "$EXT_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$EXT_IF" -j ACCEPT
+export DEBIAN_FRONTEND=noninteractive
+apt_retry update -y
+echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+apt_retry install -y iptables-persistent
+netfilter-persistent save
+"""
+        if enable_bind:
+            bind_block = """# ===== bind9 caching/forwarding resolver =====
+apt_retry install -y bind9
+cat > /etc/bind/named.conf.options <<'EOF'
+options {
+    directory "/var/cache/bind";
+    listen-on { 127.0.0.1; __PRIV_IP__; };
+    listen-on-v6 { none; };
+    allow-query { localhost; __ALLOW__ };
+    recursion yes;
+    forwarders { __FWD__ };
+    forward only;
+    dnssec-validation no;
+};
+EOF
+systemctl enable bind9 2>/dev/null || systemctl enable named 2>/dev/null || true
+systemctl restart bind9 2>/dev/null || systemctl restart named 2>/dev/null || true
+# 起動失敗を serial console に可視化（|| true で握り潰さない）
+systemctl is-active --quiet bind9 || systemctl is-active --quiet named || echo 'NAT: WARN bind failed to start' >&2
+# NAT GW 自身が bind を利用するよう resolver を 127.0.0.1 に向ける
+grep -q 'supersede domain-name-servers 127.0.0.1;' /etc/dhcp/dhclient.conf 2>/dev/null || echo 'supersede domain-name-servers 127.0.0.1;' >> /etc/dhcp/dhclient.conf
+echo 'nameserver 127.0.0.1' > /etc/resolv.conf
+"""
+            bind_block = (
+                bind_block.replace("__PRIV_IP__", priv_ip)
+                .replace("__ALLOW__", allow_block)
+                .replace("__FWD__", fwd_block)
+            )
+            script += bind_block
+        return script
+
+    def _create_nat_firewall_rules(self, cfg: Dict, dst_host: str, dst_sa: Optional[str],
+                                   net: str, cidr: str, name: str):
+        """NAT GW の内部 INGRESS（forwarding/DNS）と internet EGRESS を許可する FW（各冪等）。
+
+        EGRESS を明示する理由: Step 4.5 が src の VPC FW を複製するため、src に
+        egress-deny 系のルールがあると dst host VPC にも複製され、NAT GW の
+        masquerade egress（暗黙の allow-all egress=priority 65535）を上書きして
+        インターネット到達を黙って壊す。NAT GW tag 向けの高優先 EGRESS allow で独立に保証する。
+        """
+        gw_tag = cfg.get('nat_gateway_tag', 'nat-gateway')
+        src_ranges = cfg.get('firewall_source_ranges') or [
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+        ]
+        # INGRESS: client → NAT GW（転送 + DNS 53）
+        in_rule = f"{name}-allow-internal"
+        if self._gcloud_exists(
+            f"gcloud compute firewall-rules describe {in_rule} --project={dst_host} "
+            f"--format='value(name)'",
+            dst_sa,
+        ):
+            self.dst_logger.info(f"    FW rule '{in_rule}' は既存。スキップ")
+        else:
+            self.run_command(
+                f"gcloud compute firewall-rules create {in_rule} --project={dst_host} "
+                f"--network={net} --direction=INGRESS --priority=1000 --allow=all "
+                f"--source-ranges={','.join(src_ranges)} --target-tags={gw_tag} --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Create NAT FW {in_rule}",
+                explanation=f"内部レンジ {src_ranges} から NAT GW(tag={gw_tag}) への転送/DNS を許可",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+        # EGRESS: NAT GW → internet（複製された egress-deny に勝つ高優先 allow）
+        eg_rule = f"{name}-allow-egress"
+        if self._gcloud_exists(
+            f"gcloud compute firewall-rules describe {eg_rule} --project={dst_host} "
+            f"--format='value(name)'",
+            dst_sa,
+        ):
+            self.dst_logger.info(f"    FW rule '{eg_rule}' は既存。スキップ")
+        else:
+            self.run_command(
+                f"gcloud compute firewall-rules create {eg_rule} --project={dst_host} "
+                f"--network={net} --direction=EGRESS --priority=900 "
+                f"--action=ALLOW --rules=all --destination-ranges=0.0.0.0/0 "
+                f"--target-tags={gw_tag} --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Create NAT FW {eg_rule}",
+                explanation=f"NAT GW(tag={gw_tag}) の internet egress を許可（複製 egress-deny を上書き）",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+
+    def _create_nat_route(self, cfg: Dict, dst_host: str, dst_sa: Optional[str],
+                          net: str, name: str, zone: str,
+                          nat_proj: str, priv_ip: str):
+        """tag 付き 0.0.0.0/0 ルートで client VM の default gw を NAT GW に向ける（冪等）。
+
+        NAT GW 自身は client tag を持たないため、このルートは NAT GW には適用されず、
+        NAT GW は default-internet-gateway 経由（自身の外部 IP）で egress する（ループ回避）。
+
+        next hop の指定:
+          - NAT GW が host プロジェクトにある場合: instance 名 + zone。
+          - NAT GW が dst サービスプロジェクトにある場合: 別プロジェクトの instance 名は
+            host スコープのルートから解決できない（`next hop instance must be in the same
+            project` で失敗）ため、予約済み内部 IP を `--next-hop-address` で指す
+            （Shared VPC のクロスプロジェクト定石。NAT GW は can-ip-forward 済み）。
+        """
+        rname = cfg.get('route_name', 'nat-default-route')
+        prio = int(cfg.get('route_priority', 800))
+        tag = cfg.get('client_network_tag', 'use-nat')
+        if self._gcloud_exists(
+            f"gcloud compute routes describe {rname} --project={dst_host} "
+            f"--format='value(name)'",
+            dst_sa,
+        ):
+            self.dst_logger.info(f"    ルート {rname} は既存。スキップ")
+            return
+        if nat_proj == dst_host:
+            next_hop = f"--next-hop-instance={name} --next-hop-instance-zone={zone}"
+        else:
+            next_hop = f"--next-hop-address={priv_ip}"
+        self.run_command(
+            f"gcloud compute routes create {rname} --project={dst_host} "
+            f"--network={net} --destination-range=0.0.0.0/0 "
+            f"{next_hop} "
+            f"--priority={prio} --tags={tag} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"Create NAT route {rname}",
+            explanation=f"tag '{tag}' を持つ VM の default gw(0.0.0.0/0) を NAT GW '{name}' 経由にする",
+            impersonate_sa=dst_sa,
+        )
+
+    def _tag_nat_clients(self, cfg: Dict, nat_name: str):
+        """復元済み dst VM（NAT GW 自身を除く）に client tag を付与し NAT 経由にする。
+
+        並列実行。worker は sys.exit せず stats に記録して return（並列方針）。
+        """
+        tag = cfg.get('client_network_tag', 'use-nat')
+        units: List[Tuple[str, str, str, str]] = []  # (vm_name, zone, dst_proj, dst_sa)
+        for _src, dst_proj, _src_sa, dst_sa in self._iter_project_pairs():
+            vms_json = self.run_command(
+                f"gcloud compute instances list --project={dst_proj} --format=json",
+                side="dst", logger=self.dst_logger,
+                desc=f"List dst VMs {dst_proj}",
+                explanation=f"{dst_proj} の VM 一覧を取得（client tag 付与対象）",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+            try:
+                vms = json.loads(vms_json) if vms_json else []
+            except Exception:
+                vms = []
+            for vm in vms:
+                vm_name = vm.get('name')
+                if not vm_name or vm_name == nat_name:
+                    continue
+                zone = (vm.get('zone') or '').split('/')[-1]
+                if zone:
+                    units.append((vm_name, zone, dst_proj, dst_sa))
+
+        if not units:
+            self.dst_logger.info(f"    client tag 付与対象の VM なし（tag={tag}）")
+            return
+
+        def worker(unit):
+            vm_name, zone, dst_proj, dst_sa = unit
+            try:
+                self.run_command(
+                    f"gcloud compute instances add-tags {vm_name} --tags={tag} "
+                    f"--zone={zone} --project={dst_proj} --quiet",
+                    side="dst", logger=self.dst_logger,
+                    desc=f"Tag client {vm_name}",
+                    explanation=f"{vm_name} に client tag '{tag}' を付与し NAT 経由にする",
+                    impersonate_sa=dst_sa, allow_fail=True,
+                )
+            except Exception as e:
+                self.dst_logger.error(f"    ✗ {vm_name} の tag 付与失敗: {e}")
+                self.stats.add_failure(f"Tag client {vm_name}", str(e))
+                self.stats.incr("failed")
+
+        self.dst_logger.info(f"    client tag '{tag}' を {len(units)} VM に付与")
+        self._parallel_for_each(units, worker, "nat-tag")
 
     def _find_valid_snapshot(self, snapshots: List[Dict], disk_name: str, max_age_days: int) -> Optional[str]:
         for snap in snapshots:

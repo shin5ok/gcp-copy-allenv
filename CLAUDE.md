@@ -108,6 +108,22 @@ make vmware-all # VMware → GCE フル処理
   - 追加の防御として `_sync_classic_firewall_rules` 冒頭で参照される dst network を一括 pre-flight チェックし、`_sync_fw_policy_associations` でも assoc 単位で existence チェックして、未存在なら skip + WARNING に倒す（cryptic な API エラー量産を防ぐ）。
   - Shared VPC ホスト化・サービスプロジェクト関連付け・networkUser 付与は別途 `bootstrap_shared_vpc.sh` の担当。VPC 自体は作らない点に注意。
 
+### NAT ゲートウェイ（Step 5.7 / `step_nat_gateway`）
+
+- **新規インフラ**（src には無い）。`config.steps.nat_gateway.enabled` 既定 `false` のオプトイン。`gce_restore` (Step 5) の後・`data_sync` の前にディスパッチ（`execute()`）。VPC/subnet と client VM が存在している必要があるためこの順序。
+- **ループ回避が肝**。default gw リダイレクトは **tag 付き `0.0.0.0/0` ルート**（`client_network_tag`、既定 `use-nat`）。NAT GW 自身には **`nat_gateway_tag`（`nat-gateway`）だけ**を付け client tag を付けないので、このルートは NAT GW に適用されず自身の external IP + default-internet-gateway で egress する。untagged ルートにすると NAT GW が自分宛にルーティングしてブラックホール化するので不可。
+- **内部 IP は `compute_nat_private_ip(cidr, last_octet)`** で算出。`last_octet` は 250〜254 を強制（`validate_config` と関数の両方で二重チェック。`.255` は /24 ブロードキャスト）。/24 以外・範囲外は `ValueError`（不通 IP を握り潰さない）。
+- **`_WRITE_VERBS` は変更不要**（NAT writes は全て dst のみ。`create` 既存、`add-tags` は src で実行しない）。ただし **`_MOCK_KNOWN_PATTERNS` には `gcloud compute routes create` / `routes describe` / `instances add-tags` を追加済み**。新コマンドを足すときは mock allow-list を必ず更新（fail-closed で止まる）。
+- **`_simulate_command` に subnet describe 分岐**を追加（`--format='value(ipCidrRange)'` なので JSON でなく生文字列 `10.100.1.0/24` を返す）。`networks list` / `subnets list` の startswith 判定と順序が衝突しないよう describe を先に置く。
+- **dry_run では subnet describe (side=dst) がスキップ**されるため `_get_subnet_cidr` が仮 CIDR `10.0.0.0/24` を返して計画表示を継続する。実 run でのみ実 CIDR を使う。
+- **client tag 自動付与 (`auto_tag_clients: true`)** は `_iter_project_pairs` 全 dst を `instances list` → NAT GW 自身を除外して `add-tags` を `_parallel_for_each` 並列。worker は `sys.exit` せず `stats.add_failure` + `incr("failed")`（並列方針）。add-tags はマージ動作なので再実行安全。
+- **DNS は NAT GW 自身に bind9** を入れて caching/forwarding resolver にするのみ（VPC 全体の Cloud DNS server policy は作らない設計）。forwarders 既定は GCP 内部 DNS `169.254.169.254`。
+- **org policy で詰まる（実 run の頻出エラー）→ make plan で事前チェックする**。NAT GW は `--can-ip-forward`（`constraints/compute.vmCanIpForward`）と public IP（`constraints/compute.vmExternalIpAccess`）が必須。これらの list 制約が org/folder から継承されて deny だと `instances create` が `Constraint ... violated` で失敗する。dst host SA は `orgpolicy.policyAdmin` を持たない（bootstrap で付与するのは editor/storage.admin/bigquery.admin/iam.roleAdmin のみ）ため**ツールからは変更不可**。
+  - **org policy の自動設定は禁止**（方針）。`check_nat_prerequisites()` が `execute()` の冒頭（`check_service_accounts` の後）で両制約を `gcloud resource-manager org-policies describe --effective`（Org Policy API 不要・read-only。呼び出し元資格情報→dst SA 借用の順で試行）で検証し、`allValues=ALLOW` 等で許可されていなければ**手動の許可コマンド（実 project ID 直書きの `printf | gcloud org-policies set-policy`）を提示して `sys.exit(1)`**。make plan の段階で気付ける。
+  - 判定は `_read_effective_list_policy_allowed`：`allValues=ALLOW` か list 制限なし→許可、`DENY`/`allowedValues`/`deniedValues`→不許可、読めなければ None（検証不能も停止）。
+  - mock では事前チェックをスキップ。NAT 用 dst 書込権限は `_DST_PERMS_BY_STEP["nat_gateway"]` に登録され testIamPermissions でも検証される。
+  - 新たに org スコープ制約が NAT を阻む場合（例: 別 ORG での tag/secure tag）も同じく「自動設定せず検証＋手動 remediation 提示」で対処する。
+
 ## Git コミット
 
 - コミットメッセージに Claude の名前や署名を付けないこと

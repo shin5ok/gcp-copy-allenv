@@ -152,6 +152,48 @@ steps:
     # 0 にすると待たない。suspend は ACPI S3 応答に依存するため、短すぎると失敗しやすい。
     power_state_wait_seconds: 120
 
+  # [Step 5.7] NAT ゲートウェイ GCE を構築し、他 VM の default gw を NAT 経由にする
+  # 新規インフラ（src には無い）のため既定 off。使うときは enabled: true にして
+  # network / subnet / region / zone を環境に合わせて埋める。
+  nat_gateway:
+    enabled: false
+    # NAT GW を作成するプロジェクト。"host"(既定)=Shared VPC ホスト。
+    # 特定の dst サービスプロジェクト ID を直接書くこともできる。
+    project: "host"
+    network: "shared-vpc"          # dst host 上の VPC 名
+    subnet: "subnet-svc1"          # NAT GW を置くサブネット名（dst host 上）
+    region: "asia-northeast1"
+    zone: "asia-northeast1-a"
+    instance_name: "nat-gw-01"
+    machine_type: "e2-small"
+    image_family: "debian-12"
+    image_project: "debian-cloud"
+    # 内部 IP の第4オクテット（250〜254）。サブネット CIDR から自動算出。
+    private_ip_last_octet: 250
+    # public IP: "ephemeral"(既定) または予約済み static external address 名
+    external_ip: "ephemeral"
+    # NAT GW 自身に付ける tag（リダイレクトルートの適用対象から外すため client tag とは別）
+    nat_gateway_tag: "nat-gateway"
+    # client VM の default gw を NAT に向ける tag 付き 0.0.0.0/0 ルート
+    client_network_tag: "use-nat"
+    route_name: "nat-default-route"
+    route_priority: 800            # 既定 internet-gw ルート(1000)より小=優先
+    # true: 復元済み dst VM 全部（NAT GW 自身を除く）に client tag を自動付与し即 NAT 経由にする
+    auto_tag_clients: true
+    # client → NAT GW の内部トラフィック(forwarding/DNS)を許可する FW を作成
+    create_firewall_rules: true
+    firewall_source_ranges: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    # NAT GW は IP forwarding と public IP が必須。org policy
+    # 'constraints/compute.vmCanIpForward' / 'constraints/compute.vmExternalIpAccess'
+    # が deny だと create が失敗する。make plan の事前チェック (check_nat_prerequisites) で
+    # 検証し、不足時は手動の許可手順を提示して停止する（自動設定はしない）。
+    # 許可手順は PROCEDURE.md「NAT 前提条件」参照。
+    # DNS: NAT GW 自身に bind9 を入れて caching/forwarding resolver にする
+    dns:
+      enable_bind: true
+      forwarders: ["169.254.169.254"]    # GCP 内部 DNS。public(8.8.8.8 等)を足してもよい
+      allow_query_ranges: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
   # [Step 6] データの移行 (GCS, BigQueryなど)
   data_sync:
     enabled: true

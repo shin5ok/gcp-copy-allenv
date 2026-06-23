@@ -22,6 +22,7 @@ from scripts.sync_env import (
     analyze_cai_tf_diff,
     format_diff_report,
     _parse_gcloud_describe_json,
+    compute_nat_private_ip,
 )
 
 
@@ -1352,3 +1353,419 @@ class TestFinalizeVmPowerStates:
         with patch("subprocess.run", return_value=ok_res):
             ok = o._try_dst_suspend("vm-s", "zone-a", "dst-p", None)
         assert ok is True
+
+
+# ============================================================
+# NAT ゲートウェイ (Step 5.7)
+# ============================================================
+def _nat_orchestrator(temp_dir, mock=False, dry_run=False, **nat_over):
+    cfg = _full_config(temp_dir)
+    cfg["global"]["mock"] = mock
+    cfg["global"]["dry_run"] = dry_run
+    cfg["global"]["parallel_jobs"] = 1
+    nat = {
+        "enabled": True, "project": "host", "network": "shared-vpc",
+        "subnet": "subnet-svc1", "region": "asia-northeast1",
+        "zone": "asia-northeast1-a", "instance_name": "nat-gw-01",
+        "machine_type": "e2-small", "image_family": "debian-12",
+        "image_project": "debian-cloud", "private_ip_last_octet": 250,
+        "external_ip": "ephemeral", "nat_gateway_tag": "nat-gateway",
+        "client_network_tag": "use-nat", "route_name": "nat-default-route",
+        "route_priority": 800, "auto_tag_clients": False,
+        "create_firewall_rules": True,
+        "firewall_source_ranges": ["10.0.0.0/8"],
+        "dns": {"enable_bind": True, "forwarders": ["169.254.169.254"],
+                "allow_query_ranges": ["10.0.0.0/8"]},
+    }
+    nat.update(nat_over)
+    cfg["steps"]["nat_gateway"] = nat
+    path = os.path.join(temp_dir, "config.yaml")
+    _write_yaml(path, cfg)
+    o = MigrationOrchestrator(path)
+    o.load_config()
+    o.dst_logger = logging.getLogger("test-dst")
+    o.org_logger = logging.getLogger("test-org")
+    return o
+
+
+class TestComputeNatPrivateIp:
+    def test_basic_24(self):
+        assert compute_nat_private_ip("10.0.1.0/24", 250) == "10.0.1.250"
+
+    def test_max_254(self):
+        assert compute_nat_private_ip("10.100.1.0/24", 254) == "10.100.1.254"
+
+    def test_below_250_raises(self):
+        with pytest.raises(ValueError):
+            compute_nat_private_ip("10.0.1.0/24", 249)
+
+    def test_255_raises(self):
+        with pytest.raises(ValueError):
+            compute_nat_private_ip("10.0.1.0/24", 255)
+
+    def test_wide_mask_in_range(self):
+        import ipaddress
+        ip = compute_nat_private_ip("10.0.0.0/23", 250)
+        assert ipaddress.ip_address(ip) in ipaddress.ip_network("10.0.0.0/23").hosts()
+
+    def test_narrow_mask_out_of_range_raises(self):
+        # 10.0.0.0/26 は .0〜.63、.250 は範囲外
+        with pytest.raises(ValueError):
+            compute_nat_private_ip("10.0.0.0/26", 250)
+
+
+class TestValidateConfigNat:
+    def test_valid_nat_ok(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["steps"]["nat_gateway"] = {
+            "enabled": True, "network": "n", "subnet": "s",
+            "region": "asia-northeast1", "zone": "asia-northeast1-a",
+            "private_ip_last_octet": 250,
+        }
+        assert validate_config(cfg) == []
+
+    def test_bad_octet_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["steps"]["nat_gateway"] = {
+            "enabled": True, "network": "n", "subnet": "s",
+            "region": "r", "zone": "z", "private_ip_last_octet": 200,
+        }
+        assert any("private_ip_last_octet" in e for e in validate_config(cfg))
+
+    def test_missing_subnet_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["steps"]["nat_gateway"] = {
+            "enabled": True, "network": "n", "region": "r", "zone": "z",
+        }
+        assert any("subnet" in e for e in validate_config(cfg))
+
+    def test_disabled_skips_validation(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["steps"]["nat_gateway"] = {"enabled": False, "private_ip_last_octet": 10}
+        assert validate_config(cfg) == []
+
+
+class TestNatGatewayStep:
+    """step_nat_gateway: 発行される gcloud コマンドの形を検証する。"""
+    def _capture(self, o):
+        from unittest.mock import patch
+        with patch.object(o, "run_command", return_value="") as mock_run, \
+             patch.object(o, "_gcloud_exists", return_value=False), \
+             patch.object(o, "_reserve_internal_ip", return_value=None), \
+             patch.object(o, "_get_subnet_cidr", return_value="10.0.1.0/24"):
+            o.step_nat_gateway()
+        return [c.args[0] for c in mock_run.call_args_list]
+
+    def test_instance_create_shape(self, temp_dir):
+        o = _nat_orchestrator(temp_dir, dry_run=False)
+        calls = self._capture(o)
+        create = [c for c in calls if "instances create nat-gw-01" in c]
+        assert create, "NAT GW の instances create が発行されていない"
+        c = create[0]
+        assert "--can-ip-forward" in c
+        assert "--image-family=debian-12" in c
+        assert "--image-project=debian-cloud" in c
+        assert "private-network-ip=10.0.1.250" in c
+        assert "--metadata-from-file=startup-script=" in c
+        assert "--tags=nat-gateway" in c
+        # ループ防止: NAT GW 自身に client tag を付けない
+        assert "use-nat" not in c
+
+    def test_route_shape(self, temp_dir):
+        o = _nat_orchestrator(temp_dir, dry_run=False)
+        calls = self._capture(o)
+        route = [c for c in calls if "routes create nat-default-route" in c]
+        assert route, "リダイレクトルートが発行されていない"
+        c = route[0]
+        assert "--destination-range=0.0.0.0/0" in c
+        assert "--next-hop-instance=nat-gw-01" in c
+        assert "--next-hop-instance-zone=asia-northeast1-a" in c
+        assert "--tags=use-nat" in c
+        assert "--priority=800" in c
+
+    def test_firewall_shape(self, temp_dir):
+        o = _nat_orchestrator(temp_dir, dry_run=False, firewall_source_ranges=["10.0.0.0/8"])
+        calls = self._capture(o)
+        ingress = [c for c in calls if "firewall-rules create nat-gw-01-allow-internal" in c]
+        assert ingress, "NAT 用 INGRESS FW ルールが発行されていない"
+        c = ingress[0]
+        assert "--direction=INGRESS" in c
+        assert "--target-tags=nat-gateway" in c
+        assert "--source-ranges=10.0.0.0/8" in c
+        assert "--allow=all" in c
+        # EGRESS allow（複製 egress-deny に勝つ）も作る
+        egress = [c for c in calls if "firewall-rules create nat-gw-01-allow-egress" in c]
+        assert egress, "NAT 用 EGRESS FW ルールが発行されていない"
+        e = egress[0]
+        assert "--direction=EGRESS" in e
+        assert "--destination-ranges=0.0.0.0/0" in e
+        assert "--target-tags=nat-gateway" in e
+        assert "--priority=900" in e
+
+    def test_auto_tag_clients_excludes_nat_gw(self, temp_dir):
+        from unittest.mock import patch
+        o = _nat_orchestrator(temp_dir, dry_run=False, auto_tag_clients=True)
+        vms = json.dumps([
+            {"name": "vm-a", "zone": "projects/p/zones/asia-northeast1-a"},
+            {"name": "nat-gw-01", "zone": "projects/p/zones/asia-northeast1-a"},
+        ])
+
+        def run_side(cmd, *a, **k):
+            return vms if "instances list" in cmd else ""
+
+        with patch.object(o, "run_command", side_effect=run_side) as mock_run, \
+             patch.object(o, "_gcloud_exists", return_value=False), \
+             patch.object(o, "_reserve_internal_ip", return_value=None), \
+             patch.object(o, "_get_subnet_cidr", return_value="10.0.1.0/24"):
+            o.step_nat_gateway()
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        tag_calls = [c for c in calls if "instances add-tags" in c]
+        assert any("add-tags vm-a" in c and "--tags=use-nat" in c for c in tag_calls)
+        assert not any("add-tags nat-gw-01" in c for c in tag_calls)
+
+    def test_idempotent_skip_when_exists(self, temp_dir):
+        from unittest.mock import patch
+        o = _nat_orchestrator(temp_dir, dry_run=False)
+        with patch.object(o, "run_command", return_value="") as mock_run, \
+             patch.object(o, "_gcloud_exists", return_value=True), \
+             patch.object(o, "_reserve_internal_ip", return_value=None), \
+             patch.object(o, "_get_subnet_cidr", return_value="10.0.1.0/24"):
+            o.step_nat_gateway()
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert not any("instances create nat-gw-01" in c for c in calls)
+        assert not any("routes create" in c for c in calls)
+        assert not any("firewall-rules create" in c for c in calls)
+
+
+class TestNatStartupScript:
+    def _orch(self, temp_dir):
+        return _nat_orchestrator(temp_dir)
+
+    def test_contains_masquerade_and_bind(self, temp_dir):
+        o = self._orch(temp_dir)
+        s = o._nat_startup_script(
+            {"dns": {"enable_bind": True, "forwarders": ["169.254.169.254"],
+                     "allow_query_ranges": ["10.0.0.0/8"]}},
+            "10.0.1.250",
+        )
+        assert "MASQUERADE" in s
+        assert "net.ipv4.ip_forward=1" in s
+        assert "install -y bind9" in s
+        assert "listen-on { 127.0.0.1; 10.0.1.250; }" in s
+        assert "forwarders { 169.254.169.254; }" in s
+        assert "nameserver 127.0.0.1" in s
+        # boot race / transient 耐性（レビュー指摘の修正）
+        assert "apt_retry" in s
+        assert "default route iface not found" in s
+
+    def test_bind_disabled(self, temp_dir):
+        o = self._orch(temp_dir)
+        s = o._nat_startup_script({"dns": {"enable_bind": False}}, "10.0.1.250")
+        assert "MASQUERADE" in s
+        assert "bind9" not in s
+
+
+class TestNatGatewayMockEndToEnd:
+    def test_full_step_mock_no_exception(self, temp_dir):
+        o = _nat_orchestrator(temp_dir, mock=True, auto_tag_clients=True)
+        before = o.stats.mocked
+        o.step_nat_gateway()
+        assert o.stats.mocked > before
+        assert o.stats.failed == 0
+
+
+class TestNatMockKnownCommands:
+    @pytest.mark.parametrize("cmd", [
+        "gcloud compute routes create r --network=n --destination-range=0.0.0.0/0 --next-hop-instance=g --next-hop-instance-zone=z --priority=800 --tags=t --quiet",
+        "gcloud compute routes describe r --project=p --format='value(name)'",
+        "gcloud compute instances add-tags vm --tags=t --zone=z --project=p --quiet",
+    ])
+    def test_known(self, cmd):
+        assert is_known_mock_command(cmd) is True
+
+
+class TestNatGatewayStepExtra:
+    """レビュー指摘 [1]/[7]/[8]/[11] のカバレッジ。"""
+    def _capture(self, o, subnet_cidr="10.0.1.0/24"):
+        from unittest.mock import patch
+        with patch.object(o, "run_command", return_value="") as mock_run, \
+             patch.object(o, "_gcloud_exists", return_value=False), \
+             patch.object(o, "_reserve_internal_ip", return_value=None), \
+             patch.object(o, "_get_subnet_cidr", return_value=subnet_cidr):
+            o.step_nat_gateway()
+        return [c.args[0] for c in mock_run.call_args_list]
+
+    def test_service_project_route_uses_next_hop_address(self, temp_dir):
+        # project を dst サービスプロジェクトにすると、ルートは内部 IP next-hop に切替わる
+        o = _nat_orchestrator(temp_dir, dry_run=False, project="dst-svc-1")
+        calls = self._capture(o)
+        route = [c for c in calls if "routes create nat-default-route" in c]
+        assert route
+        c = route[0]
+        assert "--next-hop-address=10.0.1.250" in c
+        assert "--next-hop-instance=" not in c
+
+    def test_static_external_ip_in_nic(self, temp_dir):
+        o = _nat_orchestrator(temp_dir, dry_run=False, external_ip="my-reserved-addr")
+        calls = self._capture(o)
+        create = [c for c in calls if "instances create nat-gw-01" in c][0]
+        assert ",address=my-reserved-addr" in create
+        assert "no-address" not in create
+
+    def test_ephemeral_external_ip_has_no_address_token(self, temp_dir):
+        o = _nat_orchestrator(temp_dir, dry_run=False, external_ip="ephemeral")
+        create = [c for c in self._capture(o) if "instances create nat-gw-01" in c][0]
+        assert "address=" not in create  # ephemeral は address 指定なし
+
+    def test_last_octet_propagates_to_private_ip(self, temp_dir):
+        o = _nat_orchestrator(temp_dir, dry_run=False, private_ip_last_octet=254)
+        create = [c for c in self._capture(o, subnet_cidr="10.0.1.0/24")
+                  if "instances create nat-gw-01" in c][0]
+        assert "private-network-ip=10.0.1.254" in create
+
+    def test_missing_network_records_failure_and_no_create(self, temp_dir):
+        from unittest.mock import patch
+        o = _nat_orchestrator(temp_dir, dry_run=False)
+        o.config["steps"]["nat_gateway"]["network"] = ""
+        before = o.stats.failed
+        with patch.object(o, "run_command", return_value="") as mock_run, \
+             patch.object(o, "_gcloud_exists", return_value=False), \
+             patch.object(o, "_reserve_internal_ip", return_value=None), \
+             patch.object(o, "_get_subnet_cidr", return_value="10.0.1.0/24"):
+            o.step_nat_gateway()
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert o.stats.failed > before
+        assert not any("instances create" in c for c in calls)
+
+
+class TestCheckNatPrerequisites:
+    """make plan 事前チェック: NAT 用 org policy が揃わなければ fail-fast。自動設定はしない。"""
+    def _orch(self, temp_dir, **nat_over):
+        return _nat_orchestrator(temp_dir, dry_run=True, **nat_over)
+
+    def test_skips_when_disabled(self, temp_dir):
+        o = _nat_orchestrator(temp_dir, dry_run=True)
+        o.config["steps"]["nat_gateway"]["enabled"] = False
+        # 例外も sys.exit も起きない
+        o.check_nat_prerequisites()
+
+    def test_skips_in_mock(self, temp_dir):
+        o = _nat_orchestrator(temp_dir, mock=True)
+        o.check_nat_prerequisites()  # mock はスキップ
+
+    def test_passes_when_both_allow(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        with patch.object(o, "_read_effective_list_policy_allowed",
+                          return_value=(True, "allValues=ALLOW")):
+            o.check_nat_prerequisites()  # 例外なし
+
+    def test_fails_when_ip_forward_denied(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+
+        def side(constraint, project):
+            if "vmCanIpForward" in constraint:
+                return (False, "allValues=DENY（全拒否）")
+            return (True, "allValues=ALLOW")
+
+        with patch.object(o, "_read_effective_list_policy_allowed", side_effect=side):
+            with pytest.raises(SystemExit):
+                o.check_nat_prerequisites()
+
+    def test_fails_when_external_ip_denied(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+
+        def side(constraint, project):
+            if "vmExternalIpAccess" in constraint:
+                return (False, "deniedValues=[...]")
+            return (True, "allValues=ALLOW")
+
+        with patch.object(o, "_read_effective_list_policy_allowed", side_effect=side):
+            with pytest.raises(SystemExit):
+                o.check_nat_prerequisites()
+
+    def test_fails_when_unverifiable(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        with patch.object(o, "_read_effective_list_policy_allowed",
+                          return_value=(None, "PERMISSION_DENIED")):
+            with pytest.raises(SystemExit):
+                o.check_nat_prerequisites()
+
+
+class TestReadEffectiveListPolicy:
+    """_read_effective_list_policy_allowed の YAML/JSON 解釈。"""
+    def _orch(self, temp_dir):
+        return _nat_orchestrator(temp_dir, dry_run=True)
+
+    def _run(self, o, stdout, returncode=0):
+        from unittest.mock import patch, MagicMock
+        res = MagicMock(returncode=returncode, stdout=stdout, stderr="")
+        with patch("subprocess.run", return_value=res):
+            return o._read_effective_list_policy_allowed(
+                "constraints/compute.vmCanIpForward", "p")
+
+    def test_all_values_allow(self, temp_dir):
+        allowed, _ = self._run(self._orch(temp_dir),
+                               json.dumps({"listPolicy": {"allValues": "ALLOW"}}))
+        assert allowed is True
+
+    def test_all_values_deny(self, temp_dir):
+        allowed, _ = self._run(self._orch(temp_dir),
+                               json.dumps({"listPolicy": {"allValues": "DENY"}}))
+        assert allowed is False
+
+    def test_no_list_policy_defaults_allow(self, temp_dir):
+        allowed, _ = self._run(self._orch(temp_dir), json.dumps({}))
+        assert allowed is True
+
+    def test_allowed_values_restricted_not_clearly_allowed(self, temp_dir):
+        allowed, _ = self._run(
+            self._orch(temp_dir),
+            json.dumps({"listPolicy": {"allowedValues": ["under:projects/x"]}}))
+        assert allowed is False
+
+    def test_read_failure_returns_none(self, temp_dir):
+        allowed, _ = self._run(self._orch(temp_dir), "", returncode=1)
+        assert allowed is None
+
+
+class TestNatGetSubnetCidr:
+    """レビュー指摘 [9]: _get_subnet_cidr のモード別挙動。"""
+    def _orch(self, temp_dir, dry_run, mock=False):
+        o = _nat_orchestrator(temp_dir, dry_run=dry_run, mock=mock)
+        return o
+
+    def test_dry_run_fallback_placeholder(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, dry_run=True)
+        with patch.object(o, "run_command", return_value=""):
+            assert o._get_subnet_cidr("n", "s", "asia-northeast1", "host-x", None) == "10.0.0.0/24"
+
+    def test_real_value_returned_stripped(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, dry_run=False)
+        with patch.object(o, "run_command", return_value="10.5.6.0/24\n"):
+            assert o._get_subnet_cidr("n", "s", "r", "host-x", None) == "10.5.6.0/24"
+
+    def test_real_empty_returns_none(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, dry_run=False)
+        with patch.object(o, "run_command", return_value=""):
+            assert o._get_subnet_cidr("n", "s", "r", "host-x", None) is None
+
+
+class TestValidateConfigNatMissingFields:
+    """レビュー指摘 [10]: network/region/zone それぞれ欠落で検出。"""
+    @pytest.mark.parametrize("missing", ["network", "subnet", "region", "zone"])
+    def test_missing_field_rejected(self, temp_dir, missing):
+        cfg = _full_config(temp_dir)
+        nat = {
+            "enabled": True, "network": "n", "subnet": "s",
+            "region": "r", "zone": "z", "private_ip_last_octet": 250,
+        }
+        nat[missing] = ""
+        cfg["steps"]["nat_gateway"] = nat
+        assert any(missing in e for e in validate_config(cfg))

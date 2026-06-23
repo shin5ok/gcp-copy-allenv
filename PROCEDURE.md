@@ -122,6 +122,22 @@
    - **SUSPENDED 目標**: `_try_dst_suspend` が `subprocess` を直接呼び、失敗しても `stats.failed` を増やさない（run 全体の exit code に影響させない）。失敗時は WARNING + 手動復旧コマンド (`gcloud compute instances suspend <name> --zone=<zone> --project=<dst>`) を案内するだけ。
    - **transient / 未対応 OS**: suspend 非対応構成（GPU/TPU 付き、Confidential VM、メモリ 208GB 超、CSEK 付きディスク、未設定の Debian 8/9/Windows）は WARNING のみで RUNNING のまま残る。
    - **並列**: pending リストを `_parallel_for_each` で `parallel_jobs` 並列実行。
+
+2.7. **NAT ゲートウェイ (Step 5.7 / `step_nat_gateway`)**: dst に Debian NAT GW を構築し、他 VM の default gateway を NAT 経由にする独立ステップ。`config.steps.nat_gateway.enabled` で有効化（新規インフラのため既定 `false`）。`gce_restore` の後・`data_sync` の前に走る（VPC/subnet と client VM が存在している必要があるため）。
+   - **VM**: `--image-family=debian-12` の GCE を `--can-ip-forward` 付きで作成。内部 IP は指定サブネットの CIDR から第4オクテット `private_ip_last_octet`（既定 250、`compute_nat_private_ip` で算出・250〜254 を強制）で静的予約（`_reserve_internal_ip` 流用）。public IP は ephemeral（既定）または予約済み static 名。
+   - **startup-script** (`_nat_startup_script`): `net.ipv4.ip_forward=1` + iptables `MASQUERADE`（egress NIC = default route の iface）+ `iptables-persistent` で永続化。`bind9` を caching/forwarding resolver として導入し、自分自身の resolver を 127.0.0.1 に向ける（`dns.forwarders` 既定 `169.254.169.254`）。
+   - **default gw リダイレクト**: tag 付き `0.0.0.0/0` ルート（`route_priority` 既定 800 < 既定 internet-gw 1000）を作成。`client_network_tag`（既定 `use-nat`）を持つ VM のみ NAT 経由になる。**NAT GW 自身には `nat_gateway_tag`（`nat-gateway`）だけを付け client tag を付けない**ことでルートが自身に適用されずループしない（NAT GW は自分の external IP + default-internet-gateway で egress）。next hop は NAT GW が host にあれば `--next-hop-instance`+zone、dst サービスプロジェクトにあれば（別 PJ の instance 名は host スコープのルートから解決できないため）予約済み内部 IP を `--next-hop-address` で指す。
+   - **auto_tag_clients**（既定 `true`）: 復元済み dst VM 全部（NAT GW を除く）に client tag を `instances add-tags` で自動付与し、即 NAT 経由にする。並列 worker は `sys.exit` せず `stats` に記録。
+   - **FW**: `create_firewall_rules: true` で 2 本を冪等作成。`<name>-allow-internal`（INGRESS、`--allow=all`、source=`firewall_source_ranges` 既定 RFC1918、target-tags=`nat-gateway`）で client→NAT の転送/DNS(53) を許可。`<name>-allow-egress`（EGRESS、priority 900、`--action=ALLOW --rules=all`、dest=0.0.0.0/0、target-tags=`nat-gateway`）で NAT GW の internet egress を保証（Step 4.5 が src の egress-deny を複製しても上書き）。戻り通信は GCP のステートフル FW が自動許可。
+   - **NAT 前提条件（org policy）と事前チェック**: NAT GW は IP forwarding（`--can-ip-forward`）と public IP が必須。org policy `constraints/compute.vmCanIpForward` / `constraints/compute.vmExternalIpAccess` が org/folder から継承されて deny だと `instances create` が `Constraint ... violated` で失敗する。これらは org スコープのため dst host SA（`orgpolicy.policyAdmin` を持たない）からは変更不可。**ツールは自動設定しない**。代わりに `check_nat_prerequisites()` が `make plan` / `make run` の冒頭（`check_service_accounts` の後）で両制約の effective policy を `gcloud resource-manager org-policies describe --effective`（Org Policy API 不要）で read-only 検証し、許可されていなければ**手動の許可コマンドを提示して fail-fast で停止**する（コマンドは実 project ID 直書きの `printf ... | gcloud org-policies set-policy` でそのままコピペ可能）。許可は org admin 権限で project スコープに 1 回設定する:
+     ```bash
+     PROJ=<dst host project id>
+     gcloud services enable orgpolicy.googleapis.com --project="$PROJ"
+     printf 'name: projects/'"$PROJ"'/policies/compute.vmCanIpForward\nspec:\n  rules:\n  - allowAll: true\n'   > /tmp/vmCanIpForward.yaml   && gcloud org-policies set-policy /tmp/vmCanIpForward.yaml
+     printf 'name: projects/'"$PROJ"'/policies/compute.vmExternalIpAccess\nspec:\n  rules:\n  - allowAll: true\n' > /tmp/vmExternalIpAccess.yaml && gcloud org-policies set-policy /tmp/vmExternalIpAccess.yaml
+     ```
+     必要権限: 実行者または dst SA に `roles/orgpolicy.policyViewer`（事前チェックの read 用）。設定には org admin（`roles/orgpolicy.policyAdmin`）。NAT 用の dst 書込権限（`compute.instances.create` / `routes.create` / `firewalls.create` / `addresses.create` / `instances.setTags`）は `check_service_accounts` の testIamPermissions でも検証される。
+   - **3 モード**: 全コマンド side=dst。dry_run は subnet describe がスキップされるため仮 CIDR `10.0.0.0/24` で計画表示。mock は `_simulate_command` がダミー CIDR を返し全コマンド成功扱い（事前チェックは mock ではスキップ）。冪等性は `_gcloud_exists`（instance/route/fw）と add-tags のマージ性で担保。
 3. **data_sync**:
    - GCS: リネーム後バケットへ `gcloud storage rsync` で同期
    - BigQuery: src の location を継承してデータセット作成 → コピー
