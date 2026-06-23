@@ -133,7 +133,7 @@ cp dst/config.yaml.template dst/config.yaml
 | `make bootstrap-dst-sa` | dst SA 作成 + ロール付与のみ実行（dry-run は `-plan` 付き） |
 | `make bootstrap-cross-project` | dst SA → src の読取権限のみ実行（dry-run は `-plan` 付き） |
 | `make bootstrap-shared-vpc` | Shared VPC 化のみ実行（dry-run は `-plan` 付き） |
-| `make plan` | 移行処理の **ドライラン**（実行計画の表示のみ。ORG 書き込みなし） |
+| `make plan` | 移行処理の **ドライラン**（dst / ORG への書き込みは無し）。ただし表示のみではなく、**SA 事前チェック（借用トークン発行＋ testIamPermissions の実 API 呼び出し）** と **Terraform エクスポート（`gcloud beta resource-config bulk-export` を実際に実行し `terraform/active/` を生成）** は本当に走る |
 | `make mock` | **Mock モード** でローカル試走（GCP 未接続でも動作） |
 | `make run` | 移行処理の **本番実行**（dst への書き込みを伴う） |
 | `make test` | 単体テスト (pytest) を実行 |
@@ -156,7 +156,7 @@ cp dst/config.yaml.template dst/config.yaml
 graph TD
     A[dst/config.yaml を準備] --> B[make projects-plan / projects]
     B --> B2[make bootstrap-plan / bootstrap]
-    B2 --> C[make plan: 計画をドライラン確認]
+    B2 --> C["make plan: ドライラン (dst/ORG 書き込み無し)<br/>※SA事前チェック・Terraformエクスポートは実API実行"]
     C --> D[make mock: ローカル試走で動作検証]
     D --> E[make run: 本番クローン実行]
     E --> F[logs/<timestamp>/ をレビュー]
@@ -177,15 +177,21 @@ make bootstrap         # 確認できたら --apply で実行
 
 ### Step 1: 実行計画のドライラン確認
 本番実行の前に、必ずドライランで実行計画を確認します。
-ORG への書き込みは発生しません（src 操作は read-only のみ）。
+**dst / ORG への書き込みは発生しません**（src 操作は read-only のみ）。
+
+> ⚠️ **`make plan` は「表示のみ」ではありません。** dst/ORG を変更しないという意味でのドライランですが、
+> 計画を立てるために以下は **実際に外部コマンド / API を実行** します（src は read-only の範囲）:
+> - **SA 事前チェック**: 借用 SA のアクセストークン発行（impersonation）と `testIamPermissions` を **実 API で**叩いて検証します（SA の*作成*はしません。作成は `make bootstrap`）。
+> - **Terraform エクスポート** (`bulk_export`): `gcloud beta resource-config bulk-export` を**実際に実行**し、ローカルに `terraform/active/` を生成します（src からの読み取りのみ。`make plan` は常に最新を取り直します）。
+
 ```bash
 make plan
 ```
 
 > 🔍 **ドライランで計画・検証される項目**
-> 1. **CAI 現状確認** (`cai_scan`): コピー元の有効なリソース一覧を探索。
-> 2. **GCE スナップショット検証** (`gce_snapshot`): 各 VM に期限内（既定 30 日）の有効なスナップショットがあるか確認。なければエラー。
-> 3. **Terraform コード生成** (`bulk_export`): Original リソースを HCL としてエクスポートし、プロジェクト ID 置換・GCS バケットのリネーム・同一プロジェクト内 network 参照の `self_link` 化・`boot_disk.source` 行の削除を実施。
+> 1. **CAI 現状確認** (`cai_scan`): コピー元の有効なリソース一覧を探索（実 API 読み取り）。
+> 2. **GCE スナップショット検証** (`gce_snapshot`): 各 VM に期限内（既定 30 日）の有効なスナップショットがあるか確認（実 API 読み取り）。なければエラー。
+> 3. **Terraform コード生成** (`bulk_export`): Original リソースを HCL として **実際にエクスポート**し、プロジェクト ID 置換・GCS バケットのリネーム・同一プロジェクト内 network 参照の `self_link` 化・`boot_disk.source` 行の削除を実施。
 > 4. **インフラ再現** (`terraform_apply`): `terraform plan -out=tfplan` を生成（本番時のみ apply）。
 > 5. **VM データ復元** (`gce_restore`): スナップショットから復元したディスクの差し替え計画。
 > 6. **データ移行** (`data_sync`): GCS バケット（リネーム後）・BigQuery（location 継承）の同期計画。
