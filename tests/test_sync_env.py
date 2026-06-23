@@ -10,6 +10,7 @@ from scripts.sync_env import (
     is_src_read_only,
     is_known_mock_command,
     validate_config,
+    validate_steps_config,
     diff_coverage,
     _ASSET_COVERAGE,
     fw_policy_rule_layer4,
@@ -145,17 +146,110 @@ class TestValidateConfig:
         errors = validate_config(cfg)
         assert any("dst" in e and "src" in e for e in errors)
 
-    def test_missing_impersonate_sa_rejected(self, temp_dir):
+    def test_missing_impersonate_sa_allowed(self, temp_dir):
+        # `*_impersonate_service_account` 未指定はエラーにしない（ローカル認証フォールバック）。
+        # 実際に src 書込権を持っていれば check_service_accounts が警告 + 続行確認する。
         cfg = _full_config(temp_dir)
         cfg["project_mapping"]["host_project"]["src_impersonate_service_account"] = ""
-        errors = validate_config(cfg)
-        assert any("src_impersonate_service_account" in e for e in errors)
+        cfg["project_mapping"]["host_project"]["dst_impersonate_service_account"] = ""
+        cfg["project_mapping"]["service_projects"][0]["src_impersonate_service_account"] = ""
+        cfg["project_mapping"]["service_projects"][0]["dst_impersonate_service_account"] = ""
+        assert validate_config(cfg) == []
 
     def test_empty_service_projects_rejected(self, temp_dir):
         cfg = _full_config(temp_dir)
         cfg["project_mapping"]["service_projects"] = []
         errors = validate_config(cfg)
         assert any("service_projects" in e for e in errors)
+
+
+# ============================================================
+# validate_steps_config: 有効ステップの設定不備を実行前に検出
+# ============================================================
+class TestValidateStepsConfig:
+    def test_empty_steps_ok(self):
+        assert validate_steps_config({"steps": {}}) == []
+
+    def test_disabled_vpc_sc_not_checked(self):
+        cfg = {"steps": {"vpc_sc": {"enabled": False}}}
+        assert validate_steps_config(cfg) == []
+
+    def test_vpc_sc_enabled_requires_all_fields(self):
+        cfg = {"steps": {"vpc_sc": {"enabled": True}}}
+        errors = validate_steps_config(cfg)
+        assert any("access_policy" in e for e in errors)
+        assert any("perimeter" in e for e in errors)
+        assert any("billing_project" in e for e in errors)
+
+    def test_vpc_sc_missing_only_billing(self):
+        cfg = {"steps": {"vpc_sc": {
+            "enabled": True, "access_policy": "1", "perimeter": "p",
+        }}}
+        errors = validate_steps_config(cfg)
+        assert any("billing_project" in e for e in errors)
+        assert not any("access_policy" in e for e in errors)
+
+    def test_vpc_sc_complete_ok(self):
+        cfg = {"steps": {"vpc_sc": {
+            "enabled": True, "access_policy": "1", "perimeter": "p",
+            "billing_project": "host-proj",
+        }}}
+        assert validate_steps_config(cfg) == []
+
+    def test_vpc_sc_whitespace_treated_as_empty(self):
+        cfg = {"steps": {"vpc_sc": {
+            "enabled": True, "access_policy": "  ", "perimeter": "p",
+            "billing_project": "host-proj",
+        }}}
+        assert any("access_policy" in e for e in validate_steps_config(cfg))
+
+    def test_rename_method_invalid_rejected(self):
+        cfg = {
+            "steps": {"bulk_export": {"enabled": True}},
+            "rename_rules": {"gcs": {"method": "sufix", "value": "x"}},
+        }
+        assert any("rename_rules.gcs.method" in e for e in validate_steps_config(cfg))
+
+    def test_rename_value_empty_with_suffix_rejected(self):
+        cfg = {
+            "steps": {"data_sync": {"enabled": True}},
+            "rename_rules": {"gcs": {"method": "suffix", "value": ""}},
+        }
+        assert any("rename_rules.gcs.value" in e for e in validate_steps_config(cfg))
+
+    def test_rename_auto_value_ok(self):
+        cfg = {
+            "steps": {"bulk_export": {"enabled": True}},
+            "rename_rules": {"gcs": {"method": "prefix", "value": "auto"}},
+        }
+        assert validate_steps_config(cfg) == []
+
+    def test_rename_custom_no_value_ok(self):
+        # custom は overrides で個別指定するため value 空でも可
+        cfg = {
+            "steps": {"bulk_export": {"enabled": True}},
+            "rename_rules": {"gcs": {"method": "custom"}},
+        }
+        assert validate_steps_config(cfg) == []
+
+    def test_rename_not_checked_when_steps_disabled(self):
+        cfg = {
+            "steps": {"bulk_export": {"enabled": False}, "data_sync": {"enabled": False}},
+            "rename_rules": {"gcs": {"method": "bogus"}},
+        }
+        assert validate_steps_config(cfg) == []
+
+    def test_snapshot_bad_max_age_rejected(self):
+        cfg = {"steps": {"gce_snapshot": {"enabled": True, "max_age_days": "thirty"}}}
+        assert any("max_age_days" in e for e in validate_steps_config(cfg))
+
+    def test_snapshot_zero_max_age_rejected(self):
+        cfg = {"steps": {"gce_snapshot": {"enabled": True, "max_age_days": 0}}}
+        assert any("max_age_days" in e for e in validate_steps_config(cfg))
+
+    def test_snapshot_default_max_age_ok(self):
+        cfg = {"steps": {"gce_snapshot": {"enabled": True}}}
+        assert validate_steps_config(cfg) == []
 
 
 # ============================================================
@@ -345,6 +439,147 @@ class TestCheckServiceAccounts:
             not any("bigquery" in p for p in perms) for _proj, perms in checker.calls
         )
 
+    # ---- ローカル認証フォールバック（*_impersonate_service_account 未指定） ----
+    def _setup_adc(self, temp_dir, **steps):
+        """src/dst の SA を空にして ADC フォールバック経路を強制する setup。"""
+        cfg = _full_config(temp_dir)
+        for entry in (
+            cfg["project_mapping"]["host_project"],
+            *cfg["project_mapping"]["service_projects"],
+        ):
+            entry["src_impersonate_service_account"] = ""
+            entry["dst_impersonate_service_account"] = ""
+        cfg["steps"] = steps
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def _fake_local_runner(self, *, token="ya29.fake-local", account="dev@example.com",
+                           token_rc=0):
+        """`_sa_preflight_run` の差し替え（ローカル認証用）。"""
+        calls = []
+
+        def runner(cmd):
+            calls.append(cmd)
+            if "print-access-token" in cmd:
+                return (token_rc, "" if token_rc else token, "" if token_rc else "denied")
+            if "config get-value account" in cmd:
+                return (0, account, "")
+            return (0, "", "")
+
+        runner.calls = calls
+        return runner
+
+    def test_adc_no_dangerous_perms_passes(self, temp_dir, monkeypatch):
+        # ADC が src に書込相当の権限を持たない → 警告ゼロ、続行確認も呼ばれない
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner()
+        o._test_iam_permissions = self._fake_perms(granted=set())
+        o.check_service_accounts()  # 例外なし
+
+    def test_adc_with_dangerous_perms_aborts_non_tty(self, temp_dir, monkeypatch):
+        # ADC が src に書込権を持つ + 非対話 + AUTO_APPROVE 未指定 → 中断
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner()
+        o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        with pytest.raises(SystemExit) as ei:
+            o.check_service_accounts()
+        assert ei.value.code == 1
+
+    def test_adc_auto_approve_env_skips_prompt(self, temp_dir, monkeypatch):
+        # AUTO_APPROVE=1 が指定されていれば非対話でも続行
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner()
+        o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
+        monkeypatch.setenv("COPY_ALL_ENV_AUTO_APPROVE", "1")
+        o.check_service_accounts()  # 例外なし
+
+    def test_adc_interactive_yes_continues(self, temp_dir, monkeypatch):
+        # 対話セッションで "y" を返したら続行
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner()
+        o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+        o.check_service_accounts()  # 例外なし
+
+    def test_adc_interactive_no_aborts(self, temp_dir, monkeypatch):
+        # 対話セッションで "n" を返したら中断
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner()
+        o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+        with pytest.raises(SystemExit) as ei:
+            o.check_service_accounts()
+        assert ei.value.code == 1
+
+    def test_adc_token_unavailable_exits(self, temp_dir, monkeypatch):
+        # `gcloud auth print-access-token` が失敗したら fail-fast
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner(token_rc=1)
+        o._test_iam_permissions = self._fake_perms(granted=set())
+        with pytest.raises(SystemExit) as ei:
+            o.check_service_accounts()
+        assert ei.value.code == 1
+
+
+# ============================================================
+# _confirm_adc_src_write_or_abort: 続行確認の単体動作
+# ============================================================
+class TestConfirmAdcSrcWriteOrAbort:
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_empty_warnings_is_noop(self, temp_dir, monkeypatch):
+        o = self._orch(temp_dir)
+        # input が呼ばれないこと（呼ばれたら raise で失敗させる）
+        monkeypatch.setattr("builtins.input", lambda _p="": (_ for _ in ()).throw(AssertionError("called")))
+        o._confirm_adc_src_write_or_abort([])  # 例外なし
+
+    def test_non_tty_without_env_exits(self, temp_dir, monkeypatch):
+        o = self._orch(temp_dir)
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        with pytest.raises(SystemExit) as ei:
+            o._confirm_adc_src_write_or_abort(["src 'p': compute.instances.create"])
+        assert ei.value.code == 1
+
+    def test_env_overrides_non_tty(self, temp_dir, monkeypatch):
+        o = self._orch(temp_dir)
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
+        monkeypatch.setenv("COPY_ALL_ENV_AUTO_APPROVE", "1")
+        o._confirm_adc_src_write_or_abort(["src 'p': storage.buckets.delete"])  # 例外なし
+
+    def test_interactive_yes(self, temp_dir, monkeypatch):
+        o = self._orch(temp_dir)
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr("builtins.input", lambda _p="": "yes")
+        o._confirm_adc_src_write_or_abort(["src 'p': compute.disks.delete"])  # 例外なし
+
+    def test_interactive_blank_aborts(self, temp_dir, monkeypatch):
+        # Enter キーのみ（空文字）はデフォルト N 扱いで中断
+        o = self._orch(temp_dir)
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr("builtins.input", lambda _p="": "")
+        with pytest.raises(SystemExit) as ei:
+            o._confirm_adc_src_write_or_abort(["src 'p': iam.serviceAccountKeys.create"])
+        assert ei.value.code == 1
+
 
 # ============================================================
 # run_command: ORG 保護
@@ -358,13 +593,36 @@ class TestRunCommandSafety:
         o.load_config()
         return o
 
-    def test_src_without_sa_exits(self, temp_dir):
+    def test_src_without_sa_allows_read_only(self, temp_dir, monkeypatch):
+        # 旧仕様: src + impersonate_sa=None は即停止。
+        # 新仕様: ローカル認証フォールバックを許容するので、read-only コマンドは通る。
+        o = self._setup(temp_dir)
+
+        class _FakeProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(
+            "scripts.sync_env.subprocess.run",
+            lambda *a, **kw: _FakeProc(),
+        )
+        # SystemExit が出ないこと（is_src_read_only ガードは通過、impersonate 無くても可）
+        ret = o.run_command(
+            "gcloud compute instances list --project=src-host",
+            side="src", logger=o.org_logger,
+            impersonate_sa=None,
+        )
+        assert ret == ""
+
+    def test_src_without_sa_still_blocks_write_verb(self, temp_dir):
+        # impersonate の有無に関わらず書込動詞は拒否される（is_src_read_only ガード）
         o = self._setup(temp_dir)
         with pytest.raises(SystemExit):
             o.run_command(
-                "gcloud compute instances list --project=src-host",
+                "gcloud compute instances create vm --project=src-host",
                 side="src", logger=o.org_logger,
-                impersonate_sa=None,  # ← これが原因で停止すべき
+                impersonate_sa=None,
             )
 
     def test_src_write_verb_exits(self, temp_dir):
@@ -413,6 +671,153 @@ class TestRunCommandSafety:
                 side="dst", logger=o.dst_logger,
                 impersonate_sa="owner@dst-host.iam.gserviceaccount.com",
             )
+
+
+# ============================================================
+# step_vpc_sc: 既存ペリメタへ dst プロジェクトを追加（org は触らない）
+# ============================================================
+class TestVpcSc:
+    def _setup(self, temp_dir, dry_run=False, **vpc_sc):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = dry_run
+        # billing_project は必須・明示指定（自動補完しない）。テストの既定として明示。
+        vpc_sc.setdefault("billing_project", "dst-host")
+        cfg["steps"] = {"vpc_sc": {"enabled": True, **vpc_sc}}
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def _capture(self, o):
+        calls = []
+        o.run_command = lambda cmd, **kw: calls.append((cmd, kw)) or ""
+        return calls
+
+    def test_mock_command_is_known(self):
+        assert is_known_mock_command(
+            "gcloud access-context-manager perimeters update p --policy=1 --add-resources=projects/9"
+        )
+        assert is_known_mock_command(
+            "gcloud access-context-manager perimeters describe p --policy=1"
+        )
+
+    def test_load_config_rejects_enabled_vpc_sc_missing_policy(self, temp_dir):
+        # enabled なのに access_policy 未設定 → load_config が実行前に fail-fast
+        with pytest.raises(SystemExit):
+            self._setup(temp_dir, access_policy="", perimeter="dst_perimeter")
+
+    def test_runtime_skip_defense_when_required_blanked(self, temp_dir):
+        # 検証を通った後に必須項目が消えても step は誤実行せず skip（多層防御）
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        o.config["steps"]["vpc_sc"]["billing_project"] = ""
+        o._get_project_number = lambda p, impersonate_sa=None: "1001"
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        assert [c for c, _ in calls if "perimeters update" in c] == []
+        assert o.stats.skipped >= 1
+
+    def test_adds_resolved_dst_numbers_not_src(self, temp_dir):
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        nums = {"dst-host": "1001", "dst-svc-1": "1002"}
+        o._get_project_number = lambda p, impersonate_sa=None: nums.get(p)
+        o._get_perimeter_resources = lambda *a, **k: set()
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        update = [c for c, _ in calls if "perimeters update" in c]
+        assert len(update) == 1
+        cmd = update[0]
+        assert "--policy=111" in cmd and "perimeters update dst_perimeter" in cmd
+        assert "projects/1001" in cmd and "projects/1002" in cmd
+        # resources は番号で渡す（src/dst のプロジェクト ID を resources に使わない）
+        assert "src-host" not in cmd and "projects/dst-host" not in cmd
+
+    def test_load_config_rejects_enabled_vpc_sc_missing_billing(self, temp_dir):
+        # billing_project は自動補完しない → 未設定なら load_config が実行前に fail-fast
+        with pytest.raises(SystemExit):
+            self._setup(
+                temp_dir, access_policy="111", perimeter="dst_perimeter",
+                billing_project="",
+            )
+
+    def test_billing_project_flows_to_commands(self, temp_dir):
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        o._get_project_number = lambda p, impersonate_sa=None: "1001"
+        seen = {}
+        o._get_perimeter_resources = (
+            lambda *a, **k: seen.update(args=a, kwargs=k) or set()
+        )
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        # describe 側へ明示 billing が渡る
+        assert seen["args"][-1] == "dst-host" or seen["kwargs"].get("billing") == "dst-host"
+        update = [c for c, _ in calls if "perimeters update" in c][0]
+        assert "--billing-project=dst-host" in update
+        # quota project の API 有効化が走る
+        assert any(
+            "services enable accesscontextmanager.googleapis.com" in c
+            and "--project=dst-host" in c
+            for c, _ in calls
+        )
+
+    def test_billing_project_override(self, temp_dir):
+        o = self._setup(
+            temp_dir, access_policy="111", perimeter="dst_perimeter",
+            billing_project="quota-proj",
+        )
+        o._get_project_number = lambda p, impersonate_sa=None: "1001"
+        o._get_perimeter_resources = lambda *a, **k: set()
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        update = [c for c, _ in calls if "perimeters update" in c][0]
+        assert "--billing-project=quota-proj" in update
+        assert any(
+            "services enable accesscontextmanager.googleapis.com" in c
+            and "--project=quota-proj" in c
+            for c, _ in calls
+        )
+
+    def test_only_missing_resources_added(self, temp_dir):
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        nums = {"dst-host": "1001", "dst-svc-1": "1002"}
+        o._get_project_number = lambda p, impersonate_sa=None: nums.get(p)
+        o._get_perimeter_resources = lambda *a, **k: {"projects/1001"}
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        cmd = [c for c, _ in calls if "perimeters update" in c][0]
+        assert "projects/1002" in cmd and "projects/1001" not in cmd
+
+    def test_noop_when_all_present(self, temp_dir):
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        nums = {"dst-host": "1001", "dst-svc-1": "1002"}
+        o._get_project_number = lambda p, impersonate_sa=None: nums.get(p)
+        o._get_perimeter_resources = lambda *a, **k: {"projects/1001", "projects/1002"}
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        assert [c for c, _ in calls if "perimeters update" in c] == []
+        assert o.stats.skipped >= 1
+
+    def test_exclude_host_project(self, temp_dir):
+        o = self._setup(
+            temp_dir, access_policy="111", perimeter="dst_perimeter",
+            include_host_project=False,
+        )
+        nums = {"dst-host": "1001", "dst-svc-1": "1002"}
+        o._get_project_number = lambda p, impersonate_sa=None: nums.get(p)
+        o._get_perimeter_resources = lambda *a, **k: set()
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        cmd = [c for c, _ in calls if "perimeters update" in c][0]
+        assert "projects/1002" in cmd and "projects/1001" not in cmd
+
+    def test_update_is_dst_side(self, temp_dir):
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        o._get_project_number = lambda p, impersonate_sa=None: "1001"
+        o._get_perimeter_resources = lambda *a, **k: set()
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        update = [(c, kw) for c, kw in calls if "perimeters update" in c]
+        assert update and update[0][1].get("side") == "dst"
 
 
 # ============================================================
@@ -918,10 +1323,12 @@ class TestGcloudRecreateCommand:
             "//compute.googleapis.com/projects/src-host/regions/asia-northeast1/subnetworks/subnet-x",
         )
         joined = " ".join(cmds)
-        assert "gcloud compute networks subnets describe subnet-x" in joined
+        assert "gcloud compute networks subnets create subnet-x" in joined
         assert "--region=asia-northeast1" in joined
-        assert "--project=src-host" in joined
         assert "--project=dst-host" in joined
+        # read 操作 (describe) と src 参照は載せない
+        assert "describe" not in joined
+        assert "--project=src-host" not in joined
 
     def test_bucket_command_uses_gs_prefix(self):
         cmds = gcloud_recreate_command(
@@ -929,9 +1336,10 @@ class TestGcloudRecreateCommand:
             "dst-host", "//storage.googleapis.com/my-bkt",
         )
         joined = " ".join(cmds)
-        assert "gs://my-bkt" in joined
+        assert "gcloud storage buckets create gs://" in joined
         assert "--location=us-central1" in joined
         assert "--project=dst-host" in joined
+        assert "describe" not in joined
 
     def test_service_account_extracts_account_id(self):
         cmds = gcloud_recreate_command(
@@ -942,16 +1350,21 @@ class TestGcloudRecreateCommand:
             "myacct@src-host.iam.gserviceaccount.com",
         )
         joined = " ".join(cmds)
-        # describe は email 全体、create は accountId のみ
-        assert "describe myacct@src-host.iam.gserviceaccount.com" in joined
-        assert "create myacct " in joined or "create myacct\t" in joined or "create myacct " in joined
+        # create は accountId（email の @ より前）のみを使う
+        assert "create myacct " in joined or "create myacct\t" in joined
+        # read 操作は載せない / src の email 全体も出さない
+        assert "describe" not in joined
+        assert "myacct@src-host.iam.gserviceaccount.com" not in joined
 
-    def test_unknown_type_falls_back_to_asset_describe(self):
+    def test_unknown_type_falls_back_to_comment(self):
         cmds = gcloud_recreate_command(
             "fake.googleapis.com/Unknown", "x", "global",
             "dst-host", "//fake.googleapis.com/projects/src-host/unknowns/x",
         )
-        assert any("gcloud asset describe" in c for c in cmds)
+        # read 操作は載せず、手動対応を促すコメントのみ返す
+        assert any(c.lstrip().startswith("#") for c in cmds)
+        assert any("自動補完対象外" in c for c in cmds)
+        assert all("describe" not in c for c in cmds)
 
 
 class TestAnalyzeCaiTfDiff:
@@ -974,14 +1387,18 @@ class TestAnalyzeCaiTfDiff:
         # subnet-svc1 と bucket は TF にあるので covered
         assert ("compute.googleapis.com/Subnetwork", "subnet-svc1") not in missing_names
         assert ("storage.googleapis.com/Bucket", "org-bucket-shared-data") not in missing_names
-        # 一方、subnet-svc-missing と nat-router (Router) は欠落
-        assert ("compute.googleapis.com/Subnetwork", "subnet-svc-missing") in missing_names
-        assert ("compute.googleapis.com/Router", "nat-router") in missing_names
-        # 未登録 type は unknown_types に集計
+        # subnet-svc-missing は gce_restore 担当、nat-router(Router) は None 指定 →
+        # 自動処理/対象外なので要手動対応 (missing) には載らない
+        assert ("compute.googleapis.com/Subnetwork", "subnet-svc-missing") not in missing_names
+        assert ("compute.googleapis.com/Router", "nat-router") not in missing_names
+        # 未登録 type (fake) は複製漏れの可能性 → 要手動対応として残る
+        assert ("fake.googleapis.com/Unknown", "x") in missing_names
+        # 未登録 type は unknown_types にも集計
         assert "fake.googleapis.com/Unknown" in report["unknown_types"]
-        # CAI 5 件 / 一致 2 件
+        # CAI 5 件 / 一致 2 件 / 自動処理・対象外 2 件 (subnet-missing, nat-router)
         assert report["cai_total"] == 5
         assert report["covered"] == 2
+        assert report["auto_handled"] == 2
 
     def test_missing_entries_have_recreate_commands(self, temp_dir):
         cai_path, tf_dir = self._setup(temp_dir)
@@ -1002,7 +1419,10 @@ class TestAnalyzeCaiTfDiff:
         md = format_diff_report([report])
         assert "CAI ↔ Terraform" in md
         assert "src-host" in md and "dst-host" in md
-        assert "subnet-svc-missing" in md
+        # 要手動対応 (未登録 type) のみ掲載
+        assert "fake.googleapis.com/Unknown" in md
+        # 自動処理/対象外 (gce_restore, None) は本文に列挙しない
+        assert "subnet-svc-missing" not in md
         assert "```bash" in md  # コマンドが fenced コードブロックで提示される
 
 
@@ -1033,16 +1453,47 @@ class TestEmitCaiTfDiff:
         _write(os.path.join(tf_dir, "google_compute_subnetwork.tf"), _TF_SAMPLE_SUBNET)
         _write(os.path.join(tf_dir, "google_storage_bucket.tf"), _TF_SAMPLE_BUCKET)
 
-        # DIFF.md は cwd 配下に書く設計 → cwd を temp_dir に切り替え
+        # 実体は logs/<timestamp>/DIFF.md、cwd の DIFF.md は symlink
+        # → cwd を temp_dir に切り替えて symlink を生成させる
         monkeypatch.chdir(temp_dir)
         o._emit_cai_tf_diff()
-        diff_path = os.path.join(temp_dir, "DIFF.md")
-        assert os.path.isfile(diff_path)
-        body = open(diff_path, encoding="utf-8").read()
-        assert "subnet-svc-missing" in body
-        assert "nat-router" in body
-        # 一致したリソースは載らない
-        assert "subnet-svc1\n" not in body or "subnet-svc1" in body  # short_name は missing 内のみ列挙
+        # 実体は self.run_dir 配下にある
+        real_path = os.path.join(o.run_dir, "DIFF.md")
+        assert os.path.isfile(real_path)
+        # cwd の DIFF.md は symlink で、最新の実体を指している
+        symlink_path = os.path.join(temp_dir, "DIFF.md")
+        assert os.path.islink(symlink_path)
+        assert os.path.realpath(symlink_path) == os.path.realpath(real_path)
+        body = open(symlink_path, encoding="utf-8").read()
+        # 要手動対応 (未登録 type) のみ掲載
+        assert "fake.googleapis.com/Unknown" in body
+        # 自動処理/対象外 (gce_restore, None 指定) は載らない
+        assert "subnet-svc-missing" not in body
+        assert "nat-router" not in body
+
+    def test_symlink_replaces_existing_regular_file(self, temp_dir, monkeypatch):
+        """cwd に既存の通常ファイル DIFF.md があっても上書きして symlink に張り替える。"""
+        o, _ = self._orch(temp_dir)
+        cai_dir = os.path.join(temp_dir, "cai_export")
+        os.makedirs(cai_dir)
+        _write(os.path.join(cai_dir, "cai_resources_src-host.txt"), _CAI_SAMPLE)
+        tf_dir = os.path.join(temp_dir, "tf", "raw", "src-host")
+        os.makedirs(tf_dir)
+        _write(os.path.join(tf_dir, "google_compute_subnetwork.tf"), _TF_SAMPLE_SUBNET)
+
+        # 事前に通常ファイルとして DIFF.md を置いておく（旧コミットの状態を再現）
+        monkeypatch.chdir(temp_dir)
+        legacy_diff = os.path.join(temp_dir, "DIFF.md")
+        _write(legacy_diff, "OLD CONTENT")
+        assert not os.path.islink(legacy_diff)
+
+        o._emit_cai_tf_diff()
+
+        # symlink に張り替わり、実体は run_dir 側
+        assert os.path.islink(legacy_diff)
+        assert os.path.realpath(legacy_diff) == os.path.realpath(
+            os.path.join(o.run_dir, "DIFF.md")
+        )
 
 
 class TestFwRuleScopeFlag:

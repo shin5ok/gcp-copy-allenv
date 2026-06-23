@@ -13,8 +13,12 @@ logs/
 cai_export/
 terraform/
 # dst/config.yaml
+# DIFF.md は logs/<timestamp>/DIFF.md への symlink（実体は logs/ 配下）
+/DIFF.md
 
 # Node (claude-code CLI 等の付随ツール)
 node_modules/
 package.json
 package-lock.json
+
+*~

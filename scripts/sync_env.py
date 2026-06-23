@@ -4,7 +4,10 @@
 設計の柱:
 - ORG プロジェクトに対する書き込みは絶対に行わない（コードレベルで強制）。
 - すべての外部コマンドは side="src" | "dst" | "local" タグ付きで実行され、
-  src 操作は impersonate_sa 必須かつ read-only パターンに限定される。
+  src 操作は read-only パターンに限定される（書き込み動詞は実行前に拒否）。
+- impersonate_sa は推奨だが必須ではない。未指定の場合はローカル認証
+  （gcloud のアクティブアカウント / ADC）にフォールバックする。src の書込権を
+  持っていれば事前チェックで警告 + 続行確認を求める。
 - ログは実行ごとに logs/<timestamp>/{org,dst}.log に分離、日本語で記録。
 """
 import argparse
@@ -83,6 +86,8 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud compute network-firewall-policies rules describe",
     "gcloud compute network-firewall-policies rules create",
     "gcloud compute network-firewall-policies associations create",
+    "gcloud access-context-manager perimeters describe",
+    "gcloud access-context-manager perimeters update",
     "gcloud services enable",
     "bq ls",
     "bq show",
@@ -141,6 +146,25 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
     "osconfig.googleapis.com/OSPolicyAssignment":       None,
     "osconfig.googleapis.com/OSPolicyAssignmentReport": None,
 }
+
+# 専用ステップが dst へリソースを複製するため、bulk-export 出力に無くても想定内
+# （手動対応不要）。DIFF.md からは除外し件数だけ集計する。
+_AUTO_HANDLED_STEPS = frozenset({"gce_restore", "network_firewall", "data_sync"})
+
+
+def _needs_manual_recreate(atype: str, coverage_step: Optional[str]) -> bool:
+    """DIFF.md に載せるべき（手動で dst 作成/調整が要る）欠落かを判定する。
+
+    - `_ASSET_COVERAGE` 未登録: 複製漏れの可能性 → 要手動。
+    - coverage_step is None（意図的対象外）: 不要。
+    - gce_restore / network_firewall / data_sync: 専用ステップが複製 → 不要。
+    - terraform_apply / bulk_export 等: bulk-export が出すはずが欠落 → 要手動。
+    """
+    if atype not in _ASSET_COVERAGE:
+        return True
+    if coverage_step is None:
+        return False
+    return coverage_step not in _AUTO_HANDLED_STEPS
 
 
 def fw_rule_scope_flag(scope_flag: str) -> str:
@@ -469,12 +493,10 @@ def gcloud_recreate_command(
 ) -> List[str]:
     """欠落リソースを dst に作るための gcloud コマンド列を生成する。
 
-    生成方針:
-      1) src 側で詳細を取得する `gcloud ... describe` を先に提示（read-only、安全）
-      2) dst 側で作成する `gcloud ... create` を提示（必要な値は <PLACEHOLDER> で示す）
-
-    完全な引数を網羅できない種別は generic な `gcloud asset` ベースの調査コマンドだけを
-    返す。短い 1 ライナを目指し、ログでも DIFF.md でも読みやすい長さに留める。
+    生成方針: dst 側で作成する `gcloud ... create` 系のみを返す（必要な値は
+    <PLACEHOLDER> で示す）。src 側の describe / list など read 操作は DIFF.md の
+    ノイズになるため含めない。完全な引数を網羅できない種別は再作成方針を示す
+    コメント行のみを返す。短い 1 ライナを目指す。
     """
     src_proj = ""
     m = re.match(r"^//[^/]+/projects/([^/]+)/", full_name)
@@ -483,91 +505,76 @@ def gcloud_recreate_command(
 
     loc = location or "global"
     sn = short_name or "<RESOURCE_NAME>"
-    src_flag = f"--project={src_proj}" if src_proj else ""
     dst_flag = f"--project={dst_project}" if dst_project else "--project=<DST_PROJECT>"
 
     if asset_type == "compute.googleapis.com/Network":
         return [
-            f"gcloud compute networks describe {sn} {src_flag}",
             f"gcloud compute networks create {sn} {dst_flag} --subnet-mode=custom",
         ]
     if asset_type == "compute.googleapis.com/Subnetwork":
         return [
-            f"gcloud compute networks subnets describe {sn} --region={loc} {src_flag}",
             f"gcloud compute networks subnets create {sn} {dst_flag} "
             f"--region={loc} --network=<NETWORK> --range=<CIDR>",
         ]
     if asset_type == "compute.googleapis.com/Firewall":
         return [
-            f"gcloud compute firewall-rules describe {sn} {src_flag}",
             f"gcloud compute firewall-rules create {sn} {dst_flag} "
             f"--network=<NETWORK> --direction=<INGRESS|EGRESS> --action=<ALLOW|DENY> "
             f"--rules=<PROTO:PORT,...>",
         ]
     if asset_type == "compute.googleapis.com/FirewallPolicy":
         return [
-            f"gcloud compute network-firewall-policies describe {sn} --global {src_flag}",
             f"gcloud compute network-firewall-policies create {sn} --global {dst_flag} "
             f"--description=<DESC>",
         ]
     if asset_type == "compute.googleapis.com/Router":
         return [
-            f"gcloud compute routers describe {sn} --region={loc} {src_flag}",
             f"gcloud compute routers create {sn} {dst_flag} --region={loc} "
             f"--network=<NETWORK> --asn=<ASN>",
         ]
     if asset_type == "compute.googleapis.com/Route":
         return [
-            f"gcloud compute routes describe {sn} {src_flag}",
             f"gcloud compute routes create {sn} {dst_flag} "
             f"--network=<NETWORK> --destination-range=<CIDR> --next-hop-gateway=<GATEWAY>",
         ]
     if asset_type == "compute.googleapis.com/Address":
         region_flag = f"--region={loc}" if loc and loc != "global" else "--global"
         return [
-            f"gcloud compute addresses describe {sn} {region_flag} {src_flag}",
             f"gcloud compute addresses create {sn} {dst_flag} {region_flag}",
         ]
     if asset_type == "compute.googleapis.com/Instance":
         return [
-            f"gcloud compute instances describe {sn} --zone={loc} {src_flag}",
             f"gcloud compute instances create {sn} {dst_flag} "
             f"--zone={loc} --machine-type=<MACHINE_TYPE> "
             f"--source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore) が担当",
         ]
     if asset_type == "compute.googleapis.com/Disk":
         return [
-            f"gcloud compute disks describe {sn} --zone={loc} {src_flag}",
             f"gcloud compute disks create {sn} {dst_flag} "
             f"--zone={loc} --source-snapshot=<SNAPSHOT>  # 通常は Step 5 (gce_restore)",
         ]
     if asset_type == "compute.googleapis.com/Snapshot":
         return [
-            f"gcloud compute snapshots describe {sn} {src_flag}",
             f"# snapshot は src 側からの参照で復元する設計のため dst 作成は不要 "
             f"(Step 5 gce_restore が source-snapshot として直接使用)",
         ]
     if asset_type == "compute.googleapis.com/Image":
         return [
-            f"gcloud compute images describe {sn} {src_flag}",
             f"# image は使用しない方針（snapshot 由来）。必要なら "
             f"gcloud compute images create {sn} {dst_flag} --source-snapshot=<SNAPSHOT>",
         ]
     if asset_type == "compute.googleapis.com/ResourcePolicy":
         return [
-            f"gcloud compute resource-policies describe {sn} --region={loc} {src_flag}",
             f"gcloud compute resource-policies create snapshot-schedule {sn} {dst_flag} "
             f"--region={loc} --max-retention-days=<N> --daily-schedule --start-time=<HH:MM>",
         ]
     if asset_type == "storage.googleapis.com/Bucket":
         return [
-            f"gcloud storage buckets describe gs://{sn}",
             f"gcloud storage buckets create gs://<DST_BUCKET_NAME> "
             f"{dst_flag} --location={loc}  # 名前は rename_rules.gcs を適用すること",
         ]
     if asset_type == "bigquery.googleapis.com/Dataset":
         return [
-            f"bq --project_id={src_proj or '<SRC>'} show --format=prettyjson {sn}",
             f"bq --project_id={dst_project or '<DST>'} mk --location={loc} "
             f"--dataset {dst_project or '<DST>'}:{sn}",
         ]
@@ -578,8 +585,6 @@ def gcloud_recreate_command(
         if mm:
             ds, sn = mm.group(1), mm.group(2)
         return [
-            f"bq --project_id={src_proj or '<SRC>'} show --format=prettyjson "
-            f"{src_proj or '<SRC>'}:{ds or '<DATASET>'}.{sn}",
             f"bq --project_id={dst_project or '<DST>'} cp "
             f"{src_proj or '<SRC>'}:{ds or '<DATASET>'}.{sn} "
             f"{dst_project or '<DST>'}:{ds or '<DATASET>'}.{sn}  "
@@ -588,7 +593,6 @@ def gcloud_recreate_command(
     if asset_type == "iam.googleapis.com/Role":
         # full name: //iam.googleapis.com/projects/<p>/roles/<roleId>
         return [
-            f"gcloud iam roles describe {sn} {src_flag}",
             f"gcloud iam roles create {sn} {dst_flag} "
             f"--title=<TITLE> --permissions=<PERM1,PERM2,...> --stage=GA",
         ]
@@ -597,31 +601,26 @@ def gcloud_recreate_command(
         # short_name は email 全体。create の引数は accountId（email の @ より前）。
         account_id = sn.split("@", 1)[0] if "@" in sn else sn
         return [
-            f"gcloud iam service-accounts describe {sn} {src_flag}",
             f"gcloud iam service-accounts create {account_id} {dst_flag} "
             f"--display-name=<DISPLAY_NAME>",
         ]
     if asset_type == "serviceusage.googleapis.com/Service":
         return [
-            f"gcloud services list --enabled {src_flag} --filter='config.name:{sn}'",
             f"gcloud services enable {sn} {dst_flag}",
         ]
     if asset_type == "logging.googleapis.com/LogSink":
         return [
-            f"gcloud logging sinks describe {sn} {src_flag}",
             f"gcloud logging sinks create {sn} <DESTINATION> {dst_flag} "
             f"--log-filter='<FILTER>'",
         ]
     if asset_type == "logging.googleapis.com/LogBucket":
         # full name: //logging.googleapis.com/projects/<p>/locations/<loc>/buckets/<id>
         return [
-            f"gcloud logging buckets describe {sn} --location={loc} {src_flag}",
             f"gcloud logging buckets create {sn} --location={loc} {dst_flag} "
             f"--retention-days=<N>",
         ]
     # generic fallback
     return [
-        f"gcloud asset describe '{full_name}' {src_flag}",
         f"# {asset_type} は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。",
     ]
 
@@ -660,6 +659,7 @@ def analyze_cai_tf_diff(
     missing: List[Dict[str, Any]] = []
     unknown_types: set = set()
     covered = 0
+    auto_handled = 0  # 専用ステップ複製 / 意図的対象外（DIFF.md からは除外、件数のみ）
 
     for r in cai_records:
         atype = r.get("asset_type", "")
@@ -693,6 +693,12 @@ def analyze_cai_tf_diff(
         else:
             reason = f"別ステップ '{coverage_step}' が複製を担当（bulk-export 出力対象外）"
 
+        # DIFF.md は手動で dst 作成/調整が要るものだけに絞る（量が多すぎるため）。
+        # 専用ステップ複製分・意図的対象外は件数だけ数えてスキップする。
+        if not _needs_manual_recreate(atype, coverage_step):
+            auto_handled += 1
+            continue
+
         missing.append({
             "asset_type": atype,
             "short_name": short,
@@ -710,6 +716,7 @@ def analyze_cai_tf_diff(
         "cai_total": len(cai_records),
         "tf_total": sum(len(v) for v in tf_resources.values()),
         "covered": covered,
+        "auto_handled": auto_handled,
         "missing": missing,
         "unknown_types": sorted(unknown_types),
     }
@@ -724,12 +731,17 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
     lines.append("# CAI ↔ Terraform bulk-export 差分レポート")
     lines.append("")
     lines.append("Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、")
-    lines.append("`gcloud beta resource-config bulk-export` の出力に**含まれなかった**ものを")
+    lines.append("bulk-export / terraform で **自動再現されず、手動で dst 作成・調整が必要なもの** だけを")
     lines.append("プロジェクトごとに列挙し、dst 側に再現するための gcloud コマンドを併記します。")
+    lines.append("（read 操作の describe / list は省き、作成系コマンドのみ掲載）")
     lines.append("")
-    lines.append("- 「意図的に対象外」: `_ASSET_COVERAGE` で None 指定。実害なしとして除外可。")
-    lines.append("- 「別ステップが担当」: Step 4.5 / Step 5 / Step 6 等で複製。bulk-export 単体での欠落は想定通り。")
-    lines.append("- 「未登録」「bulk-export が出力しなかった」: 対応の検討が必要。")
+    lines.append("掲載対象（要手動対応）:")
+    lines.append("- 「未登録」: `_ASSET_COVERAGE` に無い assetType（複製漏れの可能性）。")
+    lines.append("- 「bulk-export が出力しなかった」: terraform_apply 担当のはずが TF 出力に無い。")
+    lines.append("")
+    lines.append("非掲載（自動処理 / 対象外。件数のみ集計）:")
+    lines.append("- 専用ステップ（Step 4.5 network_firewall / Step 5 gce_restore / Step 6 data_sync）が複製。")
+    lines.append("- `_ASSET_COVERAGE` で None 指定の意図的対象外（実害なし）。")
     lines.append("")
 
     grand_total = 0
@@ -742,7 +754,8 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
             f"- CAI 検出リソース: **{r['cai_total']}** 件"
             f" / TF 出力リソース: **{r['tf_total']}** 件"
             f" / 一致: **{r['covered']}** 件"
-            f" / 欠落候補: **{len(r['missing'])}** 件"
+            f" / 要手動対応: **{len(r['missing'])}** 件"
+            f" / 自動処理・対象外: **{r.get('auto_handled', 0)}** 件"
         )
         if r["unknown_types"]:
             lines.append(
@@ -750,7 +763,7 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
             )
         lines.append("")
         if not r["missing"]:
-            lines.append("欠落候補なし。 ✓")
+            lines.append("要手動対応の欠落なし。 ✓")
             lines.append("")
             continue
 
@@ -782,7 +795,7 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
                 lines.append("  ```")
                 lines.append("")
     lines.append("---")
-    lines.append(f"合計欠落候補: **{grand_total}** 件")
+    lines.append(f"合計（要手動対応）: **{grand_total}** 件")
     return "\n".join(lines) + "\n"
 
 
@@ -812,6 +825,40 @@ _DST_PERMS_BY_STEP = {
     "data_sync":        ("storage.objects.create",
                          "bigquery.datasets.create", "bigquery.tables.create"),
 }
+
+# `*_impersonate_service_account` 未指定でローカル認証 (gcloud のアクティブ
+# アカウント / ADC) を src に対して使う場合、現在の認証主体が src に書込相当の
+# 権限を持っていないかを事前確認するための代表セット。Editor / Owner / 各種
+# Admin ロール相当を検知できれば足りるため、リソース種を網羅する必要はない。
+# is_src_read_only(cmd) の最終防衛線は別途あるが、認証主体の最小権限化を促す
+# ための「実行前警告 + 続行確認」のトリガーとして使う。
+_SRC_DANGEROUS_PERMS = (
+    "resourcemanager.projects.setIamPolicy",
+    "resourcemanager.projects.update",
+    "resourcemanager.projects.delete",
+    "compute.instances.create",
+    "compute.instances.delete",
+    "compute.instances.setMetadata",
+    "compute.disks.create",
+    "compute.disks.delete",
+    "compute.networks.create",
+    "compute.networks.delete",
+    "compute.firewalls.create",
+    "compute.firewalls.delete",
+    "storage.buckets.create",
+    "storage.buckets.delete",
+    "storage.objects.create",
+    "storage.objects.delete",
+    "bigquery.datasets.create",
+    "bigquery.datasets.delete",
+    "bigquery.tables.create",
+    "bigquery.tables.delete",
+    "iam.serviceAccounts.create",
+    "iam.serviceAccounts.delete",
+    "iam.serviceAccountKeys.create",
+    "serviceusage.services.enable",
+    "serviceusage.services.disable",
+)
 
 
 def is_src_read_only(cmd: str) -> bool:
@@ -977,10 +1024,16 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
 
     検証項目:
     - project_mapping の存在
-    - host_project と service_projects の src/dst/impersonate_sa がすべて埋まっている
+    - host_project と service_projects の src/dst が埋まっている
     - src と dst が同一でないこと
     - dst 側 ID が src 側 ID と重複していないこと（ORG を上書きしないため）
     - dst が複数の src にマップされていないこと
+
+    `*_impersonate_service_account` の未指定は **ここではエラーにしない**。
+    未指定の場合は CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT を設定せずに
+    ローカル認証（gcloud にログイン中のユーザー / ADC）にフォールバックする。
+    その場合 src プロジェクトに対する書き込み相当の権限を持っていないかを
+    `check_service_accounts` が事前確認し、持っていれば実行前に警告 + 続行確認する。
     """
     errors: List[str] = []
     mapping = config.get('project_mapping')
@@ -1009,16 +1062,12 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
             continue
         src = ent.get('src')
         dst = ent.get('dst')
-        src_sa = ent.get('src_impersonate_service_account')
-        dst_sa = ent.get('dst_impersonate_service_account')
+        # impersonate SA は **必須にしない**。未指定はローカル認証フォールバックを許容し、
+        # check_service_accounts 側で src 書込権の有無を確認 + 警告 + 続行確認する。
         if not src:
             errors.append(f"{label}: src が未指定")
         if not dst:
             errors.append(f"{label}: dst が未指定")
-        if not src_sa:
-            errors.append(f"{label}: src_impersonate_service_account が未指定（ORG 保護のため必須）")
-        if not dst_sa:
-            errors.append(f"{label}: dst_impersonate_service_account が未指定")
         if src and dst and src == dst:
             errors.append(f"{label}: src と dst が同一です ({src})。ORG への書き込みになります")
         if src:
@@ -1034,6 +1083,78 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
             dst = ent.get('dst')
             if dst and dst in src_ids:
                 errors.append(f"{label}: dst '{dst}' は他の src と同じ ID です（ORG を上書きするリスク）")
+
+    return errors
+
+
+def validate_steps_config(config: Dict[str, Any]) -> List[str]:
+    """有効化された各ステップの必須設定を検証し、エラー文字列のリストを返す（空なら安全）。
+
+    `make plan` / `make run` の **実行前** に、「ステップが enabled なのに設定不足で
+    必ず失敗する / 黙ってスキップされてしまう」状態を fail-fast で検出する。
+    ORG 保護（`validate_config`）とは別レイヤの『設定不備』検査。
+
+    方針: 自動補完で曖昧に握り潰さず、不足は明示エラーにして実行前に気付かせる。
+    新しいステップの必須項目が増えたらここに追加する。
+    """
+    errors: List[str] = []
+    steps = config.get('steps', {})
+    if not isinstance(steps, dict):
+        return ["steps が定義されていません（辞書である必要があります）"]
+
+    def enabled(name: str) -> bool:
+        s = steps.get(name, {})
+        return isinstance(s, dict) and bool(s.get('enabled', False))
+
+    def sval(d: Dict[str, Any], key: str) -> str:
+        return str((d.get(key) if isinstance(d, dict) else '') or '').strip()
+
+    # --- Step 7: VPC Service Controls ---
+    # access-context-manager は --project を持たないため billing_project が無いと
+    # ローカル gcloud config の無関係プロジェクトを quota に使い SERVICE_DISABLED で失敗する。
+    # 自動補完しない方針なので、enabled なら 3 つとも明示必須。
+    if enabled('vpc_sc'):
+        vc = steps.get('vpc_sc', {})
+        for key, desc in (
+            ('access_policy', 'アクセスポリシー番号'),
+            ('perimeter', 'ペリメタ名'),
+            ('billing_project', 'quota/billing project（自動補完しない・明示必須）'),
+        ):
+            if not sval(vc, key):
+                errors.append(
+                    f"steps.vpc_sc.{key} が未設定です（{desc}）。"
+                    f"vpc_sc.enabled=true では必須。不要なら steps.vpc_sc.enabled=false に"
+                )
+
+    # --- rename_rules.gcs（bulk_export / data_sync が依存）---
+    # method 不正だと bucket リネームが no-op になり src と同名 → dst で名前衝突して
+    # terraform apply / rsync が失敗する。suffix/prefix で value 空も同様に同名衝突。
+    if enabled('bulk_export') or enabled('data_sync'):
+        gcs = (config.get('rename_rules', {}) or {}).get('gcs', {}) or {}
+        method = sval(gcs, 'method') or 'suffix'
+        valid_methods = ('suffix', 'prefix', 'custom')
+        if method not in valid_methods:
+            errors.append(
+                f"rename_rules.gcs.method='{method}' は不正です。"
+                f"{list(valid_methods)} のいずれかにしてください"
+            )
+        elif method in ('suffix', 'prefix') and not sval(gcs, 'value'):
+            errors.append(
+                f"rename_rules.gcs.value が空です（method={method}）。"
+                f"GCS バケット名が src と同名になり衝突します。固定文字列か 'auto' を指定"
+            )
+
+    # --- gce_snapshot.max_age_days ---
+    if enabled('gce_snapshot'):
+        mad = steps.get('gce_snapshot', {}).get('max_age_days', 30)
+        try:
+            ok = int(mad) > 0
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            errors.append(
+                f"steps.gce_snapshot.max_age_days='{mad}' は正の整数にしてください"
+            )
 
     return errors
 
@@ -1091,13 +1212,18 @@ class MigrationOrchestrator:
         if self.mock_override is not None:
             self.mock = self.mock_override
 
-        # 厳格バリデーション（ORG 保護の最終防衛線）
+        # 厳格バリデーション（ORG 保護の最終防衛線 + ステップ設定の不備チェック）。
+        # make plan / make run の実行前に、ORG 上書きリスクと「enabled なのに設定不足で
+        # 必ず失敗する」状態の両方を fail-fast で弾く。
         errors = validate_config(self.config)
-        if errors:
+        step_errors = validate_steps_config(self.config)
+        if errors or step_errors:
             print("=" * 60, file=sys.stderr)
-            print(" [ORG 保護] config.yaml にエラーがあります。処理を中止します:", file=sys.stderr)
+            print(" config.yaml にエラーがあります。処理を中止します:", file=sys.stderr)
             for e in errors:
-                print(f"  - {e}", file=sys.stderr)
+                print(f"  - [ORG 保護] {e}", file=sys.stderr)
+            for e in step_errors:
+                print(f"  - [設定不備] {e}", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
             sys.exit(1)
 
@@ -1133,7 +1259,7 @@ class MigrationOrchestrator:
         def enabled(name: str) -> bool:
             return steps.get(name, {}).get('enabled', False)
 
-        gcloud_steps = ("cai_scan", "gce_snapshot", "bulk_export", "gce_restore", "data_sync")
+        gcloud_steps = ("cai_scan", "gce_snapshot", "bulk_export", "gce_restore", "data_sync", "vpc_sc")
 
         # (ツール名, 必要か, 不足時の説明)
         required = [
@@ -1230,6 +1356,91 @@ class MigrationOrchestrator:
         except Exception:
             return None
 
+    # ----- ローカル認証（ADC / gcloud アクティブアカウント）ヘルパ -----
+    def _local_access_token(self) -> Optional[str]:
+        """ローカル認証のアクセストークンを取得する（impersonation なし）。
+
+        `subprocess` から `gcloud ...` を呼ぶ際、CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT を
+        設定しなければ gcloud は **アクティブな gcloud アカウント** を使う。`gcloud auth
+        print-access-token`（フラグ無し）はそのトークンを返すので、テスト権限の主体として
+        同等に扱える。失敗時は None。
+        """
+        rc, out, _err = self._sa_preflight_run("gcloud auth print-access-token")
+        if rc != 0 or not out.strip():
+            return None
+        return out.strip()
+
+    def _local_active_account(self) -> Optional[str]:
+        """`gcloud config get-value account` でアクティブアカウント名を返す。失敗時は None。"""
+        rc, out, _err = self._sa_preflight_run(
+            "gcloud config get-value account --quiet"
+        )
+        if rc != 0:
+            return None
+        acct = out.strip()
+        return acct or None
+
+    def _confirm_adc_src_write_or_abort(self, warnings: List[str]) -> None:
+        """ローカル認証が src に書込権を持つ場合の警告 + 続行確認。
+
+        - warnings が空ならノーオペ。
+        - 環境変数 `COPY_ALL_ENV_AUTO_APPROVE=1` で確認スキップ（CI/非対話用）。
+        - 非対話セッション（stdin が tty でない）かつ AUTO_APPROVE 未指定ならエラー終了。
+        - 対話なら `[y/N]` を求め、y/yes 以外は中断。
+        """
+        if not warnings:
+            return
+
+        print("=" * 60, file=sys.stderr)
+        print(
+            " [SA事前チェック] 警告: 借用 SA 未指定のためローカル認証（gcloud / ADC）を使用します。",
+            file=sys.stderr,
+        )
+        print(
+            " 現在の認証主体は以下の src プロジェクトに対して書き込み相当の権限を持っています:",
+            file=sys.stderr,
+        )
+        for w in warnings:
+            print(f"  - {w}", file=sys.stderr)
+        print(
+            " ORG 保護: コマンド単位の書込動詞拒否ガード (is_src_read_only) は継続適用しますが、",
+            file=sys.stderr,
+        )
+        print(
+            " 認証主体の最小権限化（読み取り専用 SA の借用）を推奨します。",
+            file=sys.stderr,
+        )
+        print(
+            " 続行をスキップしたい場合は config の `*_impersonate_service_account` を設定してください。",
+            file=sys.stderr,
+        )
+        print("=" * 60, file=sys.stderr)
+
+        if os.environ.get("COPY_ALL_ENV_AUTO_APPROVE") == "1":
+            self.org_logger.warning(
+                "  [SA事前チェック] COPY_ALL_ENV_AUTO_APPROVE=1 により続行確認を自動承認"
+            )
+            return
+
+        if not sys.stdin.isatty():
+            print(
+                " 非対話セッションのため自動続行できません。"
+                " 続行する場合は環境変数 COPY_ALL_ENV_AUTO_APPROVE=1 を設定してください。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        try:
+            ans = input("続行しますか？ [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans not in ("y", "yes"):
+            print(" [SA事前チェック] ユーザー操作により中断しました。", file=sys.stderr)
+            sys.exit(1)
+        self.org_logger.warning(
+            "  [SA事前チェック] ユーザー承認によりローカル認証で続行します"
+        )
+
     def check_service_accounts(self):
         """impersonate 対象 SA の実在性・借用可否・代表権限を実行前に検証する。
 
@@ -1241,6 +1452,12 @@ class MigrationOrchestrator:
           する代表権限（src=読取 / dst=書込）の有無を確認する。権限が不足していたら
           即停止。ただし API 未有効等で「検証できなかった」場合は警告に留め継続する
           （借用は確認済みのため）。検証する権限は代表値であり全リソース種を網羅しない。
+        - `*_impersonate_service_account` 未指定のプロジェクトはローカル認証
+          （gcloud のアクティブアカウント / ADC）にフォールバックする。その場合:
+          - src 側: 代表的な書込権 (_SRC_DANGEROUS_PERMS) を testIamPermissions で確認し、
+            granted があれば警告を集めて最後に続行確認する（is_src_read_only ガードは別途継続）。
+          - dst 側: 必要権限の不足を WARNING ログだけ出し、続行する（実書込は run 時に
+            分かる / 借用未指定のフォールバックなので fail-fast にはしない）。
         """
         if self.mock:
             self.org_logger.info("  [SA事前チェック] Mock モードのため SA 検証をスキップ")
@@ -1258,16 +1475,25 @@ class MigrationOrchestrator:
                     perms.update(plist)
             return perms
 
-        # 検証対象: (SA, project, side, 必要権限集合) を構築。
-        targets = []
+        # 検証対象を 2 系統に分割: 借用 SA 検証用 と ローカル認証フォールバック用。
+        impersonate_targets: List[Tuple[str, str, str, set]] = []
+        adc_src_projects: List[str] = []
+        adc_dst_projects: List[str] = []
         src_perms = required_perms(_SRC_PERMS_BY_STEP, _SRC_BASELINE_PERMS)
         dst_perms = required_perms(_DST_PERMS_BY_STEP, _DST_BASELINE_PERMS)
         for src_proj, dst_proj, src_sa, dst_sa in self._iter_project_pairs():
-            targets.append((src_sa, src_proj, "src", src_perms))
-            targets.append((dst_sa, dst_proj, "dst", dst_perms))
+            if src_sa:
+                impersonate_targets.append((src_sa, src_proj, "src", src_perms))
+            else:
+                adc_src_projects.append(src_proj)
+            if dst_sa:
+                impersonate_targets.append((dst_sa, dst_proj, "dst", dst_perms))
+            else:
+                adc_dst_projects.append(dst_proj)
 
         errors: List[str] = []
         checked_sas = set()
+        adc_src_warnings: List[str] = []
         sa_lock = threading.Lock()
 
         def check_one(item):
@@ -1309,7 +1535,63 @@ class MigrationOrchestrator:
             with sa_lock:
                 checked_sas.add(sa)
 
-        self._parallel_for_each(targets, check_one, "sa-preflight")
+        self._parallel_for_each(impersonate_targets, check_one, "sa-preflight")
+
+        # --- ローカル認証フォールバック: src 書込権 + dst 必要権限の事前確認 ---
+        adc_token: Optional[str] = None
+        adc_account: Optional[str] = None
+        if adc_src_projects or adc_dst_projects:
+            adc_token = self._local_access_token()
+            adc_account = self._local_active_account()
+            label_account = adc_account or "(active account 不明)"
+            self.org_logger.warning(
+                f"  [SA事前チェック] 借用 SA 未指定のためローカル認証を使用します"
+                f"（認証主体={label_account}）。"
+                f" 対象: src={len(adc_src_projects)} / dst={len(adc_dst_projects)}"
+            )
+            if not adc_token:
+                errors.append(
+                    "借用 SA 未指定でローカル認証を試みましたが、"
+                    "`gcloud auth print-access-token` でトークンを取得できませんでした。"
+                    " `gcloud auth login` を実行するか、"
+                    " `*_impersonate_service_account` を設定してください。"
+                )
+            else:
+                # src 側: 代表的な書込権を持っていれば警告対象に追加
+                for proj in sorted(set(adc_src_projects)):
+                    granted = self._test_iam_permissions(
+                        adc_token, proj, set(_SRC_DANGEROUS_PERMS)
+                    )
+                    if granted is None:
+                        self.org_logger.info(
+                            f"  [SA事前チェック] src '{proj}' のローカル認証権限を"
+                            f"検証できませんでした（cloudresourcemanager API 未有効等の可能性）。"
+                            f" 書込権チェックをスキップして継続します。"
+                        )
+                        continue
+                    if granted:
+                        adc_src_warnings.append(
+                            f"src '{proj}' (認証主体={label_account}): "
+                            f"{', '.join(sorted(granted))}"
+                        )
+                # dst 側: 必要権限が不足していても WARNING に留める（fail-fast しない）
+                for proj in sorted(set(adc_dst_projects)):
+                    granted = self._test_iam_permissions(adc_token, proj, set(dst_perms))
+                    if granted is None:
+                        self.org_logger.info(
+                            f"  [SA事前チェック] dst '{proj}' のローカル認証権限を"
+                            f"検証できませんでした（API 未有効等の可能性）。継続します。"
+                        )
+                        continue
+                    missing = sorted(set(dst_perms) - granted)
+                    if missing:
+                        shown = ", ".join(missing[:8])
+                        more = " ..." if len(missing) > 8 else ""
+                        self.org_logger.warning(
+                            f"  [SA事前チェック] dst '{proj}' でローカル認証主体に"
+                            f"不足権限の可能性: {shown}{more}"
+                            f"（認証主体={label_account}）"
+                        )
 
         if errors:
             has_dst_impersonate_failure = any(
@@ -1328,9 +1610,18 @@ class MigrationOrchestrator:
                 print("=" * 60, file=sys.stderr)
             sys.exit(1)
 
+        # ローカル認証 src 書込権の警告 + 続行確認（warnings 空ならノーオペ）
+        self._confirm_adc_src_write_or_abort(adc_src_warnings)
+
+        adc_summary = ""
+        if adc_src_projects or adc_dst_projects:
+            adc_summary = (
+                f" / ローカル認証フォールバック src={len(adc_src_projects)} "
+                f"dst={len(adc_dst_projects)}"
+            )
         self.org_logger.info(
-            f"  [SA事前チェック] OK: {len(checked_sas)} 個の SA で借用と代表権限を確認"
-            f"（検証は代表的な権限のみ）"
+            f"  [SA事前チェック] OK: 借用 SA {len(checked_sas)} 個を検証"
+            f"{adc_summary}（検証は代表的な権限のみ）"
         )
 
     # ----- 安全に外部コマンドを実行 -----
@@ -1351,7 +1642,9 @@ class MigrationOrchestrator:
 
         Args:
             side: "src" (ORG = read-only 必須) / "dst" (コピー先) / "local" (terraform 等)
-            impersonate_sa: 借用 SA。side="src" では必須。
+            impersonate_sa: 借用 SA。未指定の場合はローカル認証（gcloud のアクティブ
+                            アカウント / ADC）にフォールバックする。side="src" でも未指定可。
+                            ただし src の書込権を持っていれば事前チェック側で警告 + 続行確認する。
             retries: 失敗時の追加リトライ回数（config-connector 等のフレーキー対策）。
                      リトライ中の失敗は失敗カウントに含めない。
             expect_not_found_ok: True の場合、stdout/stderr に "Not found" を含む失敗は
@@ -1365,13 +1658,9 @@ class MigrationOrchestrator:
             logger.error(f"{tag}[ORG 保護] 無効な side='{side}' です")
             sys.exit(1)
 
+        # src 側はコマンド文字列レベルで書き込み動詞を必ず拒否する（最終防衛線）。
+        # impersonate_sa の有無に関わらず、ここで弾く。
         if side == "src":
-            if not impersonate_sa:
-                logger.error(
-                    f"{tag}[ORG 保護] src 操作には impersonate_sa が必須です。"
-                    f" コマンド: {cmd}"
-                )
-                sys.exit(1)
             if not is_src_read_only(cmd):
                 logger.error(
                     f"{tag}[ORG 保護] src 操作で書き込み動詞が検出されたため拒否しました。"
@@ -1639,8 +1928,9 @@ resource "google_storage_bucket" "mock_bucket" {{
         self.org_logger.info("=" * 60)
         self.org_logger.info(" copy-all-env  移行オーケストレータ  開始")
         self.org_logger.info("=" * 60)
-        self.org_logger.info("【ORG 保護】src 操作は read-only に強制、impersonate_sa 必須、")
-        self.org_logger.info("           書き込み動詞は実行前に拒否されます。")
+        self.org_logger.info("【ORG 保護】src 操作は read-only に強制、書き込み動詞は実行前に拒否されます。")
+        self.org_logger.info("           impersonate_sa は推奨（未指定はローカル認証フォールバック、")
+        self.org_logger.info("           src 書込権ありなら事前確認）。")
         self.org_logger.info(f"  dry_run = {self.dry_run}")
         self.org_logger.info(f"  mock    = {self.mock}")
         self.org_logger.info(f"  verbose = {self.verbose}")
@@ -1666,6 +1956,11 @@ resource "google_storage_bucket" "mock_bucket" {{
                 self.step_gce_restore()
             if steps.get('data_sync', {}).get('enabled', False):
                 self.step_data_sync()
+            # VPC SC は最後。先に dst をペリメタへ封じ込めると後続の
+            # terraform/gce/gcs/bq 操作が境界で弾かれる恐れがあるため、
+            # 全移行が終わってから既存ペリメタへ dst プロジェクトを追加する。
+            if steps.get('vpc_sc', {}).get('enabled', False):
+                self.step_vpc_sc()
             # 最後に CAI vs bulk-export tf 差分レポートを出力。
             # cai_scan も bulk_export も dry_run 中（src 側 read-only）に
             # 実コマンドが走るため、`make plan` 直後の DIFF.md 生成に使える。
@@ -1682,7 +1977,9 @@ resource "google_storage_bucket" "mock_bucket" {{
 
         各 src プロジェクトについて:
             1. cai_export/cai_resources_<src>.txt を analyze_cai_tf_diff() に渡し、
-            2. 欠落リソース + 推奨 gcloud コマンドを log と DIFF.md（リポジトリ直下）に出力。
+            2. 欠落リソース + 推奨 gcloud コマンドを log と DIFF.md に出力。
+        DIFF.md の実体は `logs/<timestamp>/DIFF.md`（org.log / dst.log と同居）に書き、
+        リポジトリ直下 (cwd) の `DIFF.md` は常に最新実行を指す symlink として張り替える。
         log は org_logger（INFO） を経由するため stdout にも自動で流れる。
         """
         log_stage_header(self.org_logger, 99, "CAI ↔ TF 差分レポート", 0)
@@ -1715,7 +2012,8 @@ resource "google_storage_bucket" "mock_bucket" {{
             self.org_logger.info(
                 f"  {src_proj}: CAI {report['cai_total']} 件 / "
                 f"TF {report['tf_total']} 件 / 一致 {report['covered']} 件 / "
-                f"欠落 {len(report['missing'])} 件"
+                f"要手動 {len(report['missing'])} 件 / "
+                f"自動・対象外 {report.get('auto_handled', 0)} 件"
             )
 
         if not reports:
@@ -1727,15 +2025,35 @@ resource "google_storage_bucket" "mock_bucket" {{
         for line in text.splitlines():
             self.org_logger.info(line)
 
-        # DIFF.md をリポジトリ直下に出力（実行 cwd 基準）。
-        # ファイル書き込みは dry_run でも実行する（src への書き込みは発生しない）。
-        diff_path = os.path.abspath("DIFF.md")
+        # 実体は logs/<timestamp>/DIFF.md に出力し、cwd の DIFF.md は symlink で
+        # 最新実行に張り替える。ファイル書き込みは dry_run でも実行する
+        # （src への書き込みは発生しない）。
+        diff_in_run = os.path.abspath(os.path.join(self.run_dir, "DIFF.md"))
+        diff_symlink = os.path.abspath("DIFF.md")
         try:
-            with open(diff_path, "w", encoding="utf-8") as f:
+            with open(diff_in_run, "w", encoding="utf-8") as f:
                 f.write(text)
-            self.org_logger.info(f"  ✓ 差分レポートを書き出しました: {diff_path}")
+            self.org_logger.info(f"  ✓ 差分レポートを書き出しました: {diff_in_run}")
         except OSError as e:
             self.org_logger.error(f"  DIFF.md の書き出しに失敗: {e}")
+            return
+
+        # cwd の DIFF.md を最新の実体への相対シンボリックリンクに張り替える。
+        # リポジトリを別パスに移しても壊れないよう、target は相対パスにする。
+        try:
+            if os.path.islink(diff_symlink) or os.path.exists(diff_symlink):
+                os.remove(diff_symlink)
+            rel_target = os.path.relpath(
+                diff_in_run, start=os.path.dirname(diff_symlink)
+            )
+            os.symlink(rel_target, diff_symlink)
+            self.org_logger.info(
+                f"  ✓ {diff_symlink} を最新版にリンク: → {rel_target}"
+            )
+        except OSError as e:
+            self.org_logger.warning(
+                f"  DIFF.md の symlink 更新に失敗（実体は {diff_in_run} に保存済み）: {e}"
+            )
 
     def _print_summary(self):
         elapsed = time.time() - self.start_t
@@ -4104,6 +4422,151 @@ resource "google_storage_bucket" "mock_bucket" {{
             explanation=f"service project {svc_proj} に静的内部IP {ip_addr} を予約 (共有 VPC subnet={subnet_uri})",
             impersonate_sa=svc_sa, allow_fail=True,
         )
+
+    def step_vpc_sc(self):
+        """Step 7: dst で作成したプロジェクトを既存の VPC Service Controls ペリメタに追加。
+
+        org は触らない: アクセスポリシーやペリメタ自体の作成/削除は一切行わず、
+        config.steps.vpc_sc で指定された **既存ペリメタ** に dst プロジェクトを
+        `--add-resources` で追記するだけ（冪等）。
+
+        ペリメタのメンバーはプロジェクト番号 (projects/<number>) で管理されるため、
+        各 dst プロジェクト ID を describe して番号へ解決する（read-only / local 認証）。
+        """
+        cfg = self.config.get('steps', {}).get('vpc_sc', {})
+        policy = str(cfg.get('access_policy', '') or '').strip()
+        perimeter = str(cfg.get('perimeter', '') or '').strip()
+        include_host = cfg.get('include_host_project', True)
+        impersonate = (cfg.get('impersonate_service_account') or '').strip() or None
+
+        mapping = self.config.get('project_mapping', {})
+        dst_projects: List[str] = []
+        host = mapping.get('host_project', {})
+        if include_host and host.get('dst'):
+            dst_projects.append(host['dst'])
+        for svc in mapping.get('service_projects', []):
+            if svc.get('dst'):
+                dst_projects.append(svc['dst'])
+
+        # quota/billing project は明示必須（フォールバックしない）。
+        # access-context-manager は --project を持たないため、未指定だと gcloud が
+        # ローカル config の core/project（移行と無関係なプロジェクト）を quota に使い、
+        # そこで API 無効 → SERVICE_DISABLED で失敗する。誤ったプロジェクトを自動推測
+        # して間違ったペリメタ操作をしないよう、未設定なら設定不足としてスキップする。
+        billing = str(cfg.get('billing_project', '') or '').strip()
+        billing_flag = f" --billing-project={billing}"
+
+        log_stage_header(
+            self.dst_logger, 7,
+            "VPC SC ペリメタへ dst プロジェクトを追加", len(dst_projects),
+        )
+
+        if not policy or not perimeter or not billing:
+            self.dst_logger.warning(
+                "  steps.vpc_sc.access_policy / perimeter / billing_project の"
+                "いずれかが未設定のためスキップ（billing_project は自動補完しない）"
+            )
+            self.stats.incr("skipped")
+            return
+        if not dst_projects:
+            self.dst_logger.warning("  追加対象の dst プロジェクトがありません。スキップ")
+            self.stats.incr("skipped")
+            return
+
+        # dst プロジェクト ID → projects/<番号> を解決（read-only / local 認証）。
+        # mock では describe が使えないためプレースホルダ番号で代用する。
+        resources: List[str] = []
+        for dst in dst_projects:
+            num = self._get_project_number(dst)
+            if not num and self.mock:
+                num = f"000{abs(hash(dst)) % 10**9}"
+            if not num:
+                self.dst_logger.warning(
+                    f"  {dst} のプロジェクト番号を取得できずスキップ"
+                    f"（projects describe 権限 / projectNumber を確認）"
+                )
+                self.stats.incr("skipped")
+                continue
+            resources.append(f"projects/{num}")
+
+        if not resources:
+            self.dst_logger.warning("  解決できた dst プロジェクト番号がありません。スキップ")
+            self.stats.incr("skipped")
+            return
+
+        # quota project で accesscontextmanager API を有効化（冪等）。これをしないと
+        # describe/update が quota project の API 無効で SERVICE_DISABLED になる。
+        self.run_command(
+            f"gcloud services enable accesscontextmanager.googleapis.com "
+            f"--project={billing}",
+            side="dst", logger=self.dst_logger,
+            desc=f"VPC SC quota project API 有効化 {billing}",
+            explanation=(
+                f"{billing} で accesscontextmanager API を有効化"
+                f"（access-context-manager の quota/billing project 用）"
+            ),
+            impersonate_sa=impersonate, allow_fail=True,
+        )
+
+        # 既存メンバーを取得し差分のみ追加（冪等・ログを綺麗に）。
+        # dry_run では describe も実行されないため existing=None → 計画として全件を表示。
+        existing = self._get_perimeter_resources(policy, perimeter, impersonate, billing)
+        if existing is None:
+            to_add = list(resources)
+        else:
+            to_add = [r for r in resources if r not in existing]
+
+        if not to_add:
+            self.dst_logger.info(
+                f"  すべての dst プロジェクト ({len(resources)} 件) は既にペリメタ "
+                f"{perimeter} 内です。スキップ"
+            )
+            self.stats.incr("skipped")
+            return
+
+        self.run_command(
+            f"gcloud access-context-manager perimeters update {perimeter} "
+            f"--policy={policy}{billing_flag} --add-resources={','.join(to_add)} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"VPC SC ペリメタ更新 {perimeter}",
+            explanation=(
+                f"既存ペリメタ {perimeter} に dst プロジェクト {len(to_add)} 件を追加"
+                f"（org / access policy 自体は変更しない）"
+            ),
+            impersonate_sa=impersonate, allow_fail=True,
+        )
+        self.dst_logger.info("  ✓ Step 7 完了")
+
+    def _get_perimeter_resources(
+        self, policy: str, perimeter: str, impersonate: Optional[str],
+        billing: str,
+    ) -> Optional[set]:
+        """ペリメタの現在の resources (projects/<番号>) を集合で返す（read-only）。
+
+        取得不能（dry_run でスキップ / describe 失敗 / mock）なら None。
+        None は呼び出し側で「差分不明 → 全件を計画として追加」と解釈する。
+
+        access-context-manager は org/policy スコープのコマンドで `--project` を持たない。
+        billing（quota project）は必須。呼び出し側が明示指定済みの前提でフラグを必ず付ける。
+        付けないと gcloud がローカル config の core/project（無関係な dst 外プロジェクト）を
+        quota に使い SERVICE_DISABLED で落ちる。
+        """
+        billing_flag = f" --billing-project={billing}"
+        out = self.run_command(
+            f"gcloud access-context-manager perimeters describe {perimeter} "
+            f"--policy={policy}{billing_flag} --format='value(status.resources)' --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"VPC SC ペリメタ参照 {perimeter}",
+            impersonate_sa=impersonate, allow_fail=True,
+            expect_not_found_ok=True,
+        )
+        if not out:
+            return None
+        # value(...) の繰り返しフィールドは ';' 区切り。projects/<num> 以外は弾く
+        # （mock の "Success" など）。
+        items = {tok.strip() for tok in re.split(r'[;\n,]', out) if tok.strip()}
+        resources = {it for it in items if it.startswith('projects/')}
+        return resources or None
 
     def _replicate_host_networks(self):
         """src host の custom VPC ネットワークとサブネットを dst host に複製する（冪等）。
