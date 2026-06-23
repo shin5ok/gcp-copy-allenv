@@ -10,6 +10,7 @@ from scripts.sync_env import (
     is_src_read_only,
     is_known_mock_command,
     validate_config,
+    validate_steps_config,
     diff_coverage,
     _ASSET_COVERAGE,
     fw_policy_rule_layer4,
@@ -156,6 +157,95 @@ class TestValidateConfig:
         cfg["project_mapping"]["service_projects"] = []
         errors = validate_config(cfg)
         assert any("service_projects" in e for e in errors)
+
+
+# ============================================================
+# validate_steps_config: 有効ステップの設定不備を実行前に検出
+# ============================================================
+class TestValidateStepsConfig:
+    def test_empty_steps_ok(self):
+        assert validate_steps_config({"steps": {}}) == []
+
+    def test_disabled_vpc_sc_not_checked(self):
+        cfg = {"steps": {"vpc_sc": {"enabled": False}}}
+        assert validate_steps_config(cfg) == []
+
+    def test_vpc_sc_enabled_requires_all_fields(self):
+        cfg = {"steps": {"vpc_sc": {"enabled": True}}}
+        errors = validate_steps_config(cfg)
+        assert any("access_policy" in e for e in errors)
+        assert any("perimeter" in e for e in errors)
+        assert any("billing_project" in e for e in errors)
+
+    def test_vpc_sc_missing_only_billing(self):
+        cfg = {"steps": {"vpc_sc": {
+            "enabled": True, "access_policy": "1", "perimeter": "p",
+        }}}
+        errors = validate_steps_config(cfg)
+        assert any("billing_project" in e for e in errors)
+        assert not any("access_policy" in e for e in errors)
+
+    def test_vpc_sc_complete_ok(self):
+        cfg = {"steps": {"vpc_sc": {
+            "enabled": True, "access_policy": "1", "perimeter": "p",
+            "billing_project": "host-proj",
+        }}}
+        assert validate_steps_config(cfg) == []
+
+    def test_vpc_sc_whitespace_treated_as_empty(self):
+        cfg = {"steps": {"vpc_sc": {
+            "enabled": True, "access_policy": "  ", "perimeter": "p",
+            "billing_project": "host-proj",
+        }}}
+        assert any("access_policy" in e for e in validate_steps_config(cfg))
+
+    def test_rename_method_invalid_rejected(self):
+        cfg = {
+            "steps": {"bulk_export": {"enabled": True}},
+            "rename_rules": {"gcs": {"method": "sufix", "value": "x"}},
+        }
+        assert any("rename_rules.gcs.method" in e for e in validate_steps_config(cfg))
+
+    def test_rename_value_empty_with_suffix_rejected(self):
+        cfg = {
+            "steps": {"data_sync": {"enabled": True}},
+            "rename_rules": {"gcs": {"method": "suffix", "value": ""}},
+        }
+        assert any("rename_rules.gcs.value" in e for e in validate_steps_config(cfg))
+
+    def test_rename_auto_value_ok(self):
+        cfg = {
+            "steps": {"bulk_export": {"enabled": True}},
+            "rename_rules": {"gcs": {"method": "prefix", "value": "auto"}},
+        }
+        assert validate_steps_config(cfg) == []
+
+    def test_rename_custom_no_value_ok(self):
+        # custom は overrides で個別指定するため value 空でも可
+        cfg = {
+            "steps": {"bulk_export": {"enabled": True}},
+            "rename_rules": {"gcs": {"method": "custom"}},
+        }
+        assert validate_steps_config(cfg) == []
+
+    def test_rename_not_checked_when_steps_disabled(self):
+        cfg = {
+            "steps": {"bulk_export": {"enabled": False}, "data_sync": {"enabled": False}},
+            "rename_rules": {"gcs": {"method": "bogus"}},
+        }
+        assert validate_steps_config(cfg) == []
+
+    def test_snapshot_bad_max_age_rejected(self):
+        cfg = {"steps": {"gce_snapshot": {"enabled": True, "max_age_days": "thirty"}}}
+        assert any("max_age_days" in e for e in validate_steps_config(cfg))
+
+    def test_snapshot_zero_max_age_rejected(self):
+        cfg = {"steps": {"gce_snapshot": {"enabled": True, "max_age_days": 0}}}
+        assert any("max_age_days" in e for e in validate_steps_config(cfg))
+
+    def test_snapshot_default_max_age_ok(self):
+        cfg = {"steps": {"gce_snapshot": {"enabled": True}}}
+        assert validate_steps_config(cfg) == []
 
 
 # ============================================================

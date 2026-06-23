@@ -1038,6 +1038,78 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
     return errors
 
 
+def validate_steps_config(config: Dict[str, Any]) -> List[str]:
+    """有効化された各ステップの必須設定を検証し、エラー文字列のリストを返す（空なら安全）。
+
+    `make plan` / `make run` の **実行前** に、「ステップが enabled なのに設定不足で
+    必ず失敗する / 黙ってスキップされてしまう」状態を fail-fast で検出する。
+    ORG 保護（`validate_config`）とは別レイヤの『設定不備』検査。
+
+    方針: 自動補完で曖昧に握り潰さず、不足は明示エラーにして実行前に気付かせる。
+    新しいステップの必須項目が増えたらここに追加する。
+    """
+    errors: List[str] = []
+    steps = config.get('steps', {})
+    if not isinstance(steps, dict):
+        return ["steps が定義されていません（辞書である必要があります）"]
+
+    def enabled(name: str) -> bool:
+        s = steps.get(name, {})
+        return isinstance(s, dict) and bool(s.get('enabled', False))
+
+    def sval(d: Dict[str, Any], key: str) -> str:
+        return str((d.get(key) if isinstance(d, dict) else '') or '').strip()
+
+    # --- Step 7: VPC Service Controls ---
+    # access-context-manager は --project を持たないため billing_project が無いと
+    # ローカル gcloud config の無関係プロジェクトを quota に使い SERVICE_DISABLED で失敗する。
+    # 自動補完しない方針なので、enabled なら 3 つとも明示必須。
+    if enabled('vpc_sc'):
+        vc = steps.get('vpc_sc', {})
+        for key, desc in (
+            ('access_policy', 'アクセスポリシー番号'),
+            ('perimeter', 'ペリメタ名'),
+            ('billing_project', 'quota/billing project（自動補完しない・明示必須）'),
+        ):
+            if not sval(vc, key):
+                errors.append(
+                    f"steps.vpc_sc.{key} が未設定です（{desc}）。"
+                    f"vpc_sc.enabled=true では必須。不要なら steps.vpc_sc.enabled=false に"
+                )
+
+    # --- rename_rules.gcs（bulk_export / data_sync が依存）---
+    # method 不正だと bucket リネームが no-op になり src と同名 → dst で名前衝突して
+    # terraform apply / rsync が失敗する。suffix/prefix で value 空も同様に同名衝突。
+    if enabled('bulk_export') or enabled('data_sync'):
+        gcs = (config.get('rename_rules', {}) or {}).get('gcs', {}) or {}
+        method = sval(gcs, 'method') or 'suffix'
+        valid_methods = ('suffix', 'prefix', 'custom')
+        if method not in valid_methods:
+            errors.append(
+                f"rename_rules.gcs.method='{method}' は不正です。"
+                f"{list(valid_methods)} のいずれかにしてください"
+            )
+        elif method in ('suffix', 'prefix') and not sval(gcs, 'value'):
+            errors.append(
+                f"rename_rules.gcs.value が空です（method={method}）。"
+                f"GCS バケット名が src と同名になり衝突します。固定文字列か 'auto' を指定"
+            )
+
+    # --- gce_snapshot.max_age_days ---
+    if enabled('gce_snapshot'):
+        mad = steps.get('gce_snapshot', {}).get('max_age_days', 30)
+        try:
+            ok = int(mad) > 0
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            errors.append(
+                f"steps.gce_snapshot.max_age_days='{mad}' は正の整数にしてください"
+            )
+
+    return errors
+
+
 # ---------------------------------------------------------------------------
 # オーケストレータ本体
 # ---------------------------------------------------------------------------
@@ -1091,13 +1163,18 @@ class MigrationOrchestrator:
         if self.mock_override is not None:
             self.mock = self.mock_override
 
-        # 厳格バリデーション（ORG 保護の最終防衛線）
+        # 厳格バリデーション（ORG 保護の最終防衛線 + ステップ設定の不備チェック）。
+        # make plan / make run の実行前に、ORG 上書きリスクと「enabled なのに設定不足で
+        # 必ず失敗する」状態の両方を fail-fast で弾く。
         errors = validate_config(self.config)
-        if errors:
+        step_errors = validate_steps_config(self.config)
+        if errors or step_errors:
             print("=" * 60, file=sys.stderr)
-            print(" [ORG 保護] config.yaml にエラーがあります。処理を中止します:", file=sys.stderr)
+            print(" config.yaml にエラーがあります。処理を中止します:", file=sys.stderr)
             for e in errors:
-                print(f"  - {e}", file=sys.stderr)
+                print(f"  - [ORG 保護] {e}", file=sys.stderr)
+            for e in step_errors:
+                print(f"  - [設定不備] {e}", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
             sys.exit(1)
 
