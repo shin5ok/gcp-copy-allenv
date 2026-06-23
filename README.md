@@ -28,7 +28,13 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
   ```
 - **`gcloud` / `bq`**（GCP CLI）
 
-> ✅ **前提チェック（fail-fast）**: `make plan` / `make run` は開始時に、有効化された
+> ✅ **config.yaml 検証（fail-fast）**: `make plan` / `make run` / `make mock` は開始時に `config.yaml` を検証します。
+> ① **ORG 保護**（src/dst マッピングの欠落・src=dst・ID 衝突 等）に加え、② **有効ステップの設定不備**を実行前に検出します。
+> 例: `vpc_sc.enabled=true` なのに `billing_project`（quota project・**必須**） / `access_policy` / `perimeter` が空、
+> `rename_rules.gcs.method` が `suffix|prefix|custom` 以外、`gce_snapshot.max_age_days` が非正の値、など。
+> 「このまま走らせると必ず失敗 / 黙ってスキップ」になる設定を `[設定不備]` として全件列挙し、**dst へ一切書き込まず即停止**します。
+>
+> ✅ **前提チェック（fail-fast）**: 続けて、有効化された
 > ステップが必要とする CLI（`gcloud` / `terraform` / `bq` / `config-connector`）の存在を確認します。
 > 不足しているとステップ途中で `not found` になる前に**即停止**します（Mock モードはスキップ）。
 >
@@ -110,10 +116,15 @@ cp dst/config.yaml.template dst/config.yaml
   （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に
   永続化され、`make plan` / `make run` / `skip_on_run` 間で同じ値が再利用されます
   （別名で作り直す場合はこのファイルを削除）。
-- **`steps`**: 各ステップ (1〜6) の有効/無効と個別設定（スナップショット期限など）。
+- **`steps`**: 各ステップ (1〜7) の有効/無効と個別設定（スナップショット期限など）。
   `bulk_export.skip_on_run: true` にすると本番実行 (`make run`) では export/customize を
   スキップし、`make plan` で生成済みの `terraform/active/` を再利用して高速化します
   （`make plan` 自体は常に最新を取り直します）。
+  - **`vpc_sc`** (Step 7): 既存の VPC Service Controls ペリメタへ dst プロジェクトを追加。
+    `access_policy` / `perimeter` に加え **`billing_project` が必須**（access-context-manager は
+    `--project` を持たず、未指定だとローカル `gcloud config` の無関係なプロジェクトを quota に
+    使い `SERVICE_DISABLED` で失敗するため）。安全のため自動補完せず、未設定ならこのステップは
+    スキップします。dst ORG 内で API を有効化できるプロジェクト（通常は dst ホスト）を明示してください。
 - **`global`**: `dry_run` / `verbose_logging` / `parallel_jobs` / `log_dir` / `org_log_file` / `dst_log_file`。
 - **`bootstrap`**: コピー先プロジェクトを新規作成する場合の組織 ID / フォルダ ID（任意） / 請求先アカウント。
 
@@ -189,6 +200,7 @@ make plan
 > 4. **インフラ再現** (`terraform_apply`): `terraform plan -out=tfplan` を生成（本番時のみ apply）。
 > 5. **VM データ復元** (`gce_restore`): スナップショットから復元したディスクの差し替え計画。
 > 6. **データ移行** (`data_sync`): GCS バケット（リネーム後）・BigQuery（location 継承）の同期計画。
+> 7. **VPC SC ペリメタ追加** (`vpc_sc`): 既存ペリメタへ dst プロジェクト（番号）を追記する計画。`billing_project` 未設定ならスキップ（後述）。
 
 ### Step 2: Mock モードでのローカル試走（任意）
 実際の GCP 環境や有効な SA がなくても、`make run` 全体のフローをエラーなく試走できます。
@@ -210,6 +222,7 @@ make run
 > 3. 復元したブートディスクを VM に差し替えて起動（OS 状態・データごと完全復元）。
 > 4. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
 > 5. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
+> 6. 全移行の最後に、dst プロジェクトを既存の VPC Service Controls ペリメタへ追加（`vpc_sc.billing_project` が必須。未設定ならスキップ）。
 
 > ♻️ **Terraform 適用の冪等性**（再実行しても 409/404 で落ちないための仕組み）
 > - dst プロジェクトが前回と変わった場合、stale な `terraform.tfstate` を破棄して import からやり直します（`active/<src>/.dst_project` マーカーで判定）。

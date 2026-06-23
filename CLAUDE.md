@@ -108,6 +108,21 @@ make vmware-all # VMware → GCE フル処理
   - 追加の防御として `_sync_classic_firewall_rules` 冒頭で参照される dst network を一括 pre-flight チェックし、`_sync_fw_policy_associations` でも assoc 単位で existence チェックして、未存在なら skip + WARNING に倒す（cryptic な API エラー量産を防ぐ）。
   - Shared VPC ホスト化・サービスプロジェクト関連付け・networkUser 付与は別途 `bootstrap_shared_vpc.sh` の担当。VPC 自体は作らない点に注意。
 
+### VPC Service Controls の quota project（Step 7）
+
+- `gcloud access-context-manager perimeters describe/update` は **org/policy スコープのコマンドで `--project` を持たない**。quota/billing project を明示しないと gcloud が **ローカル `gcloud config` の `core/project`（移行と無関係なプロジェクト）** を quota に使い、そのプロジェクトで API 無効のまま `accesscontextmanager.googleapis.com ... SERVICE_DISABLED` / `(y/N)?` プロンプトで失敗する（regression）。
+- 対策: `steps.vpc_sc.billing_project`（**必須・明示指定。自動補完/フォールバックしない**）を `--billing-project=` で両コマンドに付与し、`step_vpc_sc` 冒頭でその project に `accesscontextmanager` API を有効化（冪等 / allow_fail）してから describe/update する。`_get_perimeter_resources(..., billing)` 経由。
+- **誤ったプロジェクトを自動推測しない**のが安全方針: `billing_project` は明示必須（host dst や先頭 dst へ勝手にフォールバックしない）。`vpc_sc.enabled=true` で `access_policy` / `perimeter` / `billing_project` のいずれかが空なら、`validate_steps_config()` が **`make plan`/`make run`/`make mock` 開始時に fail-fast でエラー**（`load_config` で `exit 1`）。`step_vpc_sc` 側の未設定 skip は多層防御として残してある。同種の「無関係 default を掴むと事故になる」設定は明示必須にし、`validate_steps_config()` に検査を足す。
+
+### config.yaml の実行前検証（fail-fast）
+
+- 設定不備で `make run` の終盤や途中で失敗 / 黙ってスキップするのを防ぐため、`load_config` が **`validate_config()`（ORG 保護）** と **`validate_steps_config()`（有効ステップの設定不備）** の両方を実行し、`[ORG 保護]` / `[設定不備]` を全件列挙して `exit 1`。
+- `validate_steps_config()` は純粋関数（config dict → エラー文字列 list）。`enabled` なステップだけ検査する（無効ステップの未設定は無視）。現在: `vpc_sc`（3 項目必須）/ `rename_rules.gcs`（method 列挙・suffix/prefix の value 空）/ `gce_snapshot.max_age_days`（正の整数）。
+- **新ステップに必須設定を足したらここに検査を追加する**。自動補完で握り潰さず、未設定は明示エラーにして実行前に気付かせる方針。
+- `make mock` でも走る（mock 用の不完全 config を許容しない）。テストは純粋関数を直接叩く（`TestValidateStepsConfig`）。
+- describe には `--quiet` を付けて API 無効時の対話プロンプトでハングしないようにする。
+- 同種の「`--project` を取らない org/policy スコープ gcloud コマンド」（org policies, access policies 等）は同様に quota project を明示すること。
+
 ## Git コミット
 
 - コミットメッセージに Claude の名前や署名を付けないこと

@@ -13,7 +13,7 @@
 - `dst/config.yaml` を `dst/config.yaml.template` から複製
   - `project_mapping`: src/dst プロジェクト ID、`host_project` + `service_projects`、`src_impersonate_service_account` / `dst_impersonate_service_account` を定義
   - `rename_rules.gcs.value`: 固定文字列 or `"auto"`（日付ベース suffix `-dst-MMDDHHMM` を `terraform/.gcs_rename_value` に永続化）
-  - `steps`: 1〜6 の有効/無効、`gce_snapshot` の期限（既定 30 日）、`bulk_export.skip_on_run` 等
+  - `steps`: 1〜7 の有効/無効、`gce_snapshot` の期限（既定 30 日）、`bulk_export.skip_on_run`、`vpc_sc.billing_project`（**必須・明示指定**）等
   - `bootstrap`: 組織 ID / フォルダ ID / 請求先アカウント
 - 実行ユーザーは `gcloud auth login` 済み、`roles/iam.serviceAccountTokenCreator` を保有
 - **src 側 SA**: `scripts/bootstrap_src_sa.sh --apply` で各 src プロジェクトに read-only SA を作成
@@ -63,7 +63,14 @@
 **目的**: 本番実行 (`make run`) の前に「何を作る/変更するか」を全部見える化する。書き込みは一切しない。`DIFF.md` を眺めて意図通りか確認するためのステップ。
 
 ### 事前チェック（fail-fast）
-**役割**: 権限・CLI 不足で途中失敗するのを防ぐ。全件列挙して即停止。
+**役割**: 権限・CLI・**設定不備**で途中失敗するのを防ぐ。全件列挙して即停止。
+- **config.yaml 検証** (`load_config` 内、`make plan` / `make run` / `make mock` 共通):
+  - `validate_config()` … ORG 保護: src/dst マッピングの欠落・src=dst・dst が src ID と衝突 等。
+  - `validate_steps_config()` … **有効ステップの設定不備**を実行前に検出（自動補完で握り潰さず明示エラー）:
+    - `vpc_sc.enabled=true` なのに `access_policy` / `perimeter` / `billing_project` のいずれかが空（`billing_project` は quota project。未設定だと `SERVICE_DISABLED` で必ず失敗するため必須）。
+    - `bulk_export` / `data_sync` 有効時に `rename_rules.gcs.method` が `suffix|prefix|custom` 以外、または `suffix|prefix` で `value` 空（src と同名バケットになり衝突）。
+    - `gce_snapshot` 有効時に `max_age_days` が正の整数でない。
+  - 不備は `[設定不備] ...` として全件列挙し `exit 1`（dst へ一切書き込まずに停止）。
 - 有効ステップに必要な CLI を検査: `gcloud` / `terraform` / `bq` / `config-connector`
 - 借用 SA 検証:
   - `gcloud auth print-access-token` で SA 実在 + tokenCreator 権限を確認
@@ -134,6 +141,10 @@
 5. `bulk_export.skip_on_run: true` の場合は export/customize をスキップし `terraform/active/` を再利用（再実行高速化）
    - 判定は `terraform/active/<src>/.dst_project` マーカーが現 config の dst と一致するかで行う。一致すれば export と customize を**完全スキップ**、不一致でも `terraform/raw/` が残っていれば customize のみ再実行（bulk-export 自体は省略）。
    - マーカーは `customize_hcl` 末尾と Step 4 の `_reset_stale_state_if_needed` の両方が書く（plan/run・skip_on_run 間で整合）。dry_run では `customize_hcl` が `.tf` を実書き出ししないためマーカーも更新しない（plan で書き出すと .tf と marker が乖離するため）。
+6. **VPC Service Controls (Step 7)**: 全データ移行の **最後** に、dst プロジェクト（番号）を既存ペリメタへ `--add-resources` で追記する（org / access policy 自体は触らない・冪等）。先に封じ込めると後続操作が境界で弾かれるため最後に実行する。
+   - **`steps.vpc_sc.billing_project` は必須・明示指定**。`gcloud access-context-manager perimeters describe/update` は org/policy スコープで `--project` を持たないため、quota project を明示しないとローカル `gcloud config` の `core/project`（移行と無関係なプロジェクト）が quota に使われ、そこで API 無効 → `accesscontextmanager.googleapis.com ... SERVICE_DISABLED` で失敗する。
+   - **誤ったプロジェクトを自動推測しない**安全方針: `access_policy` / `perimeter` / `billing_project` のいずれかが未設定なら「設定不足」として skip + WARNING（host dst や先頭 dst へ勝手にフォールバックしない）。`billing_project` には dst ORG 内で API を有効化できるプロジェクト（通常は dst ホスト）を明示する。
+   - ステップ冒頭で `billing_project` に `accesscontextmanager` API を有効化（冪等 / allow_fail）してから describe/update を `--billing-project=<billing_project>` 付きで実行する。describe には `--quiet` を付け、API 無効時の対話プロンプトでハングしないようにする。
 
 ---
 
