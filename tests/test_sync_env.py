@@ -146,11 +146,15 @@ class TestValidateConfig:
         errors = validate_config(cfg)
         assert any("dst" in e and "src" in e for e in errors)
 
-    def test_missing_impersonate_sa_rejected(self, temp_dir):
+    def test_missing_impersonate_sa_allowed(self, temp_dir):
+        # `*_impersonate_service_account` 未指定はエラーにしない（ローカル認証フォールバック）。
+        # 実際に src 書込権を持っていれば check_service_accounts が警告 + 続行確認する。
         cfg = _full_config(temp_dir)
         cfg["project_mapping"]["host_project"]["src_impersonate_service_account"] = ""
-        errors = validate_config(cfg)
-        assert any("src_impersonate_service_account" in e for e in errors)
+        cfg["project_mapping"]["host_project"]["dst_impersonate_service_account"] = ""
+        cfg["project_mapping"]["service_projects"][0]["src_impersonate_service_account"] = ""
+        cfg["project_mapping"]["service_projects"][0]["dst_impersonate_service_account"] = ""
+        assert validate_config(cfg) == []
 
     def test_empty_service_projects_rejected(self, temp_dir):
         cfg = _full_config(temp_dir)
@@ -435,6 +439,147 @@ class TestCheckServiceAccounts:
             not any("bigquery" in p for p in perms) for _proj, perms in checker.calls
         )
 
+    # ---- ローカル認証フォールバック（*_impersonate_service_account 未指定） ----
+    def _setup_adc(self, temp_dir, **steps):
+        """src/dst の SA を空にして ADC フォールバック経路を強制する setup。"""
+        cfg = _full_config(temp_dir)
+        for entry in (
+            cfg["project_mapping"]["host_project"],
+            *cfg["project_mapping"]["service_projects"],
+        ):
+            entry["src_impersonate_service_account"] = ""
+            entry["dst_impersonate_service_account"] = ""
+        cfg["steps"] = steps
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def _fake_local_runner(self, *, token="ya29.fake-local", account="dev@example.com",
+                           token_rc=0):
+        """`_sa_preflight_run` の差し替え（ローカル認証用）。"""
+        calls = []
+
+        def runner(cmd):
+            calls.append(cmd)
+            if "print-access-token" in cmd:
+                return (token_rc, "" if token_rc else token, "" if token_rc else "denied")
+            if "config get-value account" in cmd:
+                return (0, account, "")
+            return (0, "", "")
+
+        runner.calls = calls
+        return runner
+
+    def test_adc_no_dangerous_perms_passes(self, temp_dir, monkeypatch):
+        # ADC が src に書込相当の権限を持たない → 警告ゼロ、続行確認も呼ばれない
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner()
+        o._test_iam_permissions = self._fake_perms(granted=set())
+        o.check_service_accounts()  # 例外なし
+
+    def test_adc_with_dangerous_perms_aborts_non_tty(self, temp_dir, monkeypatch):
+        # ADC が src に書込権を持つ + 非対話 + AUTO_APPROVE 未指定 → 中断
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner()
+        o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        with pytest.raises(SystemExit) as ei:
+            o.check_service_accounts()
+        assert ei.value.code == 1
+
+    def test_adc_auto_approve_env_skips_prompt(self, temp_dir, monkeypatch):
+        # AUTO_APPROVE=1 が指定されていれば非対話でも続行
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner()
+        o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
+        monkeypatch.setenv("COPY_ALL_ENV_AUTO_APPROVE", "1")
+        o.check_service_accounts()  # 例外なし
+
+    def test_adc_interactive_yes_continues(self, temp_dir, monkeypatch):
+        # 対話セッションで "y" を返したら続行
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner()
+        o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+        o.check_service_accounts()  # 例外なし
+
+    def test_adc_interactive_no_aborts(self, temp_dir, monkeypatch):
+        # 対話セッションで "n" を返したら中断
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner()
+        o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+        with pytest.raises(SystemExit) as ei:
+            o.check_service_accounts()
+        assert ei.value.code == 1
+
+    def test_adc_token_unavailable_exits(self, temp_dir, monkeypatch):
+        # `gcloud auth print-access-token` が失敗したら fail-fast
+        o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_local_runner(token_rc=1)
+        o._test_iam_permissions = self._fake_perms(granted=set())
+        with pytest.raises(SystemExit) as ei:
+            o.check_service_accounts()
+        assert ei.value.code == 1
+
+
+# ============================================================
+# _confirm_adc_src_write_or_abort: 続行確認の単体動作
+# ============================================================
+class TestConfirmAdcSrcWriteOrAbort:
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_empty_warnings_is_noop(self, temp_dir, monkeypatch):
+        o = self._orch(temp_dir)
+        # input が呼ばれないこと（呼ばれたら raise で失敗させる）
+        monkeypatch.setattr("builtins.input", lambda _p="": (_ for _ in ()).throw(AssertionError("called")))
+        o._confirm_adc_src_write_or_abort([])  # 例外なし
+
+    def test_non_tty_without_env_exits(self, temp_dir, monkeypatch):
+        o = self._orch(temp_dir)
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        with pytest.raises(SystemExit) as ei:
+            o._confirm_adc_src_write_or_abort(["src 'p': compute.instances.create"])
+        assert ei.value.code == 1
+
+    def test_env_overrides_non_tty(self, temp_dir, monkeypatch):
+        o = self._orch(temp_dir)
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
+        monkeypatch.setenv("COPY_ALL_ENV_AUTO_APPROVE", "1")
+        o._confirm_adc_src_write_or_abort(["src 'p': storage.buckets.delete"])  # 例外なし
+
+    def test_interactive_yes(self, temp_dir, monkeypatch):
+        o = self._orch(temp_dir)
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr("builtins.input", lambda _p="": "yes")
+        o._confirm_adc_src_write_or_abort(["src 'p': compute.disks.delete"])  # 例外なし
+
+    def test_interactive_blank_aborts(self, temp_dir, monkeypatch):
+        # Enter キーのみ（空文字）はデフォルト N 扱いで中断
+        o = self._orch(temp_dir)
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
+        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr("builtins.input", lambda _p="": "")
+        with pytest.raises(SystemExit) as ei:
+            o._confirm_adc_src_write_or_abort(["src 'p': iam.serviceAccountKeys.create"])
+        assert ei.value.code == 1
+
 
 # ============================================================
 # run_command: ORG 保護
@@ -448,13 +593,36 @@ class TestRunCommandSafety:
         o.load_config()
         return o
 
-    def test_src_without_sa_exits(self, temp_dir):
+    def test_src_without_sa_allows_read_only(self, temp_dir, monkeypatch):
+        # 旧仕様: src + impersonate_sa=None は即停止。
+        # 新仕様: ローカル認証フォールバックを許容するので、read-only コマンドは通る。
+        o = self._setup(temp_dir)
+
+        class _FakeProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(
+            "scripts.sync_env.subprocess.run",
+            lambda *a, **kw: _FakeProc(),
+        )
+        # SystemExit が出ないこと（is_src_read_only ガードは通過、impersonate 無くても可）
+        ret = o.run_command(
+            "gcloud compute instances list --project=src-host",
+            side="src", logger=o.org_logger,
+            impersonate_sa=None,
+        )
+        assert ret == ""
+
+    def test_src_without_sa_still_blocks_write_verb(self, temp_dir):
+        # impersonate の有無に関わらず書込動詞は拒否される（is_src_read_only ガード）
         o = self._setup(temp_dir)
         with pytest.raises(SystemExit):
             o.run_command(
-                "gcloud compute instances list --project=src-host",
+                "gcloud compute instances create vm --project=src-host",
                 side="src", logger=o.org_logger,
-                impersonate_sa=None,  # ← これが原因で停止すべき
+                impersonate_sa=None,
             )
 
     def test_src_write_verb_exits(self, temp_dir):
