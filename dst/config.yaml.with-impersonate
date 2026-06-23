@@ -1,0 +1,177 @@
+# ==============================================================================
+# GCP Project "Marugoto Copy" Configuration Template
+# ==============================================================================
+# このファイルを `config.yaml` にコピーし、環境に合わせて値を編集してください。
+# 例: cp dst/config.yaml.template dst/config.yaml
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. 共通設定 (Global Settings)
+# ------------------------------------------------------------------------------
+global:
+  # ログの出力先ディレクトリ。
+  log_dir: "./logs"
+
+  # コピー元（Original）の作業ログファイル名（log_dir内）
+  # コピー元からの情報取得やスナップショット確認などのログが記録されます。
+  org_log_file: "org.log"
+
+  # コピー先（Destination）の作業ログファイル名（log_dir内）
+  # コピー先でのリソース作成やデータ移行などのログが記録されます。
+  dst_log_file: "dst.log"
+
+  # 並列実行数。
+  # GCEのコピーやデータ移行など、並列処理が可能なステップで使用されます。
+  parallel_jobs: 8
+
+  # ドライランモード (デフォルト: true)
+  # true の場合、実際のリソース作成やデータのコピーは行わず、実行されるコマンドの表示のみ行います。
+  # 本番実行時は明示的に `false` に設定してください。
+  dry_run: true
+
+  # 詳細ログの出力 (デフォルト: true)
+  # true の場合、実行された生の gcloud/terraform コマンド文字列と、
+  # 人間が理解しやすい実行目的の補足説明がログに詳細に出力されます。
+  verbose_logging: true
+
+# ------------------------------------------------------------------------------
+# 1.5. 事前準備設定 (Provisioning / Bootstrap Settings)
+# ------------------------------------------------------------------------------
+# コピー先プロジェクトを新規作成する場合に必要な設定です。
+# make コマンドによる事前準備（プロジェクト作成）時に使用されます。
+bootstrap:
+  # 組織ID (Organization ID)
+  org_id: "181160215043"
+  # フォルダID (Folder ID) - 任意。指定された場合はフォルダ配下にプロジェクトを作成します。
+  # folder_id: "987654321098"
+  # 請求先アカウントID (Billing Account ID) - 必須。作成したプロジェクトに紐付けます。
+  billing_account: "01367B-8A6796-FF79CC"
+
+  folder_id: "114798477492"
+
+# ------------------------------------------------------------------------------
+# 2. プロジェクトマッピング定義 (Project Mapping)
+# ------------------------------------------------------------------------------
+# コピー元 (src) とコピー先 (dst) のプロジェクトIDを正確に指定してください。
+# 安全のため、サービスアカウントキー (JSON) は使用せず、サービスアカウントの権限借用 (Impersonation) を使用します。
+# コピー元 (src) には読み取り専用権限 (Viewer等) のサービスアカウントを、
+# コピー先 (dst) にはリソース作成権限 (Editor等) のサービスアカウントのメールアドレスを指定してください。
+# ※実行ユーザーが、対象SAに対して「サービス アカウント トークン作成者 (roles/iam.serviceAccountTokenCreator)」権限を持っている必要があります。
+project_mapping:
+  # 共有VPCホストプロジェクト
+  host_project:
+    src: "shingo-ar-sharedhost0926"
+    dst: "shingo-ar-host2026062302"
+    src_impersonate_service_account: "org-host-viewer@shingo-ar-sharedhost0926.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
+    dst_impersonate_service_account: "dst-host-owner@shingo-ar-host2026062302.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+  
+  # サービスプロジェクトのリスト (複数指定可能)
+  service_projects:
+    - src: "shingo-ar-sharedservice0926-1"
+      dst: "shingo-ar-service2026062302-1"
+      src_impersonate_service_account: "org-svc1-viewer@shingo-ar-sharedservice0926-1.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
+      dst_impersonate_service_account: "dst-svc1-owner@shingo-ar-service2026062302-1.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+    - src: "shingo-ar-sharedservice0926-3"
+      dst: "shingo-ar-service2026062302-3"
+      src_impersonate_service_account: "org-svc3-viewer@shingo-ar-sharedservice0926-3.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
+      dst_impersonate_service_account: "dst-svc3-owner@shingo-ar-service2026062302-3.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+
+# ------------------------------------------------------------------------------
+# 3. リネームルール設定 (Rename Rules)
+# ------------------------------------------------------------------------------
+# グローバルユニークである必要があるリソース（GCSバケット等）のリネーム規則を定義します。
+# コピー先環境での名前衝突を避けるために使用されます。
+rename_rules:
+  # GCSバケットのリネーム設定
+  gcs:
+    method: "suffix"                  # 'suffix' (接尾辞追加), 'prefix' (接頭辞追加), または 'custom'
+    value: "auto"                     # 付与文字列。"auto" で日付ベースの一意値を自動生成
+                                      # (suffix例: "-dst-MMDDHHMM")。生成値は
+                                      # terraform/.gcs_rename_value に保存し plan/run で再利用。
+    # 個別マッピング (特定のバケット名を明示的に指定したい場合に使用)
+    # overrides:
+    #   "original-bucket-name": "exact-destination-bucket-name"
+
+# ------------------------------------------------------------------------------
+# 4. ステップ制御 (Step Control)
+# ------------------------------------------------------------------------------
+# 各手順の実行有無 (enabled) および個別設定を行います。
+steps:
+  # [Step 1] Cloud Asset Inventory (CAI) での現状確認
+  cai_scan:
+    enabled: true
+    output_dir: "./cai_export"
+    # 未登録 assetType（_ASSET_COVERAGE に無い種別）を検出したら処理を停止するか
+    # 既定 false: WARNING でログに残すのみ。CI で漏れゼロを強制したい場合は true。
+    fail_on_uncovered: false
+
+  # [Step 2] GCE Snapshot の準備
+  gce_snapshot:
+    enabled: true
+    prefix: "migration-snap"
+    # 許容するスナップショットの最大作成経過日数 (デフォルト: 30日)
+    # データの新鮮さを保証するため、この期間内に作成されたスナップショットがない場合はエラーにします。
+    max_age_days: 30
+
+  # [Step 3] gcloud bulk-export によるIaC化 (Terraformコード生成)
+  bulk_export:
+    enabled: true
+    output_dir: "./terraform"
+    # true にすると本番実行 (`make run` = --no-dry-run) では bulk-export と
+    # customize を**スキップ**し、既存の terraform/active/ を再利用する。
+    # `make plan` (dry-run) には影響しない（plan では常に最新を取り直す）。
+    # 用途: make plan で生成済みの active をそのまま使って run を高速化したいとき。
+    skip_on_run: true
+
+  # [Step 4] dst へIaCでの再現 (Terraform適用)
+  terraform_apply:
+    enabled: true
+
+  # [Step 4.5] host project のファイアウォールルール・ポリシーを dst に複製
+  # bulk-export は network_firewall_policy を出力しないため gcloud で直接同期する
+  network_firewall:
+    enabled: true
+    # Secure tag (tagValues/<数値ID>) は ORG スコープの permanent ID で、
+    # 別 ORG にコピーすると dst には存在せず rules create が
+    # 「Could not fetch resource:」で失敗する。
+    # dst ORG で同等タグを作成し、src→dst の tagValues をここにマッピングすると
+    # 該当ルールも複製される。未指定のタグを参照するルールは
+    # （FW を意図せず緩めないため）エラーにせずスキップし WARNING を出す。
+    # 例:
+    # secure_tag_map:
+    #   "tagValues/281483307237001": "tagValues/449632198855123"  # env=prod
+    secure_tag_map: {}
+
+  # [Step 5] GCE VM 復元 (スナップショットから復元したディスクをVMに紐付け起動)
+  gce_restore:
+    enabled: true
+
+  # [Step 6] データの移行 (GCS, BigQueryなど)
+  data_sync:
+    enabled: true
+
+  # [Step 7] 作成した dst プロジェクトを既存の VPC Service Controls ペリメタへ追加
+  # org は一切触らない: アクセスポリシー / ペリメタ自体の作成・削除は行わず、
+  # 既存ペリメタへ `--add-resources` で dst プロジェクト（番号）を追記するだけ（冪等）。
+  # 全データ移行が終わった最後に実行される（先に封じ込めると後続操作が境界で弾かれるため）。
+  vpc_sc:
+    enabled: true
+    # アクセスポリシー番号（ORG/フォルダに紐付く access policy の数値 ID）
+    #   gcloud access-context-manager policies list --organization=181160215043
+    access_policy: "853369819240"        # 例: "1234567890"
+    # ペリメタ名（フルパス末尾の短い名前。projects/.../servicePerimeters/<name> の <name>）
+    #   gcloud access-context-manager perimeters list --policy=<上記>
+    perimeter: "testperimeter"            # 例: "dst_perimeter"
+    # host プロジェクトもペリメタに含めるか（Shared VPC は host も同一ペリメタ推奨）
+    include_host_project: true
+    # 【必須】quota/billing project。access-context-manager は --project を持たないため、
+    # 未指定だと gcloud がローカル config の core/project（無関係なプロジェクト）を quota に
+    # 使い、そのプロジェクトで API 無効 → SERVICE_DISABLED で失敗する。
+    # 安全のため自動補完はしない: 空のままだと本ステップは「設定不足」としてスキップする。
+    # dst ORG 内で accesscontextmanager API を有効化できるプロジェクトを明示すること
+    # （本ステップが自動で有効化する）。通常は dst ホストプロジェクトを指定。
+    billing_project: "shingo-ar-host2026062302"      # 例: "host-2026061901"（dst ホスト等を明示）
+    # （任意）ペリメタ更新に使う借用 SA。未指定なら make 実行ユーザーのローカル認証を使用。
+    # この SA / ユーザーは access policy に対する
+    # accesscontextmanager.servicePerimeters.update 権限が必要。
+    impersonate_service_account: ""
