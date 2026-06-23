@@ -1155,10 +1155,12 @@ class TestGcloudRecreateCommand:
             "//compute.googleapis.com/projects/src-host/regions/asia-northeast1/subnetworks/subnet-x",
         )
         joined = " ".join(cmds)
-        assert "gcloud compute networks subnets describe subnet-x" in joined
+        assert "gcloud compute networks subnets create subnet-x" in joined
         assert "--region=asia-northeast1" in joined
-        assert "--project=src-host" in joined
         assert "--project=dst-host" in joined
+        # read 操作 (describe) と src 参照は載せない
+        assert "describe" not in joined
+        assert "--project=src-host" not in joined
 
     def test_bucket_command_uses_gs_prefix(self):
         cmds = gcloud_recreate_command(
@@ -1166,9 +1168,10 @@ class TestGcloudRecreateCommand:
             "dst-host", "//storage.googleapis.com/my-bkt",
         )
         joined = " ".join(cmds)
-        assert "gs://my-bkt" in joined
+        assert "gcloud storage buckets create gs://" in joined
         assert "--location=us-central1" in joined
         assert "--project=dst-host" in joined
+        assert "describe" not in joined
 
     def test_service_account_extracts_account_id(self):
         cmds = gcloud_recreate_command(
@@ -1179,16 +1182,21 @@ class TestGcloudRecreateCommand:
             "myacct@src-host.iam.gserviceaccount.com",
         )
         joined = " ".join(cmds)
-        # describe は email 全体、create は accountId のみ
-        assert "describe myacct@src-host.iam.gserviceaccount.com" in joined
-        assert "create myacct " in joined or "create myacct\t" in joined or "create myacct " in joined
+        # create は accountId（email の @ より前）のみを使う
+        assert "create myacct " in joined or "create myacct\t" in joined
+        # read 操作は載せない / src の email 全体も出さない
+        assert "describe" not in joined
+        assert "myacct@src-host.iam.gserviceaccount.com" not in joined
 
-    def test_unknown_type_falls_back_to_asset_describe(self):
+    def test_unknown_type_falls_back_to_comment(self):
         cmds = gcloud_recreate_command(
             "fake.googleapis.com/Unknown", "x", "global",
             "dst-host", "//fake.googleapis.com/projects/src-host/unknowns/x",
         )
-        assert any("gcloud asset describe" in c for c in cmds)
+        # read 操作は載せず、手動対応を促すコメントのみ返す
+        assert any(c.lstrip().startswith("#") for c in cmds)
+        assert any("自動補完対象外" in c for c in cmds)
+        assert all("describe" not in c for c in cmds)
 
 
 class TestAnalyzeCaiTfDiff:
@@ -1211,14 +1219,18 @@ class TestAnalyzeCaiTfDiff:
         # subnet-svc1 と bucket は TF にあるので covered
         assert ("compute.googleapis.com/Subnetwork", "subnet-svc1") not in missing_names
         assert ("storage.googleapis.com/Bucket", "org-bucket-shared-data") not in missing_names
-        # 一方、subnet-svc-missing と nat-router (Router) は欠落
-        assert ("compute.googleapis.com/Subnetwork", "subnet-svc-missing") in missing_names
-        assert ("compute.googleapis.com/Router", "nat-router") in missing_names
-        # 未登録 type は unknown_types に集計
+        # subnet-svc-missing は gce_restore 担当、nat-router(Router) は None 指定 →
+        # 自動処理/対象外なので要手動対応 (missing) には載らない
+        assert ("compute.googleapis.com/Subnetwork", "subnet-svc-missing") not in missing_names
+        assert ("compute.googleapis.com/Router", "nat-router") not in missing_names
+        # 未登録 type (fake) は複製漏れの可能性 → 要手動対応として残る
+        assert ("fake.googleapis.com/Unknown", "x") in missing_names
+        # 未登録 type は unknown_types にも集計
         assert "fake.googleapis.com/Unknown" in report["unknown_types"]
-        # CAI 5 件 / 一致 2 件
+        # CAI 5 件 / 一致 2 件 / 自動処理・対象外 2 件 (subnet-missing, nat-router)
         assert report["cai_total"] == 5
         assert report["covered"] == 2
+        assert report["auto_handled"] == 2
 
     def test_missing_entries_have_recreate_commands(self, temp_dir):
         cai_path, tf_dir = self._setup(temp_dir)
@@ -1239,7 +1251,10 @@ class TestAnalyzeCaiTfDiff:
         md = format_diff_report([report])
         assert "CAI ↔ Terraform" in md
         assert "src-host" in md and "dst-host" in md
-        assert "subnet-svc-missing" in md
+        # 要手動対応 (未登録 type) のみ掲載
+        assert "fake.googleapis.com/Unknown" in md
+        # 自動処理/対象外 (gce_restore, None) は本文に列挙しない
+        assert "subnet-svc-missing" not in md
         assert "```bash" in md  # コマンドが fenced コードブロックで提示される
 
 
@@ -1276,10 +1291,11 @@ class TestEmitCaiTfDiff:
         diff_path = os.path.join(temp_dir, "DIFF.md")
         assert os.path.isfile(diff_path)
         body = open(diff_path, encoding="utf-8").read()
-        assert "subnet-svc-missing" in body
-        assert "nat-router" in body
-        # 一致したリソースは載らない
-        assert "subnet-svc1\n" not in body or "subnet-svc1" in body  # short_name は missing 内のみ列挙
+        # 要手動対応 (未登録 type) のみ掲載
+        assert "fake.googleapis.com/Unknown" in body
+        # 自動処理/対象外 (gce_restore, None 指定) は載らない
+        assert "subnet-svc-missing" not in body
+        assert "nat-router" not in body
 
 
 class TestFwRuleScopeFlag:
