@@ -1977,7 +1977,9 @@ resource "google_storage_bucket" "mock_bucket" {{
 
         各 src プロジェクトについて:
             1. cai_export/cai_resources_<src>.txt を analyze_cai_tf_diff() に渡し、
-            2. 欠落リソース + 推奨 gcloud コマンドを log と DIFF.md（リポジトリ直下）に出力。
+            2. 欠落リソース + 推奨 gcloud コマンドを log と DIFF.md に出力。
+        DIFF.md の実体は `logs/<timestamp>/DIFF.md`（org.log / dst.log と同居）に書き、
+        リポジトリ直下 (cwd) の `DIFF.md` は常に最新実行を指す symlink として張り替える。
         log は org_logger（INFO） を経由するため stdout にも自動で流れる。
         """
         log_stage_header(self.org_logger, 99, "CAI ↔ TF 差分レポート", 0)
@@ -2023,15 +2025,35 @@ resource "google_storage_bucket" "mock_bucket" {{
         for line in text.splitlines():
             self.org_logger.info(line)
 
-        # DIFF.md をリポジトリ直下に出力（実行 cwd 基準）。
-        # ファイル書き込みは dry_run でも実行する（src への書き込みは発生しない）。
-        diff_path = os.path.abspath("DIFF.md")
+        # 実体は logs/<timestamp>/DIFF.md に出力し、cwd の DIFF.md は symlink で
+        # 最新実行に張り替える。ファイル書き込みは dry_run でも実行する
+        # （src への書き込みは発生しない）。
+        diff_in_run = os.path.abspath(os.path.join(self.run_dir, "DIFF.md"))
+        diff_symlink = os.path.abspath("DIFF.md")
         try:
-            with open(diff_path, "w", encoding="utf-8") as f:
+            with open(diff_in_run, "w", encoding="utf-8") as f:
                 f.write(text)
-            self.org_logger.info(f"  ✓ 差分レポートを書き出しました: {diff_path}")
+            self.org_logger.info(f"  ✓ 差分レポートを書き出しました: {diff_in_run}")
         except OSError as e:
             self.org_logger.error(f"  DIFF.md の書き出しに失敗: {e}")
+            return
+
+        # cwd の DIFF.md を最新の実体への相対シンボリックリンクに張り替える。
+        # リポジトリを別パスに移しても壊れないよう、target は相対パスにする。
+        try:
+            if os.path.islink(diff_symlink) or os.path.exists(diff_symlink):
+                os.remove(diff_symlink)
+            rel_target = os.path.relpath(
+                diff_in_run, start=os.path.dirname(diff_symlink)
+            )
+            os.symlink(rel_target, diff_symlink)
+            self.org_logger.info(
+                f"  ✓ {diff_symlink} を最新版にリンク: → {rel_target}"
+            )
+        except OSError as e:
+            self.org_logger.warning(
+                f"  DIFF.md の symlink 更新に失敗（実体は {diff_in_run} に保存済み）: {e}"
+            )
 
     def _print_summary(self):
         elapsed = time.time() - self.start_t
