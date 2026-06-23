@@ -1453,17 +1453,47 @@ class TestEmitCaiTfDiff:
         _write(os.path.join(tf_dir, "google_compute_subnetwork.tf"), _TF_SAMPLE_SUBNET)
         _write(os.path.join(tf_dir, "google_storage_bucket.tf"), _TF_SAMPLE_BUCKET)
 
-        # DIFF.md は cwd 配下に書く設計 → cwd を temp_dir に切り替え
+        # 実体は logs/<timestamp>/DIFF.md、cwd の DIFF.md は symlink
+        # → cwd を temp_dir に切り替えて symlink を生成させる
         monkeypatch.chdir(temp_dir)
         o._emit_cai_tf_diff()
-        diff_path = os.path.join(temp_dir, "DIFF.md")
-        assert os.path.isfile(diff_path)
-        body = open(diff_path, encoding="utf-8").read()
+        # 実体は self.run_dir 配下にある
+        real_path = os.path.join(o.run_dir, "DIFF.md")
+        assert os.path.isfile(real_path)
+        # cwd の DIFF.md は symlink で、最新の実体を指している
+        symlink_path = os.path.join(temp_dir, "DIFF.md")
+        assert os.path.islink(symlink_path)
+        assert os.path.realpath(symlink_path) == os.path.realpath(real_path)
+        body = open(symlink_path, encoding="utf-8").read()
         # 要手動対応 (未登録 type) のみ掲載
         assert "fake.googleapis.com/Unknown" in body
         # 自動処理/対象外 (gce_restore, None 指定) は載らない
         assert "subnet-svc-missing" not in body
         assert "nat-router" not in body
+
+    def test_symlink_replaces_existing_regular_file(self, temp_dir, monkeypatch):
+        """cwd に既存の通常ファイル DIFF.md があっても上書きして symlink に張り替える。"""
+        o, _ = self._orch(temp_dir)
+        cai_dir = os.path.join(temp_dir, "cai_export")
+        os.makedirs(cai_dir)
+        _write(os.path.join(cai_dir, "cai_resources_src-host.txt"), _CAI_SAMPLE)
+        tf_dir = os.path.join(temp_dir, "tf", "raw", "src-host")
+        os.makedirs(tf_dir)
+        _write(os.path.join(tf_dir, "google_compute_subnetwork.tf"), _TF_SAMPLE_SUBNET)
+
+        # 事前に通常ファイルとして DIFF.md を置いておく（旧コミットの状態を再現）
+        monkeypatch.chdir(temp_dir)
+        legacy_diff = os.path.join(temp_dir, "DIFF.md")
+        _write(legacy_diff, "OLD CONTENT")
+        assert not os.path.islink(legacy_diff)
+
+        o._emit_cai_tf_diff()
+
+        # symlink に張り替わり、実体は run_dir 側
+        assert os.path.islink(legacy_diff)
+        assert os.path.realpath(legacy_diff) == os.path.realpath(
+            os.path.join(o.run_dir, "DIFF.md")
+        )
 
 
 class TestFwRuleScopeFlag:
