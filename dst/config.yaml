@@ -61,20 +61,20 @@ project_mapping:
   # 共有VPCホストプロジェクト
   host_project:
     src: "shingo-ar-sharedhost0926"
-    dst: "shingo-ar-host2026062302"
-    src_impersonate_service_account: "org-host-viewer@shingo-ar-sharedhost0926.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-    dst_impersonate_service_account: "dst-host-owner@shingo-ar-host2026062302.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+    dst: "shingo-ar-host2026062303"
+    src_impersonate_service_account: "" # [必須] コピー元用 (読み取り専用推奨)
+    dst_impersonate_service_account: "dst-host-owner@shingo-ar-host2026062303.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
   
   # サービスプロジェクトのリスト (複数指定可能)
   service_projects:
     - src: "shingo-ar-sharedservice0926-1"
-      dst: "shingo-ar-service2026062302-1"
-      src_impersonate_service_account: "org-svc1-viewer@shingo-ar-sharedservice0926-1.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-      dst_impersonate_service_account: "dst-svc1-owner@shingo-ar-service2026062302-1.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+      dst: "shingo-ar-service2026062303-1"
+      src_impersonate_service_account: "" # [必須] コピー元用 (読み取り専用推奨)
+      dst_impersonate_service_account: "dst-svc1-owner@shingo-ar-service2026062303-1.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
     - src: "shingo-ar-sharedservice0926-3"
-      dst: "shingo-ar-service2026062302-3"
-      src_impersonate_service_account: "org-svc3-viewer@shingo-ar-sharedservice0926-3.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-      dst_impersonate_service_account: "dst-svc3-owner@shingo-ar-service2026062302-3.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
+      dst: "shingo-ar-service2026062303-3"
+      src_impersonate_service_account: "" # [必須] コピー元用 (読み取り専用推奨)
+      dst_impersonate_service_account: "dst-svc3-owner@shingo-ar-service2026062303-3.iam.gserviceaccount.com"   # [必須] コピー先用 (作成/編集権限が必要)
 
 # ------------------------------------------------------------------------------
 # 3. リネームルール設定 (Rename Rules)
@@ -170,7 +170,7 @@ steps:
     # 安全のため自動補完はしない: 空のままだと本ステップは「設定不足」としてスキップする。
     # dst ORG 内で accesscontextmanager API を有効化できるプロジェクトを明示すること
     # （本ステップが自動で有効化する）。通常は dst ホストプロジェクトを指定。
-    billing_project: "shingo-ar-host2026062302"      # 例: "host-2026061901"（dst ホスト等を明示）
+    billing_project: "shingo-ar-host2026062303"      # 例: "host-2026061901"（dst ホスト等を明示）
     # （任意）ペリメタ更新に使う借用 SA。未指定なら make 実行ユーザーのローカル認証を使用。
     # この SA / ユーザーは access policy に対する
     # accesscontextmanager.servicePerimeters.update 権限が必要。
