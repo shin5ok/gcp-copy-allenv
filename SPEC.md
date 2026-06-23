@@ -62,7 +62,7 @@
 5. `gcloud services enable` で必要なAPI（`compute.googleapis.com` など）を有効化する。
 
 ##### B. 環境複製コアオーケストレータ (scripts/sync_env.py)
-`scripts/sync_env.py` が一連のステップ（1〜6）を統合して実行するコアオーケストレータである。
+`scripts/sync_env.py` が一連のステップ（1〜7）を統合して実行するコアオーケストレータである。
 
 1. **モック実行モード (Mock Mode)**:
    - 設定ファイル (`global.mock: true`) またはコマンドライン引数 (`--mock`) が指定された場合、実際のGCP APIおよびTerraformの呼び出しをシミュレートする。
@@ -88,6 +88,10 @@
 7. **[Step 6] Data Sync (データ同期)**:
    - GCSバケットの同期（`gcloud storage rsync`）およびBigQueryデータセット・テーブルの同期を実行する。
    - モックモード時は、バケット一覧やデータセット一覧の取得および同期コマンドの成功をシミュレートする。
+8. **[Step 7] VPC Service Controls (ペリメタ追加)**:
+   - 全データ移行の最後に、dst プロジェクト（番号）を既存の VPC SC ペリメタへ `--add-resources` で追記する（org / access policy 自体は作成・変更しない・冪等）。
+   - `access-context-manager` は org/policy スコープで `--project` を持たないため、quota project を `steps.vpc_sc.billing_project`（**必須・明示指定**）で与える。未指定だとローカル `gcloud config` の無関係なプロジェクトが quota に使われ `SERVICE_DISABLED` で失敗するため、安全側に倒して未設定ならスキップする（自動推測しない）。
+   - モックモード時は、ペリメタ describe / update / API 有効化コマンドの成功をシミュレートする。
 
 ---
 
