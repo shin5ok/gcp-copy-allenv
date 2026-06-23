@@ -149,3 +149,29 @@ steps:
   # [Step 6] データの移行 (GCS, BigQueryなど)
   data_sync:
     enabled: true
+
+  # [Step 7] 作成した dst プロジェクトを既存の VPC Service Controls ペリメタへ追加
+  # org は一切触らない: アクセスポリシー / ペリメタ自体の作成・削除は行わず、
+  # 既存ペリメタへ `--add-resources` で dst プロジェクト（番号）を追記するだけ（冪等）。
+  # 全データ移行が終わった最後に実行される（先に封じ込めると後続操作が境界で弾かれるため）。
+  vpc_sc:
+    enabled: true
+    # アクセスポリシー番号（ORG/フォルダに紐付く access policy の数値 ID）
+    #   gcloud access-context-manager policies list --organization=181160215043
+    access_policy: "853369819240"        # 例: "1234567890"
+    # ペリメタ名（フルパス末尾の短い名前。projects/.../servicePerimeters/<name> の <name>）
+    #   gcloud access-context-manager perimeters list --policy=<上記>
+    perimeter: "testperimeter"            # 例: "dst_perimeter"
+    # host プロジェクトもペリメタに含めるか（Shared VPC は host も同一ペリメタ推奨）
+    include_host_project: true
+    # 【必須】quota/billing project。access-context-manager は --project を持たないため、
+    # 未指定だと gcloud がローカル config の core/project（無関係なプロジェクト）を quota に
+    # 使い、そのプロジェクトで API 無効 → SERVICE_DISABLED で失敗する。
+    # 安全のため自動補完はしない: 空のままだと本ステップは「設定不足」としてスキップする。
+    # dst ORG 内で accesscontextmanager API を有効化できるプロジェクトを明示すること
+    # （本ステップが自動で有効化する）。通常は dst ホストプロジェクトを指定。
+    billing_project: "shingo-ar-host2026062302"      # 例: "host-2026061901"（dst ホスト等を明示）
+    # （任意）ペリメタ更新に使う借用 SA。未指定なら make 実行ユーザーのローカル認証を使用。
+    # この SA / ユーザーは access policy に対する
+    # accesscontextmanager.servicePerimeters.update 権限が必要。
+    impersonate_service_account: ""

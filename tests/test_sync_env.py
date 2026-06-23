@@ -506,6 +506,153 @@ class TestRunCommandSafety:
 
 
 # ============================================================
+# step_vpc_sc: 既存ペリメタへ dst プロジェクトを追加（org は触らない）
+# ============================================================
+class TestVpcSc:
+    def _setup(self, temp_dir, dry_run=False, **vpc_sc):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = dry_run
+        # billing_project は必須・明示指定（自動補完しない）。テストの既定として明示。
+        vpc_sc.setdefault("billing_project", "dst-host")
+        cfg["steps"] = {"vpc_sc": {"enabled": True, **vpc_sc}}
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def _capture(self, o):
+        calls = []
+        o.run_command = lambda cmd, **kw: calls.append((cmd, kw)) or ""
+        return calls
+
+    def test_mock_command_is_known(self):
+        assert is_known_mock_command(
+            "gcloud access-context-manager perimeters update p --policy=1 --add-resources=projects/9"
+        )
+        assert is_known_mock_command(
+            "gcloud access-context-manager perimeters describe p --policy=1"
+        )
+
+    def test_load_config_rejects_enabled_vpc_sc_missing_policy(self, temp_dir):
+        # enabled なのに access_policy 未設定 → load_config が実行前に fail-fast
+        with pytest.raises(SystemExit):
+            self._setup(temp_dir, access_policy="", perimeter="dst_perimeter")
+
+    def test_runtime_skip_defense_when_required_blanked(self, temp_dir):
+        # 検証を通った後に必須項目が消えても step は誤実行せず skip（多層防御）
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        o.config["steps"]["vpc_sc"]["billing_project"] = ""
+        o._get_project_number = lambda p, impersonate_sa=None: "1001"
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        assert [c for c, _ in calls if "perimeters update" in c] == []
+        assert o.stats.skipped >= 1
+
+    def test_adds_resolved_dst_numbers_not_src(self, temp_dir):
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        nums = {"dst-host": "1001", "dst-svc-1": "1002"}
+        o._get_project_number = lambda p, impersonate_sa=None: nums.get(p)
+        o._get_perimeter_resources = lambda *a, **k: set()
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        update = [c for c, _ in calls if "perimeters update" in c]
+        assert len(update) == 1
+        cmd = update[0]
+        assert "--policy=111" in cmd and "perimeters update dst_perimeter" in cmd
+        assert "projects/1001" in cmd and "projects/1002" in cmd
+        # resources は番号で渡す（src/dst のプロジェクト ID を resources に使わない）
+        assert "src-host" not in cmd and "projects/dst-host" not in cmd
+
+    def test_load_config_rejects_enabled_vpc_sc_missing_billing(self, temp_dir):
+        # billing_project は自動補完しない → 未設定なら load_config が実行前に fail-fast
+        with pytest.raises(SystemExit):
+            self._setup(
+                temp_dir, access_policy="111", perimeter="dst_perimeter",
+                billing_project="",
+            )
+
+    def test_billing_project_flows_to_commands(self, temp_dir):
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        o._get_project_number = lambda p, impersonate_sa=None: "1001"
+        seen = {}
+        o._get_perimeter_resources = (
+            lambda *a, **k: seen.update(args=a, kwargs=k) or set()
+        )
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        # describe 側へ明示 billing が渡る
+        assert seen["args"][-1] == "dst-host" or seen["kwargs"].get("billing") == "dst-host"
+        update = [c for c, _ in calls if "perimeters update" in c][0]
+        assert "--billing-project=dst-host" in update
+        # quota project の API 有効化が走る
+        assert any(
+            "services enable accesscontextmanager.googleapis.com" in c
+            and "--project=dst-host" in c
+            for c, _ in calls
+        )
+
+    def test_billing_project_override(self, temp_dir):
+        o = self._setup(
+            temp_dir, access_policy="111", perimeter="dst_perimeter",
+            billing_project="quota-proj",
+        )
+        o._get_project_number = lambda p, impersonate_sa=None: "1001"
+        o._get_perimeter_resources = lambda *a, **k: set()
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        update = [c for c, _ in calls if "perimeters update" in c][0]
+        assert "--billing-project=quota-proj" in update
+        assert any(
+            "services enable accesscontextmanager.googleapis.com" in c
+            and "--project=quota-proj" in c
+            for c, _ in calls
+        )
+
+    def test_only_missing_resources_added(self, temp_dir):
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        nums = {"dst-host": "1001", "dst-svc-1": "1002"}
+        o._get_project_number = lambda p, impersonate_sa=None: nums.get(p)
+        o._get_perimeter_resources = lambda *a, **k: {"projects/1001"}
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        cmd = [c for c, _ in calls if "perimeters update" in c][0]
+        assert "projects/1002" in cmd and "projects/1001" not in cmd
+
+    def test_noop_when_all_present(self, temp_dir):
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        nums = {"dst-host": "1001", "dst-svc-1": "1002"}
+        o._get_project_number = lambda p, impersonate_sa=None: nums.get(p)
+        o._get_perimeter_resources = lambda *a, **k: {"projects/1001", "projects/1002"}
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        assert [c for c, _ in calls if "perimeters update" in c] == []
+        assert o.stats.skipped >= 1
+
+    def test_exclude_host_project(self, temp_dir):
+        o = self._setup(
+            temp_dir, access_policy="111", perimeter="dst_perimeter",
+            include_host_project=False,
+        )
+        nums = {"dst-host": "1001", "dst-svc-1": "1002"}
+        o._get_project_number = lambda p, impersonate_sa=None: nums.get(p)
+        o._get_perimeter_resources = lambda *a, **k: set()
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        cmd = [c for c, _ in calls if "perimeters update" in c][0]
+        assert "projects/1002" in cmd and "projects/1001" not in cmd
+
+    def test_update_is_dst_side(self, temp_dir):
+        o = self._setup(temp_dir, access_policy="111", perimeter="dst_perimeter")
+        o._get_project_number = lambda p, impersonate_sa=None: "1001"
+        o._get_perimeter_resources = lambda *a, **k: set()
+        calls = self._capture(o)
+        o.step_vpc_sc()
+        update = [(c, kw) for c, kw in calls if "perimeters update" in c]
+        assert update and update[0][1].get("side") == "dst"
+
+
+# ============================================================
 # customize_hcl: name 置換が bucket ブロック内に限定されるか
 # ============================================================
 class TestCustomizeHcl:

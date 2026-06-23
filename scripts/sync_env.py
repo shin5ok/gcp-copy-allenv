@@ -83,6 +83,8 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud compute network-firewall-policies rules describe",
     "gcloud compute network-firewall-policies rules create",
     "gcloud compute network-firewall-policies associations create",
+    "gcloud access-context-manager perimeters describe",
+    "gcloud access-context-manager perimeters update",
     "gcloud services enable",
     "bq ls",
     "bq show",
@@ -1743,6 +1745,11 @@ resource "google_storage_bucket" "mock_bucket" {{
                 self.step_gce_restore()
             if steps.get('data_sync', {}).get('enabled', False):
                 self.step_data_sync()
+            # VPC SC は最後。先に dst をペリメタへ封じ込めると後続の
+            # terraform/gce/gcs/bq 操作が境界で弾かれる恐れがあるため、
+            # 全移行が終わってから既存ペリメタへ dst プロジェクトを追加する。
+            if steps.get('vpc_sc', {}).get('enabled', False):
+                self.step_vpc_sc()
             # 最後に CAI vs bulk-export tf 差分レポートを出力。
             # cai_scan も bulk_export も dry_run 中（src 側 read-only）に
             # 実コマンドが走るため、`make plan` 直後の DIFF.md 生成に使える。
@@ -4181,6 +4188,151 @@ resource "google_storage_bucket" "mock_bucket" {{
             explanation=f"service project {svc_proj} に静的内部IP {ip_addr} を予約 (共有 VPC subnet={subnet_uri})",
             impersonate_sa=svc_sa, allow_fail=True,
         )
+
+    def step_vpc_sc(self):
+        """Step 7: dst で作成したプロジェクトを既存の VPC Service Controls ペリメタに追加。
+
+        org は触らない: アクセスポリシーやペリメタ自体の作成/削除は一切行わず、
+        config.steps.vpc_sc で指定された **既存ペリメタ** に dst プロジェクトを
+        `--add-resources` で追記するだけ（冪等）。
+
+        ペリメタのメンバーはプロジェクト番号 (projects/<number>) で管理されるため、
+        各 dst プロジェクト ID を describe して番号へ解決する（read-only / local 認証）。
+        """
+        cfg = self.config.get('steps', {}).get('vpc_sc', {})
+        policy = str(cfg.get('access_policy', '') or '').strip()
+        perimeter = str(cfg.get('perimeter', '') or '').strip()
+        include_host = cfg.get('include_host_project', True)
+        impersonate = (cfg.get('impersonate_service_account') or '').strip() or None
+
+        mapping = self.config.get('project_mapping', {})
+        dst_projects: List[str] = []
+        host = mapping.get('host_project', {})
+        if include_host and host.get('dst'):
+            dst_projects.append(host['dst'])
+        for svc in mapping.get('service_projects', []):
+            if svc.get('dst'):
+                dst_projects.append(svc['dst'])
+
+        # quota/billing project は明示必須（フォールバックしない）。
+        # access-context-manager は --project を持たないため、未指定だと gcloud が
+        # ローカル config の core/project（移行と無関係なプロジェクト）を quota に使い、
+        # そこで API 無効 → SERVICE_DISABLED で失敗する。誤ったプロジェクトを自動推測
+        # して間違ったペリメタ操作をしないよう、未設定なら設定不足としてスキップする。
+        billing = str(cfg.get('billing_project', '') or '').strip()
+        billing_flag = f" --billing-project={billing}"
+
+        log_stage_header(
+            self.dst_logger, 7,
+            "VPC SC ペリメタへ dst プロジェクトを追加", len(dst_projects),
+        )
+
+        if not policy or not perimeter or not billing:
+            self.dst_logger.warning(
+                "  steps.vpc_sc.access_policy / perimeter / billing_project の"
+                "いずれかが未設定のためスキップ（billing_project は自動補完しない）"
+            )
+            self.stats.incr("skipped")
+            return
+        if not dst_projects:
+            self.dst_logger.warning("  追加対象の dst プロジェクトがありません。スキップ")
+            self.stats.incr("skipped")
+            return
+
+        # dst プロジェクト ID → projects/<番号> を解決（read-only / local 認証）。
+        # mock では describe が使えないためプレースホルダ番号で代用する。
+        resources: List[str] = []
+        for dst in dst_projects:
+            num = self._get_project_number(dst)
+            if not num and self.mock:
+                num = f"000{abs(hash(dst)) % 10**9}"
+            if not num:
+                self.dst_logger.warning(
+                    f"  {dst} のプロジェクト番号を取得できずスキップ"
+                    f"（projects describe 権限 / projectNumber を確認）"
+                )
+                self.stats.incr("skipped")
+                continue
+            resources.append(f"projects/{num}")
+
+        if not resources:
+            self.dst_logger.warning("  解決できた dst プロジェクト番号がありません。スキップ")
+            self.stats.incr("skipped")
+            return
+
+        # quota project で accesscontextmanager API を有効化（冪等）。これをしないと
+        # describe/update が quota project の API 無効で SERVICE_DISABLED になる。
+        self.run_command(
+            f"gcloud services enable accesscontextmanager.googleapis.com "
+            f"--project={billing}",
+            side="dst", logger=self.dst_logger,
+            desc=f"VPC SC quota project API 有効化 {billing}",
+            explanation=(
+                f"{billing} で accesscontextmanager API を有効化"
+                f"（access-context-manager の quota/billing project 用）"
+            ),
+            impersonate_sa=impersonate, allow_fail=True,
+        )
+
+        # 既存メンバーを取得し差分のみ追加（冪等・ログを綺麗に）。
+        # dry_run では describe も実行されないため existing=None → 計画として全件を表示。
+        existing = self._get_perimeter_resources(policy, perimeter, impersonate, billing)
+        if existing is None:
+            to_add = list(resources)
+        else:
+            to_add = [r for r in resources if r not in existing]
+
+        if not to_add:
+            self.dst_logger.info(
+                f"  すべての dst プロジェクト ({len(resources)} 件) は既にペリメタ "
+                f"{perimeter} 内です。スキップ"
+            )
+            self.stats.incr("skipped")
+            return
+
+        self.run_command(
+            f"gcloud access-context-manager perimeters update {perimeter} "
+            f"--policy={policy}{billing_flag} --add-resources={','.join(to_add)} --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"VPC SC ペリメタ更新 {perimeter}",
+            explanation=(
+                f"既存ペリメタ {perimeter} に dst プロジェクト {len(to_add)} 件を追加"
+                f"（org / access policy 自体は変更しない）"
+            ),
+            impersonate_sa=impersonate, allow_fail=True,
+        )
+        self.dst_logger.info("  ✓ Step 7 完了")
+
+    def _get_perimeter_resources(
+        self, policy: str, perimeter: str, impersonate: Optional[str],
+        billing: str,
+    ) -> Optional[set]:
+        """ペリメタの現在の resources (projects/<番号>) を集合で返す（read-only）。
+
+        取得不能（dry_run でスキップ / describe 失敗 / mock）なら None。
+        None は呼び出し側で「差分不明 → 全件を計画として追加」と解釈する。
+
+        access-context-manager は org/policy スコープのコマンドで `--project` を持たない。
+        billing（quota project）は必須。呼び出し側が明示指定済みの前提でフラグを必ず付ける。
+        付けないと gcloud がローカル config の core/project（無関係な dst 外プロジェクト）を
+        quota に使い SERVICE_DISABLED で落ちる。
+        """
+        billing_flag = f" --billing-project={billing}"
+        out = self.run_command(
+            f"gcloud access-context-manager perimeters describe {perimeter} "
+            f"--policy={policy}{billing_flag} --format='value(status.resources)' --quiet",
+            side="dst", logger=self.dst_logger,
+            desc=f"VPC SC ペリメタ参照 {perimeter}",
+            impersonate_sa=impersonate, allow_fail=True,
+            expect_not_found_ok=True,
+        )
+        if not out:
+            return None
+        # value(...) の繰り返しフィールドは ';' 区切り。projects/<num> 以外は弾く
+        # （mock の "Success" など）。
+        items = {tok.strip() for tok in re.split(r'[;\n,]', out) if tok.strip()}
+        resources = {it for it in items if it.startswith('projects/')}
+        return resources or None
 
     def _replicate_host_networks(self):
         """src host の custom VPC ネットワークとサブネットを dst host に複製する（冪等）。
