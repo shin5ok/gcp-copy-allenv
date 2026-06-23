@@ -76,6 +76,10 @@
   - `gcloud auth print-access-token` で SA 実在 + tokenCreator 権限を確認
   - `gcloud projects test-iam-permissions` で代表権限（src=read / dst=write）を確認
   - 不足は全件列挙して即停止（dst SA の不備もここで検出）
+- 借用 SA 未指定のときのフォールバック:
+  - `*_impersonate_service_account` 未指定はエラーにせず、ローカル認証（gcloud のアクティブアカウント / ADC）を使う
+  - その認証主体が **src プロジェクトに書込相当の権限を持っていれば**、対象プロジェクトと付与権限を一覧で警告し `[y/N]` で続行確認（非対話セッションは `COPY_ALL_ENV_AUTO_APPROVE=1` で明示許可した時のみ続行）
+  - src 側のコマンド書込動詞拒否ガード (`is_src_read_only`) は impersonate の有無に関わらず常時有効
 
 ### 計画ステップ（src は read-only、impersonate 経由）
 1. **cai_scan**: Cloud Asset Inventory で src の有効リソース一覧を取得（「何が存在するか」のスナップショット）

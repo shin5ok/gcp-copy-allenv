@@ -4,7 +4,10 @@
 設計の柱:
 - ORG プロジェクトに対する書き込みは絶対に行わない（コードレベルで強制）。
 - すべての外部コマンドは side="src" | "dst" | "local" タグ付きで実行され、
-  src 操作は impersonate_sa 必須かつ read-only パターンに限定される。
+  src 操作は read-only パターンに限定される（書き込み動詞は実行前に拒否）。
+- impersonate_sa は推奨だが必須ではない。未指定の場合はローカル認証
+  （gcloud のアクティブアカウント / ADC）にフォールバックする。src の書込権を
+  持っていれば事前チェックで警告 + 続行確認を求める。
 - ログは実行ごとに logs/<timestamp>/{org,dst}.log に分離、日本語で記録。
 """
 import argparse
@@ -823,6 +826,40 @@ _DST_PERMS_BY_STEP = {
                          "bigquery.datasets.create", "bigquery.tables.create"),
 }
 
+# `*_impersonate_service_account` 未指定でローカル認証 (gcloud のアクティブ
+# アカウント / ADC) を src に対して使う場合、現在の認証主体が src に書込相当の
+# 権限を持っていないかを事前確認するための代表セット。Editor / Owner / 各種
+# Admin ロール相当を検知できれば足りるため、リソース種を網羅する必要はない。
+# is_src_read_only(cmd) の最終防衛線は別途あるが、認証主体の最小権限化を促す
+# ための「実行前警告 + 続行確認」のトリガーとして使う。
+_SRC_DANGEROUS_PERMS = (
+    "resourcemanager.projects.setIamPolicy",
+    "resourcemanager.projects.update",
+    "resourcemanager.projects.delete",
+    "compute.instances.create",
+    "compute.instances.delete",
+    "compute.instances.setMetadata",
+    "compute.disks.create",
+    "compute.disks.delete",
+    "compute.networks.create",
+    "compute.networks.delete",
+    "compute.firewalls.create",
+    "compute.firewalls.delete",
+    "storage.buckets.create",
+    "storage.buckets.delete",
+    "storage.objects.create",
+    "storage.objects.delete",
+    "bigquery.datasets.create",
+    "bigquery.datasets.delete",
+    "bigquery.tables.create",
+    "bigquery.tables.delete",
+    "iam.serviceAccounts.create",
+    "iam.serviceAccounts.delete",
+    "iam.serviceAccountKeys.create",
+    "serviceusage.services.enable",
+    "serviceusage.services.disable",
+)
+
 
 def is_src_read_only(cmd: str) -> bool:
     """src 側に対して安全（read-only）なコマンドかを判定する。
@@ -987,10 +1024,16 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
 
     検証項目:
     - project_mapping の存在
-    - host_project と service_projects の src/dst/impersonate_sa がすべて埋まっている
+    - host_project と service_projects の src/dst が埋まっている
     - src と dst が同一でないこと
     - dst 側 ID が src 側 ID と重複していないこと（ORG を上書きしないため）
     - dst が複数の src にマップされていないこと
+
+    `*_impersonate_service_account` の未指定は **ここではエラーにしない**。
+    未指定の場合は CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT を設定せずに
+    ローカル認証（gcloud にログイン中のユーザー / ADC）にフォールバックする。
+    その場合 src プロジェクトに対する書き込み相当の権限を持っていないかを
+    `check_service_accounts` が事前確認し、持っていれば実行前に警告 + 続行確認する。
     """
     errors: List[str] = []
     mapping = config.get('project_mapping')
@@ -1019,16 +1062,12 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
             continue
         src = ent.get('src')
         dst = ent.get('dst')
-        src_sa = ent.get('src_impersonate_service_account')
-        dst_sa = ent.get('dst_impersonate_service_account')
+        # impersonate SA は **必須にしない**。未指定はローカル認証フォールバックを許容し、
+        # check_service_accounts 側で src 書込権の有無を確認 + 警告 + 続行確認する。
         if not src:
             errors.append(f"{label}: src が未指定")
         if not dst:
             errors.append(f"{label}: dst が未指定")
-        if not src_sa:
-            errors.append(f"{label}: src_impersonate_service_account が未指定（ORG 保護のため必須）")
-        if not dst_sa:
-            errors.append(f"{label}: dst_impersonate_service_account が未指定")
         if src and dst and src == dst:
             errors.append(f"{label}: src と dst が同一です ({src})。ORG への書き込みになります")
         if src:
@@ -1317,6 +1356,91 @@ class MigrationOrchestrator:
         except Exception:
             return None
 
+    # ----- ローカル認証（ADC / gcloud アクティブアカウント）ヘルパ -----
+    def _local_access_token(self) -> Optional[str]:
+        """ローカル認証のアクセストークンを取得する（impersonation なし）。
+
+        `subprocess` から `gcloud ...` を呼ぶ際、CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT を
+        設定しなければ gcloud は **アクティブな gcloud アカウント** を使う。`gcloud auth
+        print-access-token`（フラグ無し）はそのトークンを返すので、テスト権限の主体として
+        同等に扱える。失敗時は None。
+        """
+        rc, out, _err = self._sa_preflight_run("gcloud auth print-access-token")
+        if rc != 0 or not out.strip():
+            return None
+        return out.strip()
+
+    def _local_active_account(self) -> Optional[str]:
+        """`gcloud config get-value account` でアクティブアカウント名を返す。失敗時は None。"""
+        rc, out, _err = self._sa_preflight_run(
+            "gcloud config get-value account --quiet"
+        )
+        if rc != 0:
+            return None
+        acct = out.strip()
+        return acct or None
+
+    def _confirm_adc_src_write_or_abort(self, warnings: List[str]) -> None:
+        """ローカル認証が src に書込権を持つ場合の警告 + 続行確認。
+
+        - warnings が空ならノーオペ。
+        - 環境変数 `COPY_ALL_ENV_AUTO_APPROVE=1` で確認スキップ（CI/非対話用）。
+        - 非対話セッション（stdin が tty でない）かつ AUTO_APPROVE 未指定ならエラー終了。
+        - 対話なら `[y/N]` を求め、y/yes 以外は中断。
+        """
+        if not warnings:
+            return
+
+        print("=" * 60, file=sys.stderr)
+        print(
+            " [SA事前チェック] 警告: 借用 SA 未指定のためローカル認証（gcloud / ADC）を使用します。",
+            file=sys.stderr,
+        )
+        print(
+            " 現在の認証主体は以下の src プロジェクトに対して書き込み相当の権限を持っています:",
+            file=sys.stderr,
+        )
+        for w in warnings:
+            print(f"  - {w}", file=sys.stderr)
+        print(
+            " ORG 保護: コマンド単位の書込動詞拒否ガード (is_src_read_only) は継続適用しますが、",
+            file=sys.stderr,
+        )
+        print(
+            " 認証主体の最小権限化（読み取り専用 SA の借用）を推奨します。",
+            file=sys.stderr,
+        )
+        print(
+            " 続行をスキップしたい場合は config の `*_impersonate_service_account` を設定してください。",
+            file=sys.stderr,
+        )
+        print("=" * 60, file=sys.stderr)
+
+        if os.environ.get("COPY_ALL_ENV_AUTO_APPROVE") == "1":
+            self.org_logger.warning(
+                "  [SA事前チェック] COPY_ALL_ENV_AUTO_APPROVE=1 により続行確認を自動承認"
+            )
+            return
+
+        if not sys.stdin.isatty():
+            print(
+                " 非対話セッションのため自動続行できません。"
+                " 続行する場合は環境変数 COPY_ALL_ENV_AUTO_APPROVE=1 を設定してください。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        try:
+            ans = input("続行しますか？ [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans not in ("y", "yes"):
+            print(" [SA事前チェック] ユーザー操作により中断しました。", file=sys.stderr)
+            sys.exit(1)
+        self.org_logger.warning(
+            "  [SA事前チェック] ユーザー承認によりローカル認証で続行します"
+        )
+
     def check_service_accounts(self):
         """impersonate 対象 SA の実在性・借用可否・代表権限を実行前に検証する。
 
@@ -1328,6 +1452,12 @@ class MigrationOrchestrator:
           する代表権限（src=読取 / dst=書込）の有無を確認する。権限が不足していたら
           即停止。ただし API 未有効等で「検証できなかった」場合は警告に留め継続する
           （借用は確認済みのため）。検証する権限は代表値であり全リソース種を網羅しない。
+        - `*_impersonate_service_account` 未指定のプロジェクトはローカル認証
+          （gcloud のアクティブアカウント / ADC）にフォールバックする。その場合:
+          - src 側: 代表的な書込権 (_SRC_DANGEROUS_PERMS) を testIamPermissions で確認し、
+            granted があれば警告を集めて最後に続行確認する（is_src_read_only ガードは別途継続）。
+          - dst 側: 必要権限の不足を WARNING ログだけ出し、続行する（実書込は run 時に
+            分かる / 借用未指定のフォールバックなので fail-fast にはしない）。
         """
         if self.mock:
             self.org_logger.info("  [SA事前チェック] Mock モードのため SA 検証をスキップ")
@@ -1345,16 +1475,25 @@ class MigrationOrchestrator:
                     perms.update(plist)
             return perms
 
-        # 検証対象: (SA, project, side, 必要権限集合) を構築。
-        targets = []
+        # 検証対象を 2 系統に分割: 借用 SA 検証用 と ローカル認証フォールバック用。
+        impersonate_targets: List[Tuple[str, str, str, set]] = []
+        adc_src_projects: List[str] = []
+        adc_dst_projects: List[str] = []
         src_perms = required_perms(_SRC_PERMS_BY_STEP, _SRC_BASELINE_PERMS)
         dst_perms = required_perms(_DST_PERMS_BY_STEP, _DST_BASELINE_PERMS)
         for src_proj, dst_proj, src_sa, dst_sa in self._iter_project_pairs():
-            targets.append((src_sa, src_proj, "src", src_perms))
-            targets.append((dst_sa, dst_proj, "dst", dst_perms))
+            if src_sa:
+                impersonate_targets.append((src_sa, src_proj, "src", src_perms))
+            else:
+                adc_src_projects.append(src_proj)
+            if dst_sa:
+                impersonate_targets.append((dst_sa, dst_proj, "dst", dst_perms))
+            else:
+                adc_dst_projects.append(dst_proj)
 
         errors: List[str] = []
         checked_sas = set()
+        adc_src_warnings: List[str] = []
         sa_lock = threading.Lock()
 
         def check_one(item):
@@ -1396,7 +1535,63 @@ class MigrationOrchestrator:
             with sa_lock:
                 checked_sas.add(sa)
 
-        self._parallel_for_each(targets, check_one, "sa-preflight")
+        self._parallel_for_each(impersonate_targets, check_one, "sa-preflight")
+
+        # --- ローカル認証フォールバック: src 書込権 + dst 必要権限の事前確認 ---
+        adc_token: Optional[str] = None
+        adc_account: Optional[str] = None
+        if adc_src_projects or adc_dst_projects:
+            adc_token = self._local_access_token()
+            adc_account = self._local_active_account()
+            label_account = adc_account or "(active account 不明)"
+            self.org_logger.warning(
+                f"  [SA事前チェック] 借用 SA 未指定のためローカル認証を使用します"
+                f"（認証主体={label_account}）。"
+                f" 対象: src={len(adc_src_projects)} / dst={len(adc_dst_projects)}"
+            )
+            if not adc_token:
+                errors.append(
+                    "借用 SA 未指定でローカル認証を試みましたが、"
+                    "`gcloud auth print-access-token` でトークンを取得できませんでした。"
+                    " `gcloud auth login` を実行するか、"
+                    " `*_impersonate_service_account` を設定してください。"
+                )
+            else:
+                # src 側: 代表的な書込権を持っていれば警告対象に追加
+                for proj in sorted(set(adc_src_projects)):
+                    granted = self._test_iam_permissions(
+                        adc_token, proj, set(_SRC_DANGEROUS_PERMS)
+                    )
+                    if granted is None:
+                        self.org_logger.info(
+                            f"  [SA事前チェック] src '{proj}' のローカル認証権限を"
+                            f"検証できませんでした（cloudresourcemanager API 未有効等の可能性）。"
+                            f" 書込権チェックをスキップして継続します。"
+                        )
+                        continue
+                    if granted:
+                        adc_src_warnings.append(
+                            f"src '{proj}' (認証主体={label_account}): "
+                            f"{', '.join(sorted(granted))}"
+                        )
+                # dst 側: 必要権限が不足していても WARNING に留める（fail-fast しない）
+                for proj in sorted(set(adc_dst_projects)):
+                    granted = self._test_iam_permissions(adc_token, proj, set(dst_perms))
+                    if granted is None:
+                        self.org_logger.info(
+                            f"  [SA事前チェック] dst '{proj}' のローカル認証権限を"
+                            f"検証できませんでした（API 未有効等の可能性）。継続します。"
+                        )
+                        continue
+                    missing = sorted(set(dst_perms) - granted)
+                    if missing:
+                        shown = ", ".join(missing[:8])
+                        more = " ..." if len(missing) > 8 else ""
+                        self.org_logger.warning(
+                            f"  [SA事前チェック] dst '{proj}' でローカル認証主体に"
+                            f"不足権限の可能性: {shown}{more}"
+                            f"（認証主体={label_account}）"
+                        )
 
         if errors:
             has_dst_impersonate_failure = any(
@@ -1415,9 +1610,18 @@ class MigrationOrchestrator:
                 print("=" * 60, file=sys.stderr)
             sys.exit(1)
 
+        # ローカル認証 src 書込権の警告 + 続行確認（warnings 空ならノーオペ）
+        self._confirm_adc_src_write_or_abort(adc_src_warnings)
+
+        adc_summary = ""
+        if adc_src_projects or adc_dst_projects:
+            adc_summary = (
+                f" / ローカル認証フォールバック src={len(adc_src_projects)} "
+                f"dst={len(adc_dst_projects)}"
+            )
         self.org_logger.info(
-            f"  [SA事前チェック] OK: {len(checked_sas)} 個の SA で借用と代表権限を確認"
-            f"（検証は代表的な権限のみ）"
+            f"  [SA事前チェック] OK: 借用 SA {len(checked_sas)} 個を検証"
+            f"{adc_summary}（検証は代表的な権限のみ）"
         )
 
     # ----- 安全に外部コマンドを実行 -----
@@ -1438,7 +1642,9 @@ class MigrationOrchestrator:
 
         Args:
             side: "src" (ORG = read-only 必須) / "dst" (コピー先) / "local" (terraform 等)
-            impersonate_sa: 借用 SA。side="src" では必須。
+            impersonate_sa: 借用 SA。未指定の場合はローカル認証（gcloud のアクティブ
+                            アカウント / ADC）にフォールバックする。side="src" でも未指定可。
+                            ただし src の書込権を持っていれば事前チェック側で警告 + 続行確認する。
             retries: 失敗時の追加リトライ回数（config-connector 等のフレーキー対策）。
                      リトライ中の失敗は失敗カウントに含めない。
             expect_not_found_ok: True の場合、stdout/stderr に "Not found" を含む失敗は
@@ -1452,13 +1658,9 @@ class MigrationOrchestrator:
             logger.error(f"{tag}[ORG 保護] 無効な side='{side}' です")
             sys.exit(1)
 
+        # src 側はコマンド文字列レベルで書き込み動詞を必ず拒否する（最終防衛線）。
+        # impersonate_sa の有無に関わらず、ここで弾く。
         if side == "src":
-            if not impersonate_sa:
-                logger.error(
-                    f"{tag}[ORG 保護] src 操作には impersonate_sa が必須です。"
-                    f" コマンド: {cmd}"
-                )
-                sys.exit(1)
             if not is_src_read_only(cmd):
                 logger.error(
                     f"{tag}[ORG 保護] src 操作で書き込み動詞が検出されたため拒否しました。"
@@ -1726,8 +1928,9 @@ resource "google_storage_bucket" "mock_bucket" {{
         self.org_logger.info("=" * 60)
         self.org_logger.info(" copy-all-env  移行オーケストレータ  開始")
         self.org_logger.info("=" * 60)
-        self.org_logger.info("【ORG 保護】src 操作は read-only に強制、impersonate_sa 必須、")
-        self.org_logger.info("           書き込み動詞は実行前に拒否されます。")
+        self.org_logger.info("【ORG 保護】src 操作は read-only に強制、書き込み動詞は実行前に拒否されます。")
+        self.org_logger.info("           impersonate_sa は推奨（未指定はローカル認証フォールバック、")
+        self.org_logger.info("           src 書込権ありなら事前確認）。")
         self.org_logger.info(f"  dry_run = {self.dry_run}")
         self.org_logger.info(f"  mock    = {self.mock}")
         self.org_logger.info(f"  verbose = {self.verbose}")
