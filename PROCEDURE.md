@@ -13,7 +13,7 @@
 - `dst/config.yaml` を `dst/config.yaml.template` から複製
   - `project_mapping`: src/dst プロジェクト ID、`host_project` + `service_projects`、`src_impersonate_service_account` / `dst_impersonate_service_account` を定義
   - `rename_rules.gcs.value`: 固定文字列 or `"auto"`（日付ベース suffix `-dst-MMDDHHMM` を `terraform/.gcs_rename_value` に永続化）
-  - `steps`: 1〜7 の有効/無効、`gce_snapshot` の期限（既定 30 日）、`bulk_export.skip_on_run`、`vpc_sc.billing_project`（**必須・明示指定**）等
+  - `steps`: 8 ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `data_sync` / `vpc_sc`) の有効/無効、`gce_snapshot` の期限（既定 30 日）、`bulk_export.skip_on_run`、`vpc_sc.billing_project`（**必須・明示指定**）等
   - `bootstrap`: 組織 ID / フォルダ ID / 請求先アカウント
 - 実行ユーザーは `gcloud auth login` 済み、`roles/iam.serviceAccountTokenCreator` を保有
 - **src 側 SA**: `scripts/bootstrap_src_sa.sh --apply` で各 src プロジェクトに read-only SA を作成
@@ -92,12 +92,15 @@
    - `boot_disk.source` 行を削除（Step 5 で管理するため）
    - 成果物: `terraform/active/<src>/`
 4. **terraform_apply**: `terraform plan -out=tfplan` を生成（apply はしない）
-5. **gce_restore**: スナップショットから復元するディスク差し替え計画
-6. **data_sync**: GCS（リネーム後名）/ BigQuery（src の location 継承）の同期計画
+5. **network_firewall** (Step 4.5): classic firewall ルールと Network Firewall Policy を dst host VPC に複製する計画。`secure_tag_map` 未登録の tagValues 参照は skip + WARNING。
+6. **gce_restore**: スナップショットから復元するディスク差し替え計画
+7. **data_sync**: GCS（リネーム後名）/ BigQuery（src の location 継承）の同期計画
+8. **vpc_sc** (Step 7): 既存ペリメタへ dst プロジェクト（番号）を追記する計画。`access_policy` / `perimeter` / `billing_project` のいずれかが未設定なら skip + WARNING。
 
 ### 差分レポート
-- 直後に **`DIFF.md`** を出力（CAI スキャン結果と bulk-export terraform の差分）
-- 「CAI で見つかったのに tf に出てこない」リソースをここで気付ける
+- 直後に **`logs/<タイムスタンプ>/DIFF.md`** を出力（CAI スキャン結果と bulk-export terraform の差分）
+- リポジトリ直下の `DIFF.md` は最新版への相対 symlink に張り替え（過去実行と並べて比較可能）
+- 「CAI で見つかったのに tf に出てこない」リソースをここで気付ける（要手動 / 自動・対象外を区別）
 
 ---
 
@@ -116,13 +119,22 @@
 
 **目的**: `make plan` で確認した内容を dst にだけ実書き込みする。src には一切触れない。VM は「OS 状態・データごと」復元される。
 
-`make plan` と同じ事前チェック後、dst にのみ書き込み:
+`make plan` と同じ事前チェック後、dst にのみ書き込み（**実行順は以下の小数点番号と一致**）:
 
-1. **Terraform apply**: dst host に VPC / subnet / NAT / FW / FW Policy を再現
+1. **Terraform apply (Step 4)**: dst host に VPC / subnet / Cloud Router / Cloud NAT を再現
    - 冪等性: dst プロジェクト変更時は `terraform.tfstate` を破棄して import からやり直し（`active/<src>/.dst_project` マーカー判定）
    - `google_storage_bucket` はリネーム後の実名で import して adopt
    - VM/disk は Step 4 では作らず Step 5 で管理（責務分離）
-2. **gce_restore**: 期限内スナップショットから dst にディスクを復元 → boot disk を差し替え → **どの VM も一旦 RUNNING で残す**（OS 状態・データごと復元）
+   - **FW rules / Network Firewall Policy は Terraform では作らず Step 4.5 で gcloud 複製**（後述）。`google_compute_firewall` 等を bulk-export 由来の `.tf` に残しておくと Step 4.5 と二重定義になるため、`customize_hcl` 段階で除外している。
+
+1.5. **Network Firewall (Step 4.5 / `step_network_firewall`)**: Terraform で表現しきれない FW を `gcloud` で冪等複製する独立フェーズ。実行順は **Step 4 (terraform_apply) の直後・Step 5 (gce_restore) の前**。
+   - **冒頭で `_replicate_host_networks()` を呼び、dst host の Shared VPC ネットワーク (例: `shared-vpc`) と subnet を src host と同型に複製**する。FW rule / FW policy association は `--network=<NAME>` を要求するため、これが無いと `Could not fetch resource: 'projects/<dst_host>/global/networks/<name>' was not found` で全 FW 操作が失敗する。冪等 (`_gcloud_exists` ガード) で、Step 5 から再度呼ばれても describe のみ。
+   - 防御的に `_sync_classic_firewall_rules` は参照される dst network を一括 pre-flight チェック、`_sync_fw_policy_associations` は assoc 単位で existence チェックし、未存在の network を参照する rule/assoc は cryptic な API エラーを量産せず skip + WARNING に倒す。
+   - `network-firewall-policies` のサブコマンドごとに scope flag が異なる: `list`=`--regions=`（複数形）/ `describe`・`create`=`--global`・`--region=`（ポリシー本体）/ `rules ...`・`associations create`=`--global-firewall-policy`・`--firewall-policy-region=`。誤ると `unrecognized arguments`。`fw_rule_scope_flag()` で変換する。
+   - `fw_policy_rule_flags()` は REST API の FirewallPolicyRule 全フィールドに対応する。INGRESS ルールは `srcIpRanges / srcThreatIntelligences / srcAddressGroups / srcFqdns / srcSecureTags / srcRegionCodes / srcNetworkScope` のいずれかが必須（gcloud 仕様）。欠落すると `Must specify src_... for ingress direction` / `Could not fetch resource:` で失敗する。
+   - **Secure tag**（`tagValues/<数値ID>`）は ORG スコープの permanent ID で別 ORG には存在しない。そのまま渡すと `rules create` が `Could not fetch resource:` で失敗する。`config steps.network_firewall.secure_tag_map` に src→dst の tagValues を登録すると変換して複製。未登録タグを参照するルールは FW を意図せず緩めないようエラーにせずスキップし WARNING を出す。
+
+2. **gce_restore (Step 5)**: 期限内スナップショットから dst にディスクを復元 → boot disk を差し替え → **どの VM も一旦 RUNNING で残す**（OS 状態・データごと復元）
    - 並列化: `_replicate_host_networks()` の後、(project, vm) のフラット work unit に展開し VM 単位で並列復元（`parallel_jobs=8` 推奨）。VM 内の操作チェーン (stop → detach → delete → create disk → attach → start → secondary disks) は依存があるため直列。
    - snapshot 未検出時の挙動: 並列モードで `sys.exit(1)` すると他 VM の進行を巻き添えで止めるため、`stats.failed` に記録して return する（最終的に `main()` で exit 1）。
 
@@ -133,22 +145,17 @@
    - **SUSPENDED 目標**: `_try_dst_suspend` が `subprocess` を直接呼び、失敗しても `stats.failed` を増やさない（run 全体の exit code に影響させない）。失敗時は WARNING + 手動復旧コマンド (`gcloud compute instances suspend <name> --zone=<zone> --project=<dst>`) を案内するだけ。
    - **transient / 未対応 OS**: suspend 非対応構成（GPU/TPU 付き、Confidential VM、メモリ 208GB 超、CSEK 付きディスク、未設定の Debian 8/9/Windows）は WARNING のみで RUNNING のまま残る。
    - **並列**: pending リストを `_parallel_for_each` で `parallel_jobs` 並列実行。
-3. **data_sync**:
+3. **data_sync (Step 6)**:
    - GCS: リネーム後バケットへ `gcloud storage rsync` で同期
    - BigQuery: src の location を継承してデータセット作成 → コピー
-4. **Network Firewall (Step 4.5)**: host の FW rules / policies を `gcloud` で冪等複製（Terraform で表現しきれない部分の補完）。実際のコード上は Step 4 (terraform_apply) の直後・Step 5 (gce_restore) の前に走る。
-   - **冒頭で `_replicate_host_networks()` を呼び、dst host の Shared VPC ネットワーク (例: `shared-vpc`) と subnet を src host と同型に複製**する。FW rule / FW policy association は `--network=<NAME>` を要求するため、これが無いと `Could not fetch resource: 'projects/<dst_host>/global/networks/<name>' was not found` で全 FW 操作が失敗する。冪等 (`_gcloud_exists` ガード) で、Step 5 から再度呼ばれても describe のみ。
-   - 防御的に `_sync_classic_firewall_rules` は参照される dst network を一括 pre-flight チェック、`_sync_fw_policy_associations` は assoc 単位で existence チェックし、未存在の network を参照する rule/assoc は cryptic な API エラーを量産せず skip + WARNING に倒す。
-   - `network-firewall-policies` のサブコマンドごとに scope flag が異なる: `list`=`--regions=`（複数形）/ `describe`・`create`=`--global`・`--region=`（ポリシー本体）/ `rules ...`・`associations create`=`--global-firewall-policy`・`--firewall-policy-region=`。誤ると `unrecognized arguments`。`fw_rule_scope_flag()` で変換する。
-   - `fw_policy_rule_flags()` は REST API の FirewallPolicyRule 全フィールドに対応する。INGRESS ルールは `srcIpRanges / srcThreatIntelligences / srcAddressGroups / srcFqdns / srcSecureTags / srcRegionCodes / srcNetworkScope` のいずれかが必須（gcloud 仕様）。欠落すると `Must specify src_... for ingress direction` / `Could not fetch resource:` で失敗する。
-   - **Secure tag**（`tagValues/<数値ID>`）は ORG スコープの permanent ID で別 ORG には存在しない。そのまま渡すと `rules create` が `Could not fetch resource:` で失敗する。`config steps.network_firewall.secure_tag_map` に src→dst の tagValues を登録すると変換して複製。未登録タグを参照するルールは FW を意図せず緩めないようエラーにせずスキップし WARNING を出す。
-5. `bulk_export.skip_on_run: true` の場合は export/customize をスキップし `terraform/active/` を再利用（再実行高速化）
-   - 判定は `terraform/active/<src>/.dst_project` マーカーが現 config の dst と一致するかで行う。一致すれば export と customize を**完全スキップ**、不一致でも `terraform/raw/` が残っていれば customize のみ再実行（bulk-export 自体は省略）。
-   - マーカーは `customize_hcl` 末尾と Step 4 の `_reset_stale_state_if_needed` の両方が書く（plan/run・skip_on_run 間で整合）。dry_run では `customize_hcl` が `.tf` を実書き出ししないためマーカーも更新しない（plan で書き出すと .tf と marker が乖離するため）。
-6. **VPC Service Controls (Step 7)**: 全データ移行の **最後** に、dst プロジェクト（番号）を既存ペリメタへ `--add-resources` で追記する（org / access policy 自体は触らない・冪等）。先に封じ込めると後続操作が境界で弾かれるため最後に実行する。
+4. **VPC Service Controls (Step 7)**: 全データ移行の **最後** に、dst プロジェクト（番号）を既存ペリメタへ `--add-resources` で追記する（org / access policy 自体は触らない・冪等）。先に封じ込めると後続操作が境界で弾かれるため最後に実行する。
    - **`steps.vpc_sc.billing_project` は必須・明示指定**。`gcloud access-context-manager perimeters describe/update` は org/policy スコープで `--project` を持たないため、quota project を明示しないとローカル `gcloud config` の `core/project`（移行と無関係なプロジェクト）が quota に使われ、そこで API 無効 → `accesscontextmanager.googleapis.com ... SERVICE_DISABLED` で失敗する。
    - **誤ったプロジェクトを自動推測しない**安全方針: `access_policy` / `perimeter` / `billing_project` のいずれかが未設定なら「設定不足」として skip + WARNING（host dst や先頭 dst へ勝手にフォールバックしない）。`billing_project` には dst ORG 内で API を有効化できるプロジェクト（通常は dst ホスト）を明示する。
    - ステップ冒頭で `billing_project` に `accesscontextmanager` API を有効化（冪等 / allow_fail）してから describe/update を `--billing-project=<billing_project>` 付きで実行する。describe には `--quiet` を付け、API 無効時の対話プロンプトでハングしないようにする。
+
+> 🔁 **`bulk_export.skip_on_run: true` の挙動**（実行順とは独立した最適化）
+> - `terraform/active/<src>/.dst_project` マーカーが現 config の dst と一致するかで判定。一致すれば export と customize を**完全スキップ**、不一致でも `terraform/raw/` が残っていれば customize のみ再実行（bulk-export 自体は省略）。
+> - マーカーは `customize_hcl` 末尾と Step 4 の `_reset_stale_state_if_needed` の両方が書く（plan/run・skip_on_run 間で整合）。dry_run では `customize_hcl` が `.tf` を実書き出ししないためマーカーも更新しない（plan で書き出すと .tf と marker が乖離するため）。
 
 ---
 
@@ -156,9 +163,11 @@
 
 **目的**: 何が起きたかを後から追えるようにする。失敗時の原因切り分けもここを起点に行う。
 
-- `logs/<timestamp>/org.log` / `dst.log` をレビュー
+- `logs/<timestamp>/{org,dst}.log` / `logs/<timestamp>/DIFF.md` をレビュー
   - ステップ単位 `━━━━` 区切り、`✓/+/−/✗` 記号、スレッドタグ `[main]` / `[cai-scan_0]`
   - `verbose_logging: true` で生コマンド + STDOUT を DEBUG レベルで記録
+- リポジトリ直下の `DIFF.md` は最新実行の `logs/<timestamp>/DIFF.md` への相対 symlink（`cat DIFF.md` で常に最新版）。実体は日付付きで残るため、過去実行と並べて差分を比較できる。
+- `logs/` は `.gitignore` 配下、`/DIFF.md`（symlink）も `.gitignore` に登録済み（fresh clone で dangling になるため）。
 
 ---
 
