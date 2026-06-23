@@ -41,15 +41,20 @@
 ### 1. インターフェース (Makefile)
 ユーザーは `make` コマンドを介してツールを実行する。
 
-- **`make projects`**: `dst/config.yaml` に基づき、コピー先（Destination）プロジェクト群を新規作成し、請求先アカウントの紐付けと必要なAPIの有効化を行います。
-- **`make plan`**: ドライランモードで実行計画（予定されるgcloud/terraformコマンドと日本語補足）を表示します。
+- **`make projects-plan` / `make projects`**: `dst/config.yaml` に基づき、コピー先（Destination）プロジェクト群を新規作成し、請求先アカウントの紐付けと必要なAPIの有効化を行います（`-plan` は dry-run）。
+- **`make bootstrap-plan` / `make bootstrap`**: dst SA 作成・dst SA への src 読取権限付与・Shared VPC 化を順に実行します（`-plan` は dry-run）。`make plan` の SA 事前チェックを通すための前提整備。
+- **`make plan`**: ドライランモードで実行計画（予定されるgcloud/terraformコマンドと日本語補足）を表示します。直後に `logs/<timestamp>/DIFF.md`（CAI ↔ bulk-export terraform 差分）も出力し、リポジトリ直下の `DIFF.md` を最新版への相対 symlink に張り替えます。
+- **`make mock`**: GCP 未接続で `sync_env.py` のフロー全体をシミュレートします。未対応コマンドは fail-closed で停止。
 - **`make run`**: コピー先プロジェクト群に対し、移行処理（スキャンからクローン同期まで）を本番実行します。
+- **`make delete-projects-plan PATTERN=...` / `make delete-projects PATTERN=...`**: `dst/config.yaml` に登録された dst プロジェクトを `PATTERN` で絞り込み、6 桁ランダムコード入力で確認のうえ削除します（lien も自動解除、`-plan` は表示のみ）。
 - **`make test`**: ツール全体の単体テストを実行します。
+
+> Makefile には他に `make org` / `make org-plan` / `make vmware-*` などのターゲットがあります。詳細は `README.md` を参照してください。
 
 ### 2. 実装要件
 
 #### 2.1. 言語・実行環境
-- Python 3.12以上、`uv`、PEP8準拠、`pytest` によるテスト。
+- Python 3.13 以上（`pyproject.toml` の `requires-python` と整合）、`uv`、PEP8準拠、`pytest` によるテスト。
 
 #### 2.2. 主要ロジック (Pythonスクリプト)
 
@@ -62,11 +67,12 @@
 5. `gcloud services enable` で必要なAPI（`compute.googleapis.com` など）を有効化する。
 
 ##### B. 環境複製コアオーケストレータ (scripts/sync_env.py)
-`scripts/sync_env.py` が一連のステップ（1〜7）を統合して実行するコアオーケストレータである。
+`scripts/sync_env.py` が一連のステップ（Step 1〜7、うち Step 4.5 と Step 5.5 はサブフェーズ）を統合して実行するコアオーケストレータである。
 
 1. **モック実行モード (Mock Mode)**:
-   - 設定ファイル (`global.mock: true`) またはコマンドライン引数 (`--mock`) が指定された場合、実際のGCP APIおよびTerraformの呼び出しをシミュレートする。
+   - コマンドライン引数 (`--mock`) または `global.mock: true` が指定された場合、実際のGCP APIおよびTerraformの呼び出しをシミュレートする。
    - `run_command` は、実際のコマンドを実行する代わりに、コマンドに応じたダミーデータ（VMリストJSON、スナップショットリストJSON、ダミーHCLファイルなど）を生成して返す。
+   - **未対応コマンドは fail-closed**（本物実行に進ませない）。新しい状態遷移コマンド（suspend/resume 等）を追加する際は `_WRITE_VERBS`（src 拒否リスト）と `_MOCK_KNOWN_PATTERNS`（mock 許容リスト）の両方への登録が必要。
    - これにより、実際のGCP環境や有効なサービスアカウントがない状態でも、`make run` 全体のフローをエラーなしでテスト実行可能にする。
 
 2. **[Step 1] CAI Scan (現状確認)**:
@@ -76,22 +82,41 @@
    - 最新のGCEスナップショット（デフォルトで30日以内）が存在するか検証し、なければエラーとする。
    - モックモード時は、ダミーのVMリストと最新のスナップショットリストをシミュレートし、常に検証成功とする。
 4. **[Step 3] Bulk Export & HCL Customization (コード化とカスタマイズ)**:
-   - `gcloud` の `bulk-export` を使用してTerraform HCLを生成。
+   - `gcloud beta resource-config bulk-export --resource-format=terraform` を使用してTerraform HCLを生成（`config-connector` 依存。事前チェックで存在検証）。
    - モックモード時は、ダミーの `.tf` ファイル群を自動生成する。
-   - 生成されたHCL内のプロジェクトIDの置換、GCSバケット名のリネーム、およびVMの `boot_disk.source` 行の削除を自動で行う。
+   - 生成されたHCL内のプロジェクトIDの置換、GCSバケット名のリネーム、同一プロジェクト内 network 参照の `self_link` 化、およびVMの `boot_disk.source` 行の削除を自動で行う。FW (`google_compute_firewall` 等) は Step 4.5 で `gcloud` 経由で複製するため、ここで除外する。
+   - `bulk_export.skip_on_run: true` のときは `terraform/active/<src>/.dst_project` マーカーが現 dst と一致すれば export/customize を完全スキップ、不一致でも `terraform/raw/` が残っていれば customize のみ再実行（bulk-export 自体は省略）。
 5. **[Step 4] Terraform Apply (IaC再現)**:
-   - カスタマイズされたTerraformコードを適用し、コピー先にインフラを再構築する。
+   - カスタマイズされたTerraformコードを適用し、コピー先に **VPC / subnet / Cloud Router / Cloud NAT** などのインフラを再構築する（FW rule / Firewall Policy は Step 4.5）。
+   - 冪等性: dst プロジェクト変更時は `terraform.tfstate` を破棄して import からやり直し（`.dst_project` マーカー判定）。`google_storage_bucket` はリネーム後の実名で import して adopt。
    - モックモード時は、適用成功をシミュレートする。
-6. **[Step 5] GCE VM Restore (スナップショットからのクローンVM復元)**:
-   - コピー先に作成されたダミーVMのディスクを一旦デタッチ・削除し、コピー元のスナップショットから復元した本物ディスクをアタッチして起動する。
+6. **[Step 4.5] Network Firewall (FW ルール / ポリシー複製)**:
+   - classic firewall ルールと Network Firewall Policy（rules / associations）を `gcloud` で冪等複製する独立フェーズ。実行順は Step 4 の直後・Step 5 の前。
+   - ステップ冒頭で `_replicate_host_networks()` を呼び、dst host の Shared VPC ネットワークと subnet を src host と同型に複製（`--network=<NAME>` 参照不可で全 FW 操作が失敗する regression の防止）。
+   - `network-firewall-policies` サブコマンドごとに scope flag が異なる（`list`=`--regions=`、`describe`/`create`=`--global` または `--region=`、`rules`/`associations`=`--global-firewall-policy` または `--firewall-policy-region=`）。`fw_rule_scope_flag()` で変換。
+   - secure tag (`tagValues/<数値ID>`) は ORG スコープの permanent ID。別 ORG にはそのまま存在しないため `config.steps.network_firewall.secure_tag_map` で `src → dst tagValues` 変換。未登録参照は FW を緩めないよう skip + WARNING。
+7. **[Step 5] GCE VM Restore (スナップショットからのクローンVM復元)**:
+   - コピー先に作成されたダミーVMのディスクを一旦デタッチ・削除し、コピー元のスナップショットから復元した本物ディスクをアタッチして起動する。src の電源状態に関わらず、復元直後は **必ず RUNNING で残す**。
+   - `(project, vm)` のフラット work unit で並列化（`parallel_jobs=8` 推奨）。同一 VM 内の `stop → detach → delete → create disk → attach → start → secondary disks` チェーンは API 競合回避のため直列。
    - モックモード時は、一連の `gcloud` コマンド（stop, detach, delete, create, attach, start）の成功をシミュレートする。
-7. **[Step 6] Data Sync (データ同期)**:
+8. **[Step 5.5] Power State Reconciliation (電源状態反映)**:
+   - 全 VM の復元完了後、`_finalize_vm_power_states` で src と同じ電源状態（`TERMINATED` / `SUSPENDED`）に揃える独立フェーズ。
+   - `config.steps.gce_restore.power_state_wait_seconds`（既定 120 秒）だけ sleep してから開始（GCE suspend は guest OS が ACPI S3 シグナルに 3 分以内に応答する必要があり、boot 直後は失敗しやすいため）。
+   - `TERMINATED` は `gcloud compute instances stop --quiet`（forceful fallback あり）。`SUSPENDED` は `_try_dst_suspend` が `subprocess` を直接呼び、失敗しても `stats.failed` に計上せず WARNING + 手動復旧コマンド案内（run 全体の exit code に影響させない）。
+   - `make plan` / `make mock` ではスキップ。
+9. **[Step 6] Data Sync (データ同期)**:
    - GCSバケットの同期（`gcloud storage rsync`）およびBigQueryデータセット・テーブルの同期を実行する。
+   - BigQuery データセットは **src の location を継承** して dst に作成（クロスリージョン失敗を回避）。
    - モックモード時は、バケット一覧やデータセット一覧の取得および同期コマンドの成功をシミュレートする。
-8. **[Step 7] VPC Service Controls (ペリメタ追加)**:
-   - 全データ移行の最後に、dst プロジェクト（番号）を既存の VPC SC ペリメタへ `--add-resources` で追記する（org / access policy 自体は作成・変更しない・冪等）。
-   - `access-context-manager` は org/policy スコープで `--project` を持たないため、quota project を `steps.vpc_sc.billing_project`（**必須・明示指定**）で与える。未指定だとローカル `gcloud config` の無関係なプロジェクトが quota に使われ `SERVICE_DISABLED` で失敗するため、安全側に倒して未設定ならスキップする（自動推測しない）。
-   - モックモード時は、ペリメタ describe / update / API 有効化コマンドの成功をシミュレートする。
+10. **[Step 7] VPC Service Controls (ペリメタ追加)**:
+    - 全データ移行の最後に、dst プロジェクト（番号）を既存の VPC SC ペリメタへ `--add-resources` で追記する（org / access policy 自体は作成・変更しない・冪等）。
+    - `access-context-manager` は org/policy スコープで `--project` を持たないため、quota project を `steps.vpc_sc.billing_project`（**必須・明示指定**）で与える。未指定だとローカル `gcloud config` の無関係なプロジェクトが quota に使われ `SERVICE_DISABLED` で失敗するため、安全側に倒して未設定ならスキップする（自動推測しない）。`load_config` の `validate_steps_config()` で `vpc_sc.enabled=true` かつ `access_policy` / `perimeter` / `billing_project` のいずれかが空ならば実行前に fail-fast。
+    - モックモード時は、ペリメタ describe / update / API 有効化コマンドの成功をシミュレートする。
+
+##### C. CAI ↔ Terraform 差分レポート (DIFF.md)
+- Step 3 の bulk-export 完了後（`make plan` / `make run` の双方）、CAI 検出リソースと bulk-export 由来 `.tf` を `analyze_cai_tf_diff()` で突合し、欠落リソースに dst 再現用 `gcloud` 作成系コマンドを併記したレポートを生成する。
+- 「**要手動**」（`bulk_export` が出すはずで欠落したもの）と「**自動処理・対象外**」（専用ステップ `gce_restore` / `network_firewall` / `data_sync` が複製、または `_ASSET_COVERAGE` で `None` 指定の意図的対象外）を区別し、後者は件数のみ集計して本文に列挙しない。
+- 実体は `logs/<timestamp>/DIFF.md`、リポジトリ直下の `DIFF.md` は最新実行への**相対 symlink** に張り替える（過去実行のレポートと並べて比較可能）。`.gitignore` 配下。
 
 ---
 
@@ -148,6 +173,10 @@ gcloud migration vms image-imports list --project=<project_id> --location=<regio
 
 ### 3. 安全対策と堅牢性 (べき等性の確保とログ記録)
 - **べき等性の維持**: すべてのステップでべき等チェックを徹底し、すでに完了している処理はスキップする。
-- **ログの分離**: コピー元の読み取り操作は `org.log`、コピー先への書き込み・変更操作は `dst.log` に記録する。
-- **サービスアカウント権限借用**: セキュリティのため静的キーは使用せず、`CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` 環境変数による動的権限借用を使用する。
+- **ログの分離**: コピー元の読み取り操作は `logs/<timestamp>/org.log`、コピー先への書き込み・変更操作は `logs/<timestamp>/dst.log` に記録する。CAI ↔ TF 差分レポート `DIFF.md` も同じ `logs/<timestamp>/` 配下に出力し、リポジトリ直下の `DIFF.md` は最新版への相対 symlink。
+- **ORG 保護のコード強制**: `side="src"` の外部コマンドは `is_src_read_only` ガードで書き込み動詞（`create / delete / update / stop / start / attach / detach / mk / cp / rsync / apply` 等）を **実行前に拒否**。impersonate の有無に関わらず常時有効。
+- **サービスアカウント権限借用 + ADC フォールバック**: 既定はサービスアカウントの権限借用（`CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` 経由）。`config.yaml` の `*_impersonate_service_account` が空の場合はローカル認証（gcloud のアクティブアカウント / ADC）にフォールバックする。
+  - ADC フォールバック時、`check_service_accounts` が `_SRC_DANGEROUS_PERMS`（Editor/Owner/各種 Admin の代表値）の有無を `testIamPermissions` で確認し、src プロジェクトへの書込権を持つ場合は対象プロジェクトと付与権限を一覧で警告して `[y/N]` で続行確認する。
+  - 非対話セッションは既定で abort。明示続行は `COPY_ALL_ENV_AUTO_APPROVE=1` を要求。
+- **実行前設定検証 (fail-fast)**: `load_config` が `validate_config()`（ORG 保護: src/dst マッピングの欠落・src=dst・dst が src ID と衝突 等）と `validate_steps_config()`（有効ステップの設定不備: `vpc_sc.access_policy/perimeter/billing_project`、`rename_rules.gcs.method/value`、`gce_snapshot.max_age_days` 等）の両方を実行し、不備を全件列挙して `exit 1`（dst へ一切書き込まずに停止）。`make plan` / `make run` / `make mock` 共通。
 
