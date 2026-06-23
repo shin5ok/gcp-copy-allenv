@@ -15,7 +15,7 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 ## 前提条件と環境セットアップ
 
 ### 1. ツール要件
-- **Python 3.12 以上**
+- **Python 3.13 以上**（`pyproject.toml` の `requires-python` に合わせる）
 - **`uv`**（Python パッケージ管理・仮想環境ツール）
   ```bash
   curl -sSf https://rye.astral.sh/get | bash   # または pipx install uv
@@ -45,6 +45,13 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > 検出すると全件を列挙して**即停止**します（Mock モードはスキップ）。dry-run（`make plan`）でも実行され、
 > dst SA の不備もこの段階で検出できます。
 > ⚠️ 検証する権限は有効ステップに対応する**代表値**であり、全リソース種を網羅するものではありません。
+>
+> 💡 **借用 SA 未指定時のフォールバック**: `*_impersonate_service_account` を空にするとローカル認証
+> （gcloud のアクティブアカウント / ADC）で続行します。SA 事前チェックは ADC 経路に切り替わり、
+> 認証主体が src プロジェクトに**書込相当の権限**を持っていれば、対象プロジェクトと付与権限を一覧で
+> 警告した上で `[y/N]` の続行確認を出します。非対話セッション（CI 等）はデフォルトで abort し、
+> 明示続行は `COPY_ALL_ENV_AUTO_APPROVE=1` を要求します。なお `side="src"` のコマンドに対する
+> 書込動詞拒否ガード (`is_src_read_only`) は impersonate / ADC のどちらでも常時有効です。
 - **Config Connector**（**必須**）: Step 3 の Terraform エクスポート
   (`gcloud beta resource-config bulk-export --resource-format=terraform`) が依存する gcloud コンポーネント。
   未インストールだと `make plan` / `make run` は前提チェックで**即停止**します（Mock モードを除く）。
@@ -116,7 +123,7 @@ cp dst/config.yaml.template dst/config.yaml
   （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に
   永続化され、`make plan` / `make run` / `skip_on_run` 間で同じ値が再利用されます
   （別名で作り直す場合はこのファイルを削除）。
-- **`steps`**: 各ステップ (1〜7) の有効/無効と個別設定（スナップショット期限など）。
+- **`steps`**: 各ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `data_sync` / `vpc_sc`) の有効/無効と個別設定（スナップショット期限など）。
   `bulk_export.skip_on_run: true` にすると本番実行 (`make run`) では export/customize を
   スキップし、`make plan` で生成済みの `terraform/active/` を再利用して高速化します
   （`make plan` 自体は常に最新を取り直します）。
@@ -198,9 +205,17 @@ make plan
 > 2. **GCE スナップショット検証** (`gce_snapshot`): 各 VM に期限内（既定 30 日）の有効なスナップショットがあるか確認。なければエラー。
 > 3. **Terraform コード生成** (`bulk_export`): Original リソースを HCL としてエクスポートし、プロジェクト ID 置換・GCS バケットのリネーム・同一プロジェクト内 network 参照の `self_link` 化・`boot_disk.source` 行の削除を実施。
 > 4. **インフラ再現** (`terraform_apply`): `terraform plan -out=tfplan` を生成（本番時のみ apply）。
-> 5. **VM データ復元** (`gce_restore`): スナップショットから復元したディスクの差し替え計画。
-> 6. **データ移行** (`data_sync`): GCS バケット（リネーム後）・BigQuery（location 継承）の同期計画。
-> 7. **VPC SC ペリメタ追加** (`vpc_sc`): 既存ペリメタへ dst プロジェクト（番号）を追記する計画。`billing_project` 未設定ならスキップ（後述）。
+> 5. **FW ルール / ポリシー複製** (`network_firewall`): classic firewall と Network Firewall Policy を dst host VPC に複製する計画（`secure_tag_map` 未登録の tagValues 参照は skip + WARNING）。
+> 6. **VM データ復元** (`gce_restore`): スナップショットから復元したディスクの差し替え計画。
+> 7. **データ移行** (`data_sync`): GCS バケット（リネーム後）・BigQuery（location 継承）の同期計画。
+> 8. **VPC SC ペリメタ追加** (`vpc_sc`): 既存ペリメタへ dst プロジェクト（番号）を追記する計画。`billing_project` 未設定ならスキップ（後述）。
+>
+> 📝 **差分レポート (`DIFF.md`)**: 上記完了後に **`logs/<タイムスタンプ>/DIFF.md`** を出力し、リポジトリ直下の `DIFF.md` を最新版への相対 symlink に張り替えます（実体は日付付きで残るので過去実行とも比較可能）。
+> CAI が検出した src リソースのうち、
+> - **要手動**: `bulk_export` が出すはずで欠落したもの（dst 再現用の `gcloud` 作成系コマンドを併記）
+> - **自動処理・対象外**: 専用ステップ（`gce_restore` / `network_firewall` / `data_sync`）が複製、または `_ASSET_COVERAGE` で `None` 指定の意図的対象外（件数のみ集計し詳細は出力しない）
+>
+> をプロジェクトごとに分けて列挙します。`make plan` 直後に `cat DIFF.md`（= 最新実行）を眺めて、自動再現されない欠落だけ手当てする運用です。
 
 ### Step 2: Mock モードでのローカル試走（任意）
 実際の GCP 環境や有効な SA がなくても、`make run` 全体のフローをエラーなく試走できます。
@@ -217,12 +232,13 @@ make run
 ```
 
 > 🚀 **クローンのメカニズム**
-> 1. コピー先ホストプロジェクトに、Terraform で VPC・サブネット・NAT・FW 等のインフラを再現。
-> 2. Original の有効なスナップショット（期限内）から、コピー先にディスクを復元。
-> 3. 復元したブートディスクを VM に差し替えて起動（OS 状態・データごと完全復元）。
-> 4. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
-> 5. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
-> 6. 全移行の最後に、dst プロジェクトを既存の VPC Service Controls ペリメタへ追加（`vpc_sc.billing_project` が必須。未設定ならスキップ）。
+> 1. コピー先ホストプロジェクトに、Terraform で VPC・サブネット・Cloud Router・Cloud NAT 等のインフラを再現（bulk-export の HCL を `terraform apply`）。
+> 2. classic firewall ルールと Network Firewall Policy は **Step 4.5 (`network_firewall`)** で `gcloud` 経由で複製（dst host VPC が Step 1 で出来ている前提。`secure_tag_map` で別 ORG の tagValues 変換、未登録参照は skip + WARNING）。
+> 3. Original の有効なスナップショット（期限内）から、コピー先にディスクを復元。
+> 4. 復元したブートディスクを VM に差し替えて起動（OS 状態・データごと完全復元）。電源状態（RUNNING / TERMINATED / SUSPENDED）は Step 5 最終フェーズでまとめて反映。
+> 5. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
+> 6. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
+> 7. 全移行の最後に、dst プロジェクトを既存の VPC Service Controls ペリメタへ追加（`vpc_sc.billing_project` が必須。未設定ならスキップ）。
 
 > ♻️ **Terraform 適用の冪等性**（再実行しても 409/404 で落ちないための仕組み）
 > - dst プロジェクトが前回と変わった場合、stale な `terraform.tfstate` を破棄して import からやり直します（`active/<src>/.dst_project` マーカーで判定）。
@@ -252,7 +268,7 @@ make run
 ## 🔍 ログ仕様（レビューしやすさ重視）
 
 実行のたびに **`logs/<タイムスタンプ>/` ディレクトリ** が新規作成され、その中に
-コピー元操作ログ `org.log` とコピー先操作ログ `dst.log` が分離して記録されます（追記による履歴累積はしません）。
+コピー元操作ログ `org.log` / コピー先操作ログ `dst.log` / 差分レポート `DIFF.md` が分離して記録されます（追記による履歴累積はしません）。
 
 - **日本語で記録**: 各操作の「実行内容」を日本語の補足説明付きで出力。
 - **ステップ単位でグループ化**: `━━━━` バーで `ステップ N: タイトル (対象 X 件)` を区切り表示。
@@ -260,11 +276,16 @@ make run
 - **スレッドタグ**: 並列実行時、各ログ行に `[main]` / `[cai-scan_0]` 等のタグが自動付与され、`grep` で追跡可能。
 - **末尾サマリ**: 実行時間 / 読取成功 / 書込成功 / スキップ / 失敗 / Mock 実行 / ログパスを出力。
 - **詳細ログ**: `verbose_logging: true` のとき、生の `gcloud` / `terraform` コマンド文字列と STDOUT を DEBUG レベルでファイルに記録（コンソールは INFO のみ）。
+- **`DIFF.md` の最新版**: リポジトリ直下の `DIFF.md` は `logs/<タイムスタンプ>/DIFF.md` への**相対 symlink**として張り替えられます。`cat DIFF.md` で常に最新の差分レポートを参照できます（実体は日付付きで保存され続けるので、過去実行とも比較可能）。
 
 ```bash
 # 直近の実行ログを確認
 ls -t logs/ | head -1
 tail -f logs/$(ls -t logs/ | head -1)/dst.log
+# 最新の差分レポート（symlink 経由）
+cat DIFF.md
+# 過去実行の差分レポートを直接見る
+ls -1 logs/*/DIFF.md
 ```
 
 ---
