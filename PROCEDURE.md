@@ -8,16 +8,41 @@
 
 ## 0. 事前準備（手動）
 
-**目的**: 「どこから何を、どこへ複製するか」を宣言し、必要な認証を準備する。
+**目的**: 「どこから何を、どこへ複製するか」を宣言し、必要な認証・データ・設定を揃える。
+ここが揃っていないと `make plan` の事前チェック (fail-fast) で停止し、dst には一切書き込まずに終わる。
 
-- `dst/config.yaml` を `dst/config.yaml.template` から複製
-  - `project_mapping`: src/dst プロジェクト ID、`host_project` + `service_projects`、`src_impersonate_service_account` / `dst_impersonate_service_account` を定義
-  - `rename_rules.gcs.value`: 固定文字列 or `"auto"`（日付ベース suffix `-dst-MMDDHHMM` を `terraform/.gcs_rename_value` に永続化）
-  - `steps`: 8 ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `data_sync` / `vpc_sc`) の有効/無効、`gce_snapshot` の期限（既定 30 日）、`bulk_export.skip_on_run`、`vpc_sc.billing_project`（**必須・明示指定**）等
-  - `bootstrap`: 組織 ID / フォルダ ID / 請求先アカウント
-- 実行ユーザーは `gcloud auth login` 済み、`roles/iam.serviceAccountTokenCreator` を保有
-- **src 側 SA**: `scripts/bootstrap_src_sa.sh --apply` で各 src プロジェクトに read-only SA を作成
+### 0a. 把握しておく情報（先に集める）
+| 情報 | 用途 / 反映先 |
+|---|---|
+| コピー元 (src) の全プロジェクト ID（host + svc） | `config.yaml: project_mapping.host_project.src` / `service_projects[].src` |
+| コピー先 (dst) の **組織 ID** (`organizations/<id>`) | `config.yaml: bootstrap.org_id` |
+| コピー先のフォルダ ID（任意） | `config.yaml: bootstrap.folder_id` |
+| **請求先アカウント ID** (`billingAccounts/<id>`) | `config.yaml: bootstrap.billing_account` |
+| 借用 SA メール（任意・推奨）src 用 / dst 用 | `config.yaml: project_mapping.*.{src,dst}_impersonate_service_account` |
+| VPC SC を使うなら access_policy / perimeter / billing_project | `config.yaml: steps.vpc_sc.*`（**全部必須**） |
+
+### 0b. ローカル環境
+- `gcloud auth login` 済みで、実行ユーザーが `roles/iam.serviceAccountTokenCreator` を持つ
+- `gcloud` / `bq` / `terraform` が PATH に通る（`bulk_export` を使うなら `gcloud components install config-connector`）
+- Python 3.13 以上 / `uv`
+
+### 0c. コピー元 (src) の準備
+- **read-only SA を各 src プロジェクトに作成**（借用 SA 経路を使う場合）:
+  - `scripts/bootstrap_src_sa.sh --apply` で一括投入
   - 付与: `roles/viewer` / `roles/cloudasset.viewer` / 実行ユーザーへ `roles/iam.serviceAccountTokenCreator`
+  - 借用 SA を空にした場合はローカル認証 (gcloud アクティブアカウント / ADC) にフォールバック。src 書込権を持っていれば事前チェックで警告 + 続行確認になる（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で明示許可）
+- **GCE VM の期限内スナップショット**（`gce_snapshot` 有効時の必須前提）:
+  - 移行対象の全 VM について `steps.gce_snapshot.max_age_days`（既定 30 日）以内のスナップショットが必要
+  - 不足していると **Step 2 `gce_snapshot` がエラー停止**（`make plan` でも検出）
+  - 手動作成: `gcloud compute disks snapshot <disk> --snapshot-names=<name> --zone=<zone> --project=<src>`
+  - `cai_scan` 結果と合わせて事前棚卸ししておくと、`make plan` 時の手戻りが減る
+
+### 0d. 設定ファイルの編集
+- `cp dst/config.yaml.template dst/config.yaml` してから 0a で集めた値を埋める:
+  - `project_mapping`: src/dst プロジェクト ID、`host_project` + `service_projects`、`*_impersonate_service_account`
+  - `rename_rules.gcs.value`: 固定文字列 or `"auto"`（日付ベース suffix `-dst-MMDDHHMM` を `terraform/.gcs_rename_value` に永続化）
+  - `steps`: 8 ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `data_sync` / `vpc_sc`) の有効/無効、`gce_snapshot.max_age_days`、`bulk_export.skip_on_run`、`vpc_sc.billing_project`（**必須・明示指定**）等
+  - `bootstrap`: 0a で集めた `org_id` / `folder_id` / `billing_account`
 
 ---
 

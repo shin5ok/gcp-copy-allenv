@@ -51,12 +51,33 @@
 
 > Makefile には他に `make org` / `make org-plan` / `make vmware-*` などのターゲットがあります。詳細は `README.md` を参照してください。
 
-### 2. 実装要件
+### 2. 実行前提条件 (Prerequisites)
 
-#### 2.1. 言語・実行環境
+ツール本体（`make plan` / `make run`）は起動時に `validate_config()` + `validate_steps_config()` + 前提チェック（CLI / SA）を **fail-fast** で実行する。不足があれば dst へ一切書き込まずに全件列挙して `exit 1`。
+
+詳細チェックリストは [`README.md`](./README.md)「0. 前提条件チェックリスト」/ [`PROCEDURE.md`](./PROCEDURE.md)「0. 事前準備（手動）」を正とする。本仕様書では検証対象と検証主体の対応のみ規定する。
+
+| カテゴリ | 必要な入力 / 状態 | 検証主体 |
+|---------|------------------|---------|
+| ローカル CLI | `gcloud` / `bq` / `terraform`、`bulk_export` 有効時は `gcloud components install config-connector` | 前提チェック（Mock はスキップ） |
+| 認証 | `gcloud auth login` 済み + 実行ユーザーに `roles/iam.serviceAccountTokenCreator` | SA 事前チェック |
+| src 借用 SA（推奨） | `roles/viewer` / `roles/cloudasset.viewer`（`scripts/bootstrap_src_sa.sh --apply` で各 src プロジェクトへ投入） | `gcloud auth print-access-token` + `testIamPermissions` で代表 read 権限を確認 |
+| src 借用 SA 未指定時 | ローカル認証 (gcloud アクティブアカウント / ADC) にフォールバック。src 書込権を持つ場合は警告 + `[y/N]` 続行確認（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で明示許可） | `_SRC_DANGEROUS_PERMS` を `testIamPermissions` で検査 |
+| GCE スナップショット | `gce_snapshot` 有効時、移行対象の全 VM に `steps.gce_snapshot.max_age_days`（既定 30 日）以内のスナップショットが必要 | Step 2 `gce_snapshot` で検証。無ければエラー停止し手動作成 (`gcloud compute disks snapshot ...`) を促す |
+| dst プロジェクト | `make projects` で新規作成（または既存を流用） | SA 事前チェック (`projects test-iam-permissions`) |
+| dst 借用 SA | `roles/editor` / `roles/storage.admin` / `roles/bigquery.admin`（`scripts/bootstrap_dst_sa.sh` で投入） | SA 事前チェックで write 権限を確認 |
+| 組織 / フォルダ / 請求先 ID | `bootstrap.org_id`（`organizations/<id>`）/ `bootstrap.folder_id`（任意）/ `bootstrap.billing_account`（`billingAccounts/<id>`） | `make projects` 実行時に利用 |
+| VPC SC 設定 | `vpc_sc.enabled=true` 時は `access_policy` / `perimeter` / `billing_project` 全て必須・明示指定 | `validate_steps_config()` で fail-fast |
+| GCS リネーム | `bulk_export` / `data_sync` 有効時、`rename_rules.gcs.method` ∈ `{suffix, prefix, custom}`、`suffix`/`prefix` は `value` 非空 | `validate_steps_config()` で fail-fast |
+
+---
+
+### 3. 実装要件
+
+#### 3.1. 言語・実行環境
 - Python 3.13 以上（`pyproject.toml` の `requires-python` と整合）、`uv`、PEP8準拠、`pytest` によるテスト。
 
-#### 2.2. 主要ロジック (Pythonスクリプト)
+#### 3.2. 主要ロジック (Pythonスクリプト)
 
 ##### A. プロジェクト作成 (scripts/create_projects.py)
 コピー先プロジェクトを自動作成し、ブートストラップ（初期化）を行う。
@@ -171,7 +192,7 @@ gcloud migration vms image-imports list --project=<project_id> --location=<regio
 
 ---
 
-### 3. 安全対策と堅牢性 (べき等性の確保とログ記録)
+### 4. 安全対策と堅牢性 (べき等性の確保とログ記録)
 - **べき等性の維持**: すべてのステップでべき等チェックを徹底し、すでに完了している処理はスキップする。
 - **ログの分離**: コピー元の読み取り操作は `logs/<timestamp>/org.log`、コピー先への書き込み・変更操作は `logs/<timestamp>/dst.log` に記録する。CAI ↔ TF 差分レポート `DIFF.md` も同じ `logs/<timestamp>/` 配下に出力し、リポジトリ直下の `DIFF.md` は最新版への相対 symlink。
 - **ORG 保護のコード強制**: `side="src"` の外部コマンドは `is_src_read_only` ガードで書き込み動詞（`create / delete / update / stop / start / attach / detach / mk / cp / rsync / apply` 等）を **実行前に拒否**。impersonate の有無に関わらず常時有効。

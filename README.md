@@ -14,6 +14,44 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 
 ## 前提条件と環境セットアップ
 
+### 0. 前提条件チェックリスト
+
+`make plan` / `make run` を走らせる前に下記が**すべて満たされている**ことを確認してください。
+不足があると事前チェック (fail-fast) で停止します（dst への書き込みは発生しません）。詳細は後続の各セクション。
+
+#### A. ローカル環境
+- [ ] Python 3.13 以上 / `uv` がインストール済み
+- [ ] `gcloud` / `bq` / `terraform` が PATH に通っている
+- [ ] `bulk_export` を有効化する場合は `gcloud components install config-connector` 済み
+
+#### B. 認証
+- [ ] `gcloud auth login` で実行ユーザーがログイン済み
+- [ ] 実行ユーザーに `roles/iam.serviceAccountTokenCreator`（SA 借用権限）を付与済み
+
+#### C. コピー元 (src) 側
+- [ ] 各 src プロジェクトの **プロジェクト ID** を把握している
+      （`config.yaml` の `project_mapping.host_project.src` / `service_projects[].src` に記入）
+- [ ] 各 src プロジェクトに **read-only SA** を作成済み
+      → `scripts/bootstrap_src_sa.sh --apply` で一括投入（`roles/viewer` + `roles/cloudasset.viewer` + 実行ユーザーへ `roles/iam.serviceAccountTokenCreator`）
+      ※ 借用 SA を使わずローカル認証で動かす場合は省略可（下記「借用 SA 未指定時のフォールバック」参照）
+- [ ] 移行対象の **全 GCE VM に期限内スナップショット**（既定 30 日以内）が存在
+      → 無いと Step 2 `gce_snapshot` がエラーで停止（`make plan` でも検出）
+      → 手動作成: `gcloud compute disks snapshot <disk> --snapshot-names=<name> --zone=<zone> --project=<src>`
+      → 期限は `config.yaml` の `steps.gce_snapshot.max_age_days` で変更可
+
+#### D. コピー先 (dst) 側
+- [ ] **組織 ID** (`organizations/<id>`) → `bootstrap.org_id`
+- [ ] **フォルダ ID** (任意) → `bootstrap.folder_id`
+- [ ] **請求先アカウント ID** (`billingAccounts/<id>`) → `bootstrap.billing_account`
+- [ ] dst プロジェクトは `make projects` で新規作成（または既存を使う）
+
+#### E. 設定ファイル
+- [ ] `dst/config.yaml` を `dst/config.yaml.template` から複製・編集済み
+- [ ] `vpc_sc.enabled=true` にする場合は `access_policy` / `perimeter` / `billing_project` を明示
+- [ ] `rename_rules.gcs.value` を `"auto"` または固定文字列に設定
+
+---
+
 ### 1. ツール要件
 - **Python 3.13 以上**（`pyproject.toml` の `requires-python` に合わせる）
 - **`uv`**（Python パッケージ管理・仮想環境ツール）
