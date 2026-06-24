@@ -75,7 +75,7 @@ PYTHONPATH=. uv run pytest
 ```
 
 ## 4. Location of Files
-- **Project Provisioner**: [scripts/create_projects.py](file:///usr/local/google/home/kawanos/repos/copy-all-env/scripts/create_projects.py)
-- **Unit Tests**: [tests/test_create_projects.py](file:///usr/local/google/home/kawanos/repos/copy-all-env/tests/test_create_projects.py)
-- **Orchestrator**: [scripts/sync_env.py](file:///usr/local/google/home/kawanos/repos/copy-all-env/scripts/sync_env.py)
-- **Makefile**: [Makefile](file:///usr/local/google/home/kawanos/repos/copy-all-env/Makefile)
+- **Project Provisioner**: [scripts/create_projects.py](../scripts/create_projects.py)
+- **Unit Tests**: [tests/test_create_projects.py](../tests/test_create_projects.py)
+- **Orchestrator**: [scripts/sync_env.py](../scripts/sync_env.py)
+- **Makefile**: [Makefile](../Makefile)
