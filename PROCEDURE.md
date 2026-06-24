@@ -198,20 +198,24 @@
 
 ## 7. `make delete-projects-plan PATTERN=...` → `make delete-projects PATTERN=...`（任意・クリーンアップ）
 
-**目的**: 試行錯誤で作った dst プロジェクト群を一括で片付ける。src は対象外（コードレベルで母集団から除外）。
+**目的**: 試行錯誤で作った dst プロジェクト群を一括で片付ける。src は folder スコープ外なので対象に上がらない。
 
-### 削除対象の決定
-- 母集団は `dst/config.yaml` の `project_mapping.host_project.dst` と `service_projects[].dst` のみ。**config に無い無関係なプロジェクトは仕様上候補に上がらない**（誤爆防止のコア）。
-- `PATTERN` (3 文字以上必須) で母集団を project_id 部分一致でさらに絞り込む。
-- 各候補は `gcloud projects describe` で存在 / 状態を確認: `lifecycleState != ACTIVE` のものや describe 不可（存在しない / 権限不足）は自動でスキップし、理由付きで列挙。
+### 削除対象の決定（folder スコープ列挙）
+- 母集団は **`bootstrap.folder_id` 配下の ACTIVE プロジェクト**。`gcloud projects list --filter="parent.id=<folder_id> parent.type=folder lifecycleState:ACTIVE"` で実機列挙する。
+- `folder_id` が config に無い場合は起動時に **fail-fast**（org root 全体を対象にしない安全方針）。`ARGS="--folder-id <id>"` で一時上書き可。
+- **config (`project_mapping.*.dst`) は kind(host/svc) と src の cross-reference 用にだけ使う**。母集団ではない。これにより `dst/config.yaml` を別の dst に書き換えた後でも、folder に残っている過去の dst を削除できる（旧仕様の regression: config 改変前の dst が消せなくなる問題への対策）。
+- `PATTERN` (3 文字以上必須) で folder 列挙結果を project_id 部分一致で絞り込む。
+- **PATTERN にマッチしないプロジェクトは出力しない**（folder 内の他用途プロジェクトをスキップ理由付きで列挙する仕様は廃止。出力ノイズ抑制のため。0 件時は「削除対象は 0 件です」の 1 行のみ）。
+- 状態フィルタは gcloud 側 (`lifecycleState:ACTIVE`) + defense-in-depth でクライアント側でも再チェック。
 
 ### 多重安全策
-1. **`PATTERN` 必須・3 文字未満は拒否**（make ターゲット側でも未指定なら即エラー）
-2. **削除前に一覧テーブル**を出力: `# / kind(host|svc) / project_id (dst) / name / state / lien 数 / src project` を桁揃え
-3. **6 桁ランダムコード**を端末に表示。**標準入力で一致するまで削除は実行されない**（一致しなければ exit 1 で中止）
-4. lien (`compute.googleapis.com/projects-delete-prevented` 等) が付いていれば `gcloud alpha resource-manager liens delete` で先に解除してから `gcloud projects delete --quiet`
-5. 既定は `--dry-run`（make ターゲット側で `--no-dry-run` を付与）。`delete-projects-plan` は dry-run 固定で表示のみ
-6. 並列度は `global.parallel_jobs`（既定 8）。worker 内で `sys.exit` せず、`threading.Lock` で success/fail カウンタを保護（他 worker を巻き添えで止めない）
+1. **folder スコープ必須**: `folder_id` 未設定なら起動時 exit 2。org root 全体や任意プロジェクトを対象にできない構造。
+2. **`PATTERN` 必須・3 文字未満は拒否**（make ターゲット側でも未指定なら即エラー）。
+3. **削除前に一覧テーブル**を出力: `# / kind(host|svc|-) / project_id (dst) / name / state / lien 数 / src project / in_cfg(yes|no)` を桁揃え。`in_cfg=no` は「folder にあるが config に未登録」(過去の dst 等) の明示マーカー。
+4. **6 桁ランダムコード**を端末に表示。**標準入力で一致するまで削除は実行されない**（一致しなければ exit 1 で中止）。
+5. lien (`compute.googleapis.com/projects-delete-prevented` 等) が付いていれば `gcloud alpha resource-manager liens delete` で先に解除してから `gcloud projects delete --quiet`。
+6. 既定は `--dry-run`（make ターゲット側で `--no-dry-run` を付与）。`delete-projects-plan` は dry-run 固定で表示のみ。
+7. 並列度は `global.parallel_jobs`（既定 8）。worker 内で `sys.exit` せず、`threading.Lock` で success/fail カウンタを保護（他 worker を巻き添えで止めない）。
 
 ### ログ
 - `logs/<timestamp>_delete-projects/dst.log` に独立出力（`create-projects` と同じ書式）

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""copy-all-env が作成した dst プロジェクトのみを対象に一括削除する。
+"""copy-all-env が作成した dst プロジェクトを folder スコープで一括削除する。
 
 削除対象の決定:
-- `--config` (既定 `dst/config.yaml`) の `project_mapping.host_project.dst` と
-  `project_mapping.service_projects[].dst` を母集団とする。
-- `--pattern` でその母集団をさらに project_id 部分一致で絞り込む（3 文字以上必須）。
-- このため、config に無い「他人のプロジェクト」「無関係なプロジェクト」は誤って消えない。
+- `bootstrap.folder_id` (または `--folder-id`) 配下の **ACTIVE プロジェクトを `gcloud projects list` で実機列挙**。
+  config を母集団にすると、config を別の dst に書き換えた後に「過去の dst」を削除できなくなるため。
+- `--pattern` でその列挙結果を project_id 部分一致で絞り込む（3 文字以上必須）。
+- config の `project_mapping.*.dst` は **kind(host/svc) と src の cross-reference 用** にのみ使う
+  （config に無い「config から外れた過去の dst」もテーブルに "-" 付きで表示し削除候補に上げる）。
 
-安全策:
-- パターンは 3 文字以上必須（誤爆防止）
-- `--no-dry-run` 時は 6 桁ランダムコードを端末に表示し、ユーザー入力と一致しないと進まない
-- lien が付いている場合は先に削除してから `projects delete` を行う
-- 削除前に対象一覧をテーブル形式で出力（src→dst 対応・lien 数・状態）
+安全策（多層）:
+- folder_id 必須。未設定なら起動時 fail-fast（org root 全体を対象にしない）。
+- パターンは 3 文字以上必須（誤爆防止）。
+- `--no-dry-run` 時は 6 桁ランダムコードを端末に表示し、ユーザー入力と一致しないと進まない。
+- lien が付いている場合は先に削除してから `projects delete` を行う。
+- 削除前に対象一覧をテーブル形式で出力（kind/src→dst 対応・lien 数・状態・config 内か）。
 
 ログは scripts/create_projects.py と揃え、logs/<ts>_delete-projects/dst.log に書く。
 """
@@ -73,16 +75,30 @@ def _gen_confirmation_code() -> str:
     return "".join(secrets.choice(string.digits) for _ in range(6))
 
 
-def _collect_dst_entries(config: Dict[str, Any]) -> List[Dict[str, str]]:
+def _collect_config_dst_map(config: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    """config の dst → {kind, src} の cross-reference 辞書を作る。
+
+    削除対象の母集団ではない（folder 列挙が母集団）。テーブル表示で kind/src を埋めるためだけに使う。
+    """
     mapping = config.get("project_mapping", {}) or {}
-    out: List[Dict[str, str]] = []
+    out: Dict[str, Dict[str, str]] = {}
     host = mapping.get("host_project", {}) or {}
     if isinstance(host, dict) and host.get("dst"):
-        out.append({"kind": "host", "dst": host["dst"], "src": host.get("src", "")})
+        out[host["dst"]] = {"kind": "host", "src": host.get("src", "")}
     for svc in mapping.get("service_projects", []) or []:
         if isinstance(svc, dict) and svc.get("dst"):
-            out.append({"kind": "svc", "dst": svc["dst"], "src": svc.get("src", "")})
+            out[svc["dst"]] = {"kind": "svc", "src": svc.get("src", "")}
     return out
+
+
+def _resolve_folder_id(config: Dict[str, Any], override: Optional[str]) -> Optional[str]:
+    if override:
+        return str(override).strip() or None
+    fid = (config.get("bootstrap", {}) or {}).get("folder_id")
+    if fid is None:
+        return None
+    s = str(fid).strip()
+    return s or None
 
 
 class ProjectDeleter:
@@ -94,6 +110,7 @@ class ProjectDeleter:
         verbose: bool = True,
         yes_code: Optional[str] = None,
         stdin=sys.stdin,
+        folder_id_override: Optional[str] = None,
     ):
         self.pattern = pattern
         self.dry_run = dry_run
@@ -101,8 +118,10 @@ class ProjectDeleter:
         self.verbose = verbose
         self.yes_code = yes_code
         self.stdin = stdin
+        self.folder_id_override = folder_id_override
 
         self.config: Dict[str, Any] = {}
+        self.folder_id: str = ""
         self.logger: Optional[logging.Logger] = None
         self.run_dir: str = ""
         self.parallel_jobs: int = 8
@@ -160,20 +179,34 @@ class ProjectDeleter:
             self.logger.error(f"{tag}✗ 失敗 (exit={res.returncode}) {res.stderr.strip()}")
         return res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip()
 
-    def _describe_project(self, pid: str) -> Optional[Dict[str, Any]]:
+    def _list_projects_in_folder(self, folder_id: str) -> List[Dict[str, Any]]:
+        """folder 配下の ACTIVE プロジェクトを実機列挙する（read-only）。
+
+        `parent.id=<folder_id> parent.type=folder` で direct children のみ取得。
+        ネストした sub-folder 配下は対象外（誤爆抑制）。
+        """
         rc, out, err = self._run(
-            ["gcloud", "projects", "describe", pid, "--format=json"],
-            desc=f"describe:{pid}",
-            explanation=f"{pid} の存在 / 状態を確認",
+            [
+                "gcloud", "projects", "list",
+                f"--filter=parent.id={folder_id} parent.type=folder lifecycleState:ACTIVE",
+                "--format=json",
+            ],
+            desc=f"list-folder:{folder_id}",
+            explanation=f"folder {folder_id} 配下の ACTIVE プロジェクトを列挙",
             allow_fail=True,
             read_only=True,
         )
         if rc != 0:
-            return None
+            self.logger.error(f"folder {folder_id} 配下のプロジェクト一覧取得に失敗: {err}")
+            return []
         try:
-            return json.loads(out) if out else None
+            data = json.loads(out) if out else []
         except json.JSONDecodeError:
-            return None
+            self.logger.error(f"folder {folder_id} のレスポンス JSON パース失敗: {out[:200]}")
+            return []
+        if not isinstance(data, list):
+            return []
+        return [p for p in data if isinstance(p, dict) and p.get("projectId")]
 
     def _list_liens(self, project_id: str) -> List[str]:
         for track in ("alpha", "beta"):
@@ -240,20 +273,21 @@ class ProjectDeleter:
     def _print_table(
         self,
         rows: List[Dict[str, Any]],
-        total_config: int,
+        total_folder: int,
     ) -> None:
-        headers = ["#", "kind", "project_id (dst)", "name", "state", "lien", "src project"]
+        headers = ["#", "kind", "project_id (dst)", "name", "state", "lien", "src project", "in_cfg"]
         widths = [len(h) for h in headers]
         body: List[List[str]] = []
         for i, r in enumerate(rows, 1):
             body.append([
                 str(i),
-                r["kind"],
+                r.get("kind", "-") or "-",
                 r["dst"],
                 r.get("name", "") or "",
                 r.get("state", "") or "",
                 str(r.get("liens_count", 0)),
-                r.get("src", "") or "",
+                r.get("src", "") or "-",
+                "yes" if r.get("in_config") else "no",
             ])
         for row in body:
             for i, cell in enumerate(row):
@@ -268,12 +302,13 @@ class ProjectDeleter:
                     parts.append(c.ljust(widths[i]))
             return "  " + " | ".join(parts)
 
-        bar = "━" * 78
+        bar = "━" * 88
         self.logger.info("")
         self.logger.info(bar)
-        self.logger.info(f"  削除対象プロジェクト ({len(rows)} 件 / config dst {total_config} 件中)")
-        self.logger.info(f"  config  = {self.config_path}")
-        self.logger.info(f"  pattern = '{self.pattern}'")
+        self.logger.info(f"  削除対象プロジェクト ({len(rows)} 件 / folder {self.folder_id} 配下 {total_folder} 件中)")
+        self.logger.info(f"  config    = {self.config_path}")
+        self.logger.info(f"  folder_id = {self.folder_id}")
+        self.logger.info(f"  pattern   = '{self.pattern}'")
         self.logger.info(bar)
         self.logger.info(fmt(headers))
         self.logger.info("  " + "-+-".join("-" * w for w in widths))
@@ -313,7 +348,7 @@ class ProjectDeleter:
         if not os.path.exists(self.config_path):
             print(
                 f"ERROR: config が見つかりません: {self.config_path}\n"
-                "  copy-all-env が作成した dst プロジェクト一覧を取得するため config が必須です。",
+                "  log_dir / parallel_jobs / kind・src の cross-reference のため config が必要です。",
                 file=sys.stderr,
             )
             return 2
@@ -323,68 +358,64 @@ class ProjectDeleter:
             print(f"ERROR: config 読み込み失敗: {e}", file=sys.stderr)
             return 2
 
-        all_dst = _collect_dst_entries(self.config)
-        if not all_dst:
+        folder_id = _resolve_folder_id(self.config, self.folder_id_override)
+        if not folder_id:
             print(
-                f"ERROR: config の project_mapping に dst が定義されていません: {self.config_path}",
+                "ERROR: folder_id が設定されていません。\n"
+                "  delete-projects は folder 配下の ACTIVE プロジェクトを実機列挙して削除候補にします。\n"
+                "  config の bootstrap.folder_id を設定するか、--folder-id <id> を指定してください。\n"
+                "  （org root 全体を対象にする運用は安全のため受け付けません）",
                 file=sys.stderr,
             )
             return 2
+        self.folder_id = folder_id
+
+        config_map = _collect_config_dst_map(self.config)
 
         self._setup()
         self.logger.info("=" * 60)
         self.logger.info(" copy-all-env  delete-projects  開始")
         self.logger.info("=" * 60)
         self.logger.info(f"  config       = {self.config_path}")
+        self.logger.info(f"  folder_id    = {self.folder_id}")
         self.logger.info(f"  pattern      = '{self.pattern}'")
-        self.logger.info(f"  config dst   = {len(all_dst)} 件")
+        self.logger.info(f"  config dst   = {len(config_map)} 件 (cross-reference のみ)")
         self.logger.info(f"  dry_run      = {self.dry_run}")
         self.logger.info(f"  parallel     = {self.parallel_jobs}")
         self.logger.info(f"  ログ         = {self.run_dir}")
 
-        candidates = [e for e in all_dst if self.pattern in e["dst"]]
-        skipped_no_match = [e for e in all_dst if self.pattern not in e["dst"]]
+        folder_projects = self._list_projects_in_folder(self.folder_id)
+        active_in_folder = [
+            p for p in folder_projects if p.get("lifecycleState", "ACTIVE") == "ACTIVE"
+        ]
+        candidates = [p for p in active_in_folder if self.pattern in p.get("projectId", "")]
 
         rows: List[Dict[str, Any]] = []
-        skipped: List[Tuple[str, str]] = [(e["dst"], "pattern に一致しません") for e in skipped_no_match]
 
-        for e in candidates:
-            pid = e["dst"]
-            desc = self._describe_project(pid)
-            if desc is None:
-                skipped.append((pid, "存在しない / アクセス不可"))
-                continue
-            state = desc.get("lifecycleState", "ACTIVE")
-            if state != "ACTIVE":
-                skipped.append((pid, f"lifecycleState={state}"))
-                continue
+        for p in candidates:
+            pid = p["projectId"]
+            conf = config_map.get(pid, {})
             liens = self._list_liens(pid)
             rows.append({
-                **e,
-                "name": desc.get("name", ""),
-                "state": state,
+                "dst": pid,
+                "kind": conf.get("kind", "-"),
+                "src": conf.get("src", "-"),
+                "name": p.get("name", ""),
+                "state": p.get("lifecycleState", "ACTIVE"),
                 "liens": liens,
                 "liens_count": len(liens),
+                "in_config": pid in config_map,
             })
 
         if not rows:
             self.logger.info("")
             self.logger.info(
-                f"削除対象は 0 件です（pattern '{self.pattern}' に一致する config dst が無い、"
-                "または既に削除済 / アクセス不可）。"
+                f"削除対象は 0 件です（folder {self.folder_id} 配下に pattern '{self.pattern}' "
+                "に一致する ACTIVE プロジェクトがありません）。"
             )
-            if skipped:
-                self.logger.info("内訳:")
-                for pid, reason in skipped:
-                    self.logger.info(f"  - {pid}  ({reason})")
             return 0
 
-        self._print_table(rows, total_config=len(all_dst))
-        if skipped:
-            self.logger.info("")
-            self.logger.info(f"スキップ ({len(skipped)} 件):")
-            for pid, reason in skipped:
-                self.logger.info(f"  - {pid}  ({reason})")
+        self._print_table(rows, total_folder=len(active_in_folder))
 
         if self.dry_run:
             self.logger.info("")
@@ -418,10 +449,14 @@ class ProjectDeleter:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="copy-all-env (dst/config.yaml) が作成した dst プロジェクトのみを 6 桁コード確認のうえ削除",
+        description=(
+            "bootstrap.folder_id 配下の ACTIVE プロジェクトを実機列挙し、"
+            "pattern マッチ + 6 桁コード確認のうえ削除する"
+        ),
     )
     parser.add_argument("--pattern", required=True, help=f"project_id 部分一致 ({MIN_PATTERN_LEN} 文字以上)")
-    parser.add_argument("--config", default="dst/config.yaml", help="dst 一覧 / log_dir / parallel_jobs を読む config")
+    parser.add_argument("--config", default="dst/config.yaml", help="folder_id / log_dir / parallel_jobs / kind・src cross-reference を読む config")
+    parser.add_argument("--folder-id", default=None, help="bootstrap.folder_id をオーバーライド（未指定なら config から取得）")
     parser.add_argument("--dry-run", action="store_true", default=True, help="一覧表示のみ (default)")
     parser.add_argument("--no-dry-run", action="store_false", dest="dry_run", help="実削除")
     parser.add_argument("--yes", default=None, help="対話コード入力の代替（表示コードと一致する必要あり）")
@@ -434,6 +469,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         config_path=args.config,
         verbose=args.verbose,
         yes_code=args.yes,
+        folder_id_override=args.folder_id,
     )
     return d.run()
 

@@ -182,7 +182,7 @@ cp dst/config.yaml.template dst/config.yaml
 | `make setup` | uv 仮想環境の同期・セットアップ |
 | `make projects-plan` | コピー先プロジェクト作成の **ドライラン** |
 | `make projects` | コピー先プロジェクトを実際に作成（請求紐付け + API 有効化） |
-| `make delete-projects-plan PATTERN=xxx` | `dst/config.yaml` の dst プロジェクトのうち `project_id` に `xxx` を含むものを **一覧表示のみ**（削除なし） |
+| `make delete-projects-plan PATTERN=xxx` | `bootstrap.folder_id` 配下の ACTIVE プロジェクトのうち `project_id` に `xxx` を含むものを **一覧表示のみ**（削除なし） |
 | `make delete-projects PATTERN=xxx` | 同上を **削除**（6 桁ランダムコードを端末に入力しないと進まない安全策つき。lien も自動解除） |
 | `make bootstrap-plan` | dst SA / src 読取権限 / Shared VPC を順に **ドライラン** で表示 |
 | `make bootstrap` | 上記 3 つを `--apply` で実行（dst と src(ORG) に IAM/構成を書き込み） |
@@ -197,12 +197,13 @@ cp dst/config.yaml.template dst/config.yaml
 各コマンドには `ARGS="..."` で追加の引数を渡せます（例: `make plan ARGS="--config path/to/config.yaml"`）。
 
 > 🗑️ **`make delete-projects` の安全策**
-> - **copy-all-env が作成したものしか消さない**: 削除対象は `dst/config.yaml` の `project_mapping.host_project.dst` と `project_mapping.service_projects[].dst` に登録されている dst プロジェクトに限定。config に無い無関係なプロジェクトは仕様上候補に上がりません。
-> - `PATTERN` 必須・3 文字未満は拒否。上記の dst 一覧をさらに project_id 部分一致で絞り込み、削除前にテーブル形式で一覧表示します（`# / kind(host|svc) / project_id / name / state / lien 数 / src project`）。
+> - **folder スコープに限定**: `bootstrap.folder_id` 配下の ACTIVE プロジェクトを `gcloud projects list --filter="parent.id=<folder_id> parent.type=folder lifecycleState:ACTIVE"` で**実機列挙**して母集団にする。`folder_id` 未設定なら起動時に fail-fast（org root 全体を対象にしない）。`ARGS="--folder-id <id>"` で一時的に上書き可。
+> - **config 改変後の旧 dst も削除可能**: 母集団は実機の folder 配下なので、`dst/config.yaml` を新しい dst に書き換えた後でも **folder に残っている過去の dst** を削除できる（config はテーブルの kind/src 補完用に使うのみ）。config に無い候補は `in_cfg=no` として表示される。
+> - `PATTERN` 必須・3 文字未満は拒否。folder 列挙結果をさらに project_id 部分一致で絞り込み、削除前にテーブル形式で一覧表示（`# / kind(host|svc|-) / project_id / name / state / lien 数 / src project / in_cfg`）。
+> - **PATTERN にマッチしないプロジェクトは出力しない**（folder 内の他用途プロジェクトをスキップ理由付きで列挙する仕様は廃止。ノイズ抑制のため）。
 > - 6 桁のランダムコードを端末に表示し、**そのコードを打鍵しない限り削除は実行されません**。
-> - lien (`compute.googleapis.com/projects-delete-prevented` 等) が付いていれば `gcloud alpha resource-manager liens delete` で先に解除してから `gcloud projects delete --quiet` を呼びます。
-> - `lifecycleState != ACTIVE` のものや、describe で確認できないもの（存在しない / 権限不足）は自動でスキップし、スキップ理由を一覧出力します。
-> - 既定は `--dry-run`（make ターゲット側で `--no-dry-run` を付与）。並列度は `dst/config.yaml` の `global.parallel_jobs`（既定 8）に従います。
+> - lien (`compute.googleapis.com/projects-delete-prevented` 等) が付いていれば `gcloud alpha resource-manager liens delete` で先に解除してから `gcloud projects delete --quiet` を呼ぶ。
+> - 既定は `--dry-run`（make ターゲット側で `--no-dry-run` を付与）。並列度は `dst/config.yaml` の `global.parallel_jobs`（既定 8）に従う。
 
 ---
 

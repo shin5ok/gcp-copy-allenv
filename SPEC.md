@@ -46,7 +46,7 @@
 - **`make plan`**: ドライランモードで実行計画（予定されるgcloud/terraformコマンドと日本語補足）を表示します。直後に `logs/<timestamp>/DIFF.md`（CAI ↔ bulk-export terraform 差分）も出力し、リポジトリ直下の `DIFF.md` を最新版への相対 symlink に張り替えます。
 - **`make mock`**: GCP 未接続で `sync_env.py` のフロー全体をシミュレートします。未対応コマンドは fail-closed で停止。
 - **`make run`**: コピー先プロジェクト群に対し、移行処理（スキャンからクローン同期まで）を本番実行します。
-- **`make delete-projects-plan PATTERN=...` / `make delete-projects PATTERN=...`**: `dst/config.yaml` に登録された dst プロジェクトを `PATTERN` で絞り込み、6 桁ランダムコード入力で確認のうえ削除します（lien も自動解除、`-plan` は表示のみ）。
+- **`make delete-projects-plan PATTERN=...` / `make delete-projects PATTERN=...`**: `bootstrap.folder_id` 配下の ACTIVE プロジェクトを `gcloud projects list` で実機列挙し、`PATTERN` (3 文字以上必須) で絞り込み、6 桁ランダムコード入力で確認のうえ削除します（lien も自動解除、`-plan` は表示のみ）。`folder_id` 未設定なら fail-fast。config は kind/src の cross-reference にのみ使うので、config を別の dst に書き換えた後でも folder 内の過去 dst を削除可能。
 - **`make test`**: ツール全体の単体テストを実行します。
 
 > Makefile には他に `make org` / `make org-plan` / `make vmware-*` などのターゲットがあります。詳細は `README.md` を参照してください。
