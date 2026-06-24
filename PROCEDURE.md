@@ -18,19 +18,25 @@
 | コピー先 (dst) の **組織 ID** (`organizations/<id>`) | `config.yaml: bootstrap.org_id` |
 | コピー先のフォルダ ID（任意） | `config.yaml: bootstrap.folder_id` |
 | **請求先アカウント ID** (`billingAccounts/<id>`) | `config.yaml: bootstrap.billing_account` |
-| 借用 SA メール（任意・推奨）src 用 / dst 用 | `config.yaml: project_mapping.*.{src,dst}_impersonate_service_account` |
+| 借用 SA メール（**両方オプション**。推奨: src=未指定 / dst=指定） | `config.yaml: project_mapping.*.{src,dst}_impersonate_service_account` |
 | VPC SC を使うなら access_policy / perimeter / billing_project | `config.yaml: steps.vpc_sc.*`（**全部必須**） |
 
 ### 0b. ローカル環境
-- `gcloud auth login` 済みで、実行ユーザーが `roles/iam.serviceAccountTokenCreator` を持つ
+- `gcloud auth login` 済み
+  - **dst を impersonate する場合**は、実行ユーザーが対象 dst SA に対して `roles/iam.serviceAccountTokenCreator` を持つこと
+  - src を impersonate しない（推奨）場合は src への tokenCreator は不要
 - `gcloud` / `bq` / `terraform` が PATH に通る（`bulk_export` を使うなら `gcloud components install config-connector`）
 - Python 3.13 以上 / `uv`
 
 ### 0c. コピー元 (src) の準備
-- **read-only SA を各 src プロジェクトに作成**（借用 SA 経路を使う場合）:
-  - `scripts/bootstrap_src_sa.sh --apply` で一括投入
+- **認証方針（推奨）**: `src_impersonate_service_account` は **空のまま**にし、実行ユーザー本人に
+  src の `roles/viewer`（+ `roles/cloudasset.viewer`）を付与してローカル認証で読む。
+  - 利点: src 側に SA を作らずに済み、src の IAM を書き換える必要が無い（最も安全）。
+  - src への書き込みはコード上 `is_src_read_only` ガードで impersonate の有無に関わらず常時禁止。
+  - 事前チェックで実行ユーザーに src 書込権が検出された場合は警告 + `[y/N]` 続行確認（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で明示許可）。
+- **impersonate 経路を使う場合のみ**: `scripts/bootstrap_src_sa.sh --apply` で read-only SA を各 src プロジェクトに作成
   - 付与: `roles/viewer` / `roles/cloudasset.viewer` / 実行ユーザーへ `roles/iam.serviceAccountTokenCreator`
-  - 借用 SA を空にした場合はローカル認証 (gcloud アクティブアカウント / ADC) にフォールバック。src 書込権を持っていれば事前チェックで警告 + 続行確認になる（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で明示許可）
+  - **このスクリプトの実行だけ src(ORG) への IAM 書き込みを伴う**ため、`sync_env.py` の ORG 保護とは意図的に分離した手動セットアップ用
 - **GCE VM の期限内スナップショット**（`gce_snapshot` 有効時の必須前提）:
   - 移行対象の全 VM について `steps.gce_snapshot.max_age_days`（既定 30 日）以内のスナップショットが必要
   - 不足していると **Step 2 `gce_snapshot` がエラー停止**（`make plan` でも検出）
@@ -39,7 +45,7 @@
 
 ### 0d. 設定ファイルの編集
 - `cp dst/config.yaml.template dst/config.yaml` してから 0a で集めた値を埋める:
-  - `project_mapping`: src/dst プロジェクト ID、`host_project` + `service_projects`、`*_impersonate_service_account`
+  - `project_mapping`: src/dst プロジェクト ID、`host_project` + `service_projects`、`*_impersonate_service_account`（両方オプション。**推奨は src=未指定 / dst=指定**）
   - `rename_rules.gcs.value`: 固定文字列 or `"auto"`（日付ベース suffix `-dst-MMDDHHMM` を `terraform/.gcs_rename_value` に永続化）
   - `steps`: 8 ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `data_sync` / `vpc_sc`) の有効/無効、`gce_snapshot.max_age_days`、`bulk_export.skip_on_run`、`vpc_sc.billing_project`（**必須・明示指定**）等
   - `bootstrap`: 0a で集めた `org_id` / `folder_id` / `billing_account`
@@ -220,3 +226,49 @@
 ### ログ
 - `logs/<timestamp>_delete-projects/dst.log` に独立出力（`create-projects` と同じ書式）
 - サマリ: `削除済 / lien 解除 / 失敗` 件数 + ログパス。1 件でも失敗で exit 1
+
+---
+
+## 8. `make vmware-*`（任意・VMware VMDK → GCE インポート）
+
+**目的**: VMware からエクスポートした VMDK を **Migrate to VMs API** でカスタムイメージ化し、指定構成の GCE インスタンスとして起動する。本体 (`dst/`) パイプラインとは独立した別ワークフローで、`vmware/config.yaml` を Single Source of Truth とする。`sync_env.py` を経由しないため `dst/config.yaml` / ORG 保護ガード (`is_src_read_only`) / SA 事前チェックは **適用されない**。
+
+### 8a. 事前準備（手動）
+- 対象 VMDK を GCS バケットへ配置（`source.disks[]` の `gcs_uri` で参照）
+- `gcloud auth login` 済み、対象 project に Compute / Storage / Migration / IAM 権限を持つアカウントで実行
+- `cp vmware/config.yaml.template vmware/config.yaml` してから以下を埋める:
+  - `global`: 出力先 project_id / region / zone / dry_run / ログ設定
+  - `source.disks[]`: VMDK の GCS URI（`boot: true` を 1 本、`boot: false` をデータディスクとして複数可）
+  - `image_import`: image 名 prefix、ライセンスタイプ（任意）、Migration host/target project 分離（任意）
+  - `instance`: machine_type / SA / labels / tags / metadata
+  - `network`: VPC / subnetwork（Shared VPC は `host_project` 指定）、内部 IP（予約 address 名 or 直接）、外部 IP 有無
+- 設定ファイル切替は `VMWARE_CONFIG=vmware/other.yaml`（例: `make vmware-setup-apply VMWARE_CONFIG=vmware/prod.yaml`）
+
+### 8b. `make vmware-setup` → `make vmware-setup-apply`
+**役割**: VMware import に必要な API・SA 権限・IP 予約を整える。冪等（既存リソースは describe のみ）。
+- 必要 API の有効化: `compute` / `storage` / `vmmigration` / `iam`
+- Migrate to VMs の TargetProject 登録
+- vmmigration SA に source bucket への `roles/storage.objectViewer` を付与
+- 内部固定 IP / 外部 static IP の予約
+
+### 8c. `make vmware-import` → `make vmware-import-apply`
+**役割**: VMDK をカスタムイメージ化する（非同期投入）。
+- `source.disks[]` の各 VMDK について `gcloud migration vms image-imports create` を発行
+  - `boot: true` は OS イメージ（OS 適応あり）
+  - `boot: false` は `--skip-os-adaptation` 付きでデータディスクとして
+- 完了確認は `gcloud migration vms image-imports describe` をポーリング（長時間化することあり）
+
+### 8d. `make vmware-start` → `make vmware-start-apply`
+**役割**: 出来上がったカスタムイメージから GCE インスタンスを起動する。
+- boot image から `gcloud compute instances create`（machine_type / SA / labels / tags / 内部 static IP / 外部 IP は config に従う）
+- データディスクがあれば対応イメージから `gcloud compute disks create` → `gcloud compute instances attach-disk`
+
+### 8e. `make vmware-all` / `make vmware-all-apply`
+**役割**: 8b → 8c → 8d を一気通貫で実行する。`-apply` の有無は個別ターゲットと同じ（`-apply` なし = dry-run、あり = `--apply`）。
+
+### 8f. `make vmware-clean`
+**役割**: `vmware/logs/` を削除（試行錯誤後のクリーンアップ用）。dry-run / apply の区別なし。
+
+### 8g. `dst/` パイプラインとの関係
+- VMware VMDK の出力先 project は `vmware/config.yaml` の `global.project_id` で完全独立に指定する。dst host / svc と同じ project を指定することも可能だが、リソース名やサブネット衝突に注意。
+- `image_import.target_project_host` / `target_project_name` で Migration host project と target project を分離可能（省略時は `global.project_id` を使用）。
