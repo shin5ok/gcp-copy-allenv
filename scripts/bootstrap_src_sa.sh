@@ -74,8 +74,11 @@ PY
 )"
 
 if [[ -z "${PAIRS}" ]]; then
-  echo "エラー: ${CONFIG} から src / src_impersonate_service_account を抽出できませんでした。" >&2
-  exit 1
+  echo "情報: ${CONFIG} に src_impersonate_service_account が指定されたエントリがありません。"
+  echo "       借用 SA は **オプション** で、未指定なら sync_env.py は gcloud アクティブアカウント / ADC に"
+  echo "       フォールバックします (src は read-only / is_src_read_only ガードが常時適用)。"
+  echo "       bootstrap で作る対象が無いためスキップします。"
+  exit 0
 fi
 
 echo "============================================================"

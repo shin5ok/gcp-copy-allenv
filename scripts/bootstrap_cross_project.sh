@@ -62,8 +62,11 @@ PY
 )"
 
 if [[ -z "${PAIRS}" ]]; then
-  echo "エラー: ${CONFIG} から src / dst SA を抽出できませんでした。" >&2
-  exit 1
+  echo "情報: ${CONFIG} に dst_impersonate_service_account が指定されたエントリがありません。"
+  echo "       借用 SA は **オプション** で、未指定なら sync_env.py は ADC (実行ユーザー) で src を読みます。"
+  echo "       その場合 dst SA への cross-project read 付与は不要 (実行ユーザー自身が src の Viewer 等を"
+  echo "       持つ前提)。bootstrap で付与する対象が無いためスキップします。"
+  exit 0
 fi
 
 echo "============================================================"

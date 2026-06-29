@@ -80,8 +80,10 @@ PY
 )"
 
 if [[ -z "${PAIRS}" ]]; then
-  echo "エラー: ${CONFIG} から dst / dst_impersonate_service_account を抽出できませんでした。" >&2
-  exit 1
+  echo "情報: ${CONFIG} に dst_impersonate_service_account が指定されたエントリがありません。"
+  echo "       借用 SA は **オプション** で、未指定なら sync_env.py は gcloud アクティブアカウント / ADC に"
+  echo "       フォールバックします (ADC 主体に編集権限が必要)。bootstrap で作る対象が無いためスキップします。"
+  exit 0
 fi
 
 echo "============================================================"
