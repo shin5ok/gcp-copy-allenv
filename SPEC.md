@@ -42,7 +42,7 @@
 ユーザーは `make` コマンドを介してツールを実行する。
 
 - **`make projects-plan` / `make projects`**: `dst/config.yaml` に基づき、コピー先（Destination）プロジェクト群を新規作成し、請求先アカウントの紐付けと必要なAPIの有効化を行います（`-plan` は dry-run）。
-- **`make bootstrap-plan` / `make bootstrap`**: dst SA 作成・dst SA への src 読取権限付与・Shared VPC 化を順に実行します（`-plan` は dry-run）。`make plan` の SA 事前チェックを通すための前提整備。
+- **`make bootstrap-plan` / `make bootstrap`**: dst SA 作成・dst SA への src 読取権限付与・Shared VPC 化を順に実行します（`-plan` は dry-run）。**ローカル認証なら Shared VPC 化（`make bootstrap-shared-vpc`）だけで十分**で、dst SA / src 読取権限は Impersonation を使う場合のみ必要です。
 - **`make plan`**: ドライランモードで実行計画（予定されるgcloud/terraformコマンドと日本語補足）を表示します。直後に `logs/<timestamp>/DIFF.md`（CAI ↔ bulk-export terraform 差分）も出力し、リポジトリ直下の `DIFF.md` を最新版への相対 symlink に張り替えます。
 - **`make mock`**: GCP 未接続で `sync_env.py` のフロー全体をシミュレートします。未対応コマンドは fail-closed で停止。
 - **`make run`**: コピー先プロジェクト群に対し、移行処理（スキャンからクローン同期まで）を本番実行します。
@@ -60,12 +60,12 @@
 | カテゴリ | 必要な入力 / 状態 | 検証主体 |
 |---------|------------------|---------|
 | ローカル CLI | `gcloud` / `bq` / `terraform`、`bulk_export` 有効時は `gcloud components install config-connector` | 前提チェック（Mock はスキップ） |
-| 認証 | `gcloud auth login` 済み + 実行ユーザーに `roles/iam.serviceAccountTokenCreator` | SA 事前チェック |
-| src 借用 SA（推奨） | `roles/viewer` / `roles/cloudasset.viewer`（`scripts/bootstrap_src_sa.sh --apply` で各 src プロジェクトへ投入） | `gcloud auth print-access-token` + `testIamPermissions` で代表 read 権限を確認 |
-| src 借用 SA 未指定時 | ローカル認証 (gcloud アクティブアカウント / ADC) にフォールバック。src 書込権を持つ場合は警告 + `[y/N]` 続行確認（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で明示許可） | `_SRC_DANGEROUS_PERMS` を `testIamPermissions` で検査 |
+| 認証 | `gcloud auth login` + `gcloud auth application-default login`（ADC）。Impersonation 利用時のみ実行ユーザーに対象 SA への `roles/iam.serviceAccountTokenCreator` | SA 事前チェック |
+| src ローカル認証（src を書き換えたくない場合のおすすめ） | `src_impersonate_service_account` を空にし、実行ユーザーに src の `roles/viewer`（既存読取権の流用可）。src 側に SA を作らず IAM も変更しない | ローカル認証 (gcloud アクティブアカウント / ADC) で読む。src 書込権検出時は警告 + `[y/N]` 続行確認（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1`。`_SRC_DANGEROUS_PERMS` を `testIamPermissions` で検査） |
+| src 借用 SA（オプション） | `roles/viewer` / `roles/cloudasset.viewer`（`scripts/bootstrap_src_sa.sh --apply` で各 src へ投入。**src への IAM 書き込みが発生**） | `gcloud auth print-access-token` + `testIamPermissions` で代表 read 権限を確認 |
 | GCE スナップショット | `gce_snapshot` 有効時、移行対象の全 VM に `steps.gce_snapshot.max_age_days`（既定 30 日）以内のスナップショットが必要 | Step 2 `gce_snapshot` で検証。無ければエラー停止し手動作成 (`gcloud compute disks snapshot ...`) を促す |
 | dst プロジェクト | `make projects` で新規作成（または既存を流用） | SA 事前チェック (`projects test-iam-permissions`) |
-| dst 借用 SA | `roles/editor` / `roles/storage.admin` / `roles/bigquery.admin`（`scripts/bootstrap_dst_sa.sh` で投入） | SA 事前チェックで write 権限を確認 |
+| dst 認証 | ローカル認証なら実行ユーザーに Editor 相当 + dst フォルダ/組織への書込。Impersonation（オプション）なら `roles/editor` / `roles/storage.admin` / `roles/bigquery.admin` の専用 SA（`scripts/bootstrap_dst_sa.sh` で投入） | SA 事前チェックで write 権限を確認 |
 | 組織 / フォルダ / 請求先 ID | `bootstrap.org_id`（`organizations/<id>`）/ `bootstrap.folder_id`（任意）/ `bootstrap.billing_account`（`billingAccounts/<id>`） | `make projects` 実行時に利用 |
 | VPC SC 設定 | `vpc_sc.enabled=true` 時は `access_policy` / `perimeter` / `billing_project` 全て必須・明示指定 | `validate_steps_config()` で fail-fast |
 | GCS リネーム | `bulk_export` / `data_sync` 有効時、`rename_rules.gcs.method` ∈ `{suffix, prefix, custom}`、`suffix`/`prefix` は `value` 非空 | `validate_steps_config()` で fail-fast |
@@ -196,7 +196,7 @@ gcloud migration vms image-imports list --project=<project_id> --location=<regio
 - **べき等性の維持**: すべてのステップでべき等チェックを徹底し、すでに完了している処理はスキップする。
 - **ログの分離**: コピー元の読み取り操作は `logs/<timestamp>/org.log`、コピー先への書き込み・変更操作は `logs/<timestamp>/dst.log` に記録する。CAI ↔ TF 差分レポート `DIFF.md` も同じ `logs/<timestamp>/` 配下に出力し、リポジトリ直下の `DIFF.md` は最新版への相対 symlink。
 - **ORG 保護のコード強制**: `side="src"` の外部コマンドは `is_src_read_only` ガードで書き込み動詞（`create / delete / update / stop / start / attach / detach / mk / cp / rsync / apply` 等）を **実行前に拒否**。impersonate の有無に関わらず常時有効。
-- **サービスアカウント権限借用 + ADC フォールバック**: 既定はサービスアカウントの権限借用（`CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` 経由）。`config.yaml` の `*_impersonate_service_account` が空の場合はローカル認証（gcloud のアクティブアカウント / ADC）にフォールバックする。
+- **認証（ローカル認証 / 権限借用）**: `config.yaml` の `*_impersonate_service_account` が空ならローカル認証（gcloud のアクティブアカウント / ADC）、SA を指定した場合は権限借用（`CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` 経由）で動作する。**src（オリジナル）を一切書き換えたくない場合は、src 側を空（ローカル認証）にして実行ユーザーの読取権限で読むのがおすすめ**（src に SA を作らず IAM も変更しない）。
   - ADC フォールバック時、`check_service_accounts` が `_SRC_DANGEROUS_PERMS`（Editor/Owner/各種 Admin の代表値）の有無を `testIamPermissions` で確認し、src プロジェクトへの書込権を持つ場合は対象プロジェクトと付与権限を一覧で警告して `[y/N]` で続行確認する。
   - 非対話セッションは既定で abort。明示続行は `COPY_ALL_ENV_AUTO_APPROVE=1` を要求。
 - **実行前設定検証 (fail-fast)**: `load_config` が `validate_config()`（ORG 保護: src/dst マッピングの欠落・src=dst・dst が src ID と衝突 等）と `validate_steps_config()`（有効ステップの設定不備: `vpc_sc.access_policy/perimeter/billing_project`、`rename_rules.gcs.method/value`、`gce_snapshot.max_age_days` 等）の両方を実行し、不備を全件列挙して `exit 1`（dst へ一切書き込まずに停止）。`make plan` / `make run` / `make mock` 共通。

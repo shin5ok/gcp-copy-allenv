@@ -18,25 +18,26 @@
 | コピー先 (dst) の **組織 ID** (`organizations/<id>`) | `config.yaml: bootstrap.org_id` |
 | コピー先のフォルダ ID（任意） | `config.yaml: bootstrap.folder_id` |
 | **請求先アカウント ID** (`billingAccounts/<id>`) | `config.yaml: bootstrap.billing_account` |
-| 借用 SA メール（**両方オプション**。推奨: src=未指定 / dst=指定） | `config.yaml: project_mapping.*.{src,dst}_impersonate_service_account` |
+| 借用 SA メール（**両方オプション**。src を書き換えたくない場合は src/dst とも未指定=ローカル認証がおすすめ） | `config.yaml: project_mapping.*.{src,dst}_impersonate_service_account` |
 | VPC SC を使うなら access_policy / perimeter / billing_project | `config.yaml: steps.vpc_sc.*`（**全部必須**） |
 
 ### 0b. ローカル環境
-- `gcloud auth login` 済み
-  - **dst を impersonate する場合**は、実行ユーザーが対象 dst SA に対して `roles/iam.serviceAccountTokenCreator` を持つこと
-  - src を impersonate しない（推奨）場合は src への tokenCreator は不要
+- `gcloud auth login` + `gcloud auth application-default login`（ADC）でログイン済み
+  - **Impersonation を使う場合のみ**、実行ユーザーが対象 SA に対して `roles/iam.serviceAccountTokenCreator` を持つこと
+  - ローカル認証（src/dst とも未指定）なら tokenCreator は不要
 - `gcloud` / `bq` / `terraform` が PATH に通る（`bulk_export` を使うなら `gcloud components install config-connector`）
 - Python 3.13 以上 / `uv`
 
 ### 0c. コピー元 (src) の準備
-- **認証方針（推奨）**: `src_impersonate_service_account` は **空のまま**にし、実行ユーザー本人に
-  src の `roles/viewer`（+ `roles/cloudasset.viewer`）を付与してローカル認証で読む。
-  - 利点: src 側に SA を作らずに済み、src の IAM を書き換える必要が無い（最も安全）。
+- **src を一切書き換えたくない場合のおすすめ（ローカル認証）**: `src_impersonate_service_account` は
+  **空のまま**にし、実行ユーザー本人に src の `roles/viewer`（+ `roles/cloudasset.viewer`）相当の
+  読取権限を用意する（既存の読取権限があればそれを流用）。
+  - 利点: src 側に SA を作らずに済み、src の IAM を書き換えずに読める。
   - src への書き込みはコード上 `is_src_read_only` ガードで impersonate の有無に関わらず常時禁止。
   - 事前チェックで実行ユーザーに src 書込権が検出された場合は警告 + `[y/N]` 続行確認（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で明示許可）。
-- **impersonate 経路を使う場合のみ**: `scripts/bootstrap_src_sa.sh --apply` で read-only SA を各 src プロジェクトに作成
+- **impersonate 経路を使う場合（オプション）**: `scripts/bootstrap_src_sa.sh --apply` で read-only SA を各 src プロジェクトに作成
   - 付与: `roles/viewer` / `roles/cloudasset.viewer` / 実行ユーザーへ `roles/iam.serviceAccountTokenCreator`
-  - **このスクリプトの実行だけ src(ORG) への IAM 書き込みを伴う**ため、`sync_env.py` の ORG 保護とは意図的に分離した手動セットアップ用
+  - **このスクリプトの実行は src(ORG) への IAM 書き込みを伴う**ため、src を一切変更したくない要件には不向き。`sync_env.py` の ORG 保護とは意図的に分離した手動セットアップ用
 - **GCE VM の期限内スナップショット**（`gce_snapshot` 有効時の必須前提）:
   - 移行対象の全 VM について `steps.gce_snapshot.max_age_days`（既定 30 日）以内のスナップショットが必要
   - 不足していると **Step 2 `gce_snapshot` がエラー停止**（`make plan` でも検出）
@@ -45,7 +46,7 @@
 
 ### 0d. 設定ファイルの編集
 - `cp dst/config.yaml.template dst/config.yaml` してから 0a で集めた値を埋める:
-  - `project_mapping`: src/dst プロジェクト ID、`host_project` + `service_projects`、`*_impersonate_service_account`（両方オプション。**推奨は src=未指定 / dst=指定**）
+  - `project_mapping`: src/dst プロジェクト ID、`host_project` + `service_projects`、`*_impersonate_service_account`（両方オプション。**src を書き換えたくない場合は src/dst とも未指定=ローカル認証がおすすめ**）
   - `rename_rules.gcs.value`: 固定文字列 or `"auto"`（日付ベース suffix `-dst-MMDDHHMM` を `terraform/.gcs_rename_value` に永続化）
   - `steps`: 8 ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `data_sync` / `vpc_sc`) の有効/無効、`gce_snapshot.max_age_days`、`bulk_export.skip_on_run`、`vpc_sc.billing_project`（**必須・明示指定**）等
   - `bootstrap`: 0a で集めた `org_id` / `folder_id` / `billing_account`
@@ -69,14 +70,18 @@
 
 3 スクリプトを順次実行。`bootstrap-plan` で内容確認 → `bootstrap` で適用（`projects*` と同じく裸 = 実適用 / `-plan` = dry-run）。
 
-### 2a. `bootstrap-dst-sa` (`scripts/bootstrap_dst_sa.sh`)
-**役割**: dst 側の書き込み用 SA を作る。以降の書き込みはすべてこの SA を impersonate して行う。
+> 💡 **ローカル認証（src を書き換えたくない場合のおすすめ）では 2c の Shared VPC 化だけで十分**。
+> 2a (dst SA) / 2b (src 読取権限) は Impersonation を使う場合にのみ必要なので、その場合は
+> `make bootstrap-shared-vpc` だけ実行すればよい。
+
+### 2a. `bootstrap-dst-sa` (`scripts/bootstrap_dst_sa.sh`) — Impersonation を使う場合のみ
+**役割**: dst 側の書き込み用 SA を作る。dst を借用する場合、以降の書き込みはこの SA を impersonate して行う（ローカル認証なら不要）。
 - 各 dst プロジェクトに dst SA を作成
 - 付与: `roles/editor` / `roles/storage.admin` / `roles/bigquery.admin`
 - 実行アカウントに `roles/iam.serviceAccountTokenCreator`（impersonate 用）
 
-### 2b. `bootstrap-cross-project` (`scripts/bootstrap_cross_project.sh`)
-**役割**: dst SA が src を「覗ける」ようにする。src への書き込み権限は与えない。
+### 2b. `bootstrap-cross-project` (`scripts/bootstrap_cross_project.sh`) — Impersonation を使う場合のみ
+**役割**: dst SA が src を「覗ける」ようにする。src への書き込み権限は与えない（ローカル認証なら不要）。
 - 各 src プロジェクトに read-only カスタムロール `migrationSrcReader` を作成（compute/GCS/BQ/CAI の read 権限のみ）
 - 対応する dst SA に `migrationSrcReader` + `roles/bigquery.dataViewer` を付与
 - **src(ORG) への read-only IAM 書き込み**を伴うため、`sync_env.py` の ORG 保護からは意図的に分離
@@ -112,7 +117,7 @@
   - その認証主体が **src プロジェクトに書込相当の権限を持っていれば**、対象プロジェクトと付与権限を一覧で警告し `[y/N]` で続行確認（非対話セッションは `COPY_ALL_ENV_AUTO_APPROVE=1` で明示許可した時のみ続行）
   - src 側のコマンド書込動詞拒否ガード (`is_src_read_only`) は impersonate の有無に関わらず常時有効
 
-### 計画ステップ（src は read-only、impersonate 経由）
+### 計画ステップ（src は read-only）
 1. **cai_scan**: Cloud Asset Inventory で src の有効リソース一覧を取得（「何が存在するか」のスナップショット）
 2. **gce_snapshot**: 各 VM に期限内（既定 30 日）の有効スナップショットがあるか検証（復元元の鮮度チェック）
 3. **bulk_export**: `gcloud beta resource-config bulk-export --resource-format=terraform` で HCL 出力（並列）

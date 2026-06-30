@@ -7,8 +7,10 @@
 GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行します。
 
 > 🔐 **このツールは Original（ORG）プロジェクトに一切書き込みを行いません。**
-> コード側で「src 操作は read-only のみ・書き込み動詞は実行前に拒否」を強制しています。借用 SA は推奨（未指定時はローカル認証へフォールバックし、src 書込権を持っていれば実行前に警告 + 続行確認）。
+> コード側で「src 操作は read-only のみ・書き込み動詞は実行前に拒否」を強制しています。認証は、src を一切書き換えたくない場合は **ローカル認証（実行ユーザー本人）がおすすめ**で、SA の権限借用はオプションです（src 書込権を持っていれば実行前に警告 + 続行確認）。
 > 詳細は後述の [ORG プロジェクト保護](#-org-プロジェクト保護) を参照してください。
+
+> 📚 **関連ドキュメント**: [PROCEDURE.md](./PROCEDURE.md)（推奨運用フロー）・[SPEC.md](./SPEC.md)（全体仕様）・[dst/SPEC.md](./dst/SPEC.md)（コピー先仕様）・[HISTORY.md](./HISTORY.md)（変更履歴）
 
 ---
 
@@ -25,15 +27,15 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 - [ ] `bulk_export` を有効化する場合は `gcloud components install config-connector` 済み
 
 #### B. 認証
-- [ ] `gcloud auth login` で実行ユーザーがログイン済み
-- [ ] 実行ユーザーに `roles/iam.serviceAccountTokenCreator`（SA 借用権限）を付与済み
+- [ ] `gcloud auth login` と `gcloud auth application-default login`（ADC）でログイン済み
+- [ ] （ローカル認証）実行ユーザーが src=読み取り / dst=フォルダ・組織への書き込み権限を保有
+- [ ] （Impersonation を使う場合のみ）対象 SA への `roles/iam.serviceAccountTokenCreator` を付与済み
 
 #### C. コピー元 (src) 側
 - [ ] 各 src プロジェクトの **プロジェクト ID** を把握している
       （`config.yaml` の `project_mapping.host_project.src` / `service_projects[].src` に記入）
-- [ ] 各 src プロジェクトに **read-only SA** を作成済み
-      → `scripts/bootstrap_src_sa.sh --apply` で一括投入（`roles/viewer` + `roles/cloudasset.viewer` + 実行ユーザーへ `roles/iam.serviceAccountTokenCreator`）
-      ※ 借用 SA を使わずローカル認証で動かす場合は省略可（下記「借用 SA 未指定時のフォールバック」参照）
+- [ ] 各 src プロジェクトに実行ユーザーの**読み取り権限**（`roles/viewer` 相当）を付与済み（ローカル認証）
+      → Impersonation を使う場合は `scripts/bootstrap_src_sa.sh --apply` で read-only SA を一括投入（`roles/viewer` + `roles/cloudasset.viewer` + 実行ユーザーへ `roles/iam.serviceAccountTokenCreator`）
 - [ ] 移行対象の **全 GCE VM に期限内スナップショット**（既定 30 日以内）が存在
       → 無いと Step 2 `gce_snapshot` がエラーで停止（`make plan` でも検出）
       → 手動作成: `gcloud compute disks snapshot <disk> --snapshot-names=<name> --zone=<zone> --project=<src>`
@@ -65,63 +67,61 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
   # 未導入の場合: https://developer.hashicorp.com/terraform/install
   ```
 - **`gcloud` / `bq`**（GCP CLI）
-
-> ✅ **config.yaml 検証（fail-fast）**: `make plan` / `make run` / `make mock` は開始時に `config.yaml` を検証します。
-> ① **ORG 保護**（src/dst マッピングの欠落・src=dst・ID 衝突 等）に加え、② **有効ステップの設定不備**を実行前に検出します。
-> 例: `vpc_sc.enabled=true` なのに `billing_project`（quota project・**必須**） / `access_policy` / `perimeter` が空、
-> `rename_rules.gcs.method` が `suffix|prefix|custom` 以外、`gce_snapshot.max_age_days` が非正の値、など。
-> 「このまま走らせると必ず失敗 / 黙ってスキップ」になる設定を `[設定不備]` として全件列挙し、**dst へ一切書き込まず即停止**します。
->
-> ✅ **前提チェック（fail-fast）**: 続けて、有効化された
-> ステップが必要とする CLI（`gcloud` / `terraform` / `bq` / `config-connector`）の存在を確認します。
-> 不足しているとステップ途中で `not found` になる前に**即停止**します（Mock モードはスキップ）。
->
-> ✅ **SA 事前チェック（fail-fast）**: CLI 確認に続けて、`config.yaml` の借用 SA を実行前に検証します。
-> ① `gcloud auth print-access-token` でアクセストークン発行を試み、**SA の実在**と実行ユーザーの
-> **借用権限（`roles/iam.serviceAccountTokenCreator`）** を確認、② `gcloud projects test-iam-permissions`
-> で対象プロジェクトの**代表権限**（src=読取 / dst=書込）の有無を確認します。借用不可・権限不足を
-> 検出すると全件を列挙して**即停止**します（Mock モードはスキップ）。dry-run（`make plan`）でも実行され、
-> dst SA の不備もこの段階で検出できます。
-> ⚠️ 検証する権限は有効ステップに対応する**代表値**であり、全リソース種を網羅するものではありません。
->
-> 💡 **借用 SA 未指定時のフォールバック**: `*_impersonate_service_account` を空にするとローカル認証
-> （gcloud のアクティブアカウント / ADC）で続行します（**src 側はこのフォールバックを推奨**）。
-> SA 事前チェックは ADC 経路に切り替わり、認証主体が src プロジェクトに**書込相当の権限**を
-> 持っていれば、対象プロジェクトと付与権限を一覧で警告した上で `[y/N]` の続行確認を出します。
-> 非対話セッション（CI 等）はデフォルトで abort し、明示続行は `COPY_ALL_ENV_AUTO_APPROVE=1` を
-> 要求します。なお `side="src"` のコマンドに対する書込動詞拒否ガード (`is_src_read_only`) は
-> impersonate / ADC のどちらでも常時有効です。
-- **Config Connector**（**必須**）: Step 3 の Terraform エクスポート
-  (`gcloud beta resource-config bulk-export --resource-format=terraform`) が依存する gcloud コンポーネント。
-  未インストールだと `make plan` / `make run` は前提チェックで**即停止**します（Mock モードを除く）。
+- **Config Connector**（`bulk_export` 有効時のみ**必須**）: Step 3 の `bulk-export` が依存する gcloud コンポーネント。
   ```bash
-  gcloud components install config-connector   # インストール
-  which config-connector                       # 確認（パスが返れば OK）
+  gcloud components install config-connector
   ```
-  > ℹ️ Config Connector は `bulk_export` ステップが有効な場合のみ必須です。`make mock` では実コマンドを叩かないためチェックをスキップします。
 
-### 2. GCP 認証と安全なアクセス設定（Impersonation）
-サービスアカウントキー (JSON) は使用しません。必要な範囲だけ
-**サービスアカウントの権限借用 (Impersonation)** を使います。
+> ✅ **実行前の自動チェック（fail-fast）**
+> `make plan` / `make run` / `make mock` は開始時に下記を検証し、不備があれば
+> **dst へ書き込まずに全件列挙して即停止**します（Mock は CLI / SA チェックをスキップ）。
+>
+> - **config.yaml 検証**: ORG 保護（src/dst マッピング欠落・`src=dst`・ID 衝突）と、有効ステップの
+>   設定不備（`vpc_sc` の `billing_project` / `access_policy` / `perimeter` 空、`rename_rules.gcs.method` 不正、
+>   `gce_snapshot.max_age_days` が非正 など）。
+> - **CLI 前提チェック**: 有効ステップが使う `gcloud` / `terraform` / `bq` / `config-connector` の存在。
+> - **SA 事前チェック**: 借用 SA の実在・借用可否と代表権限（src=読取 / dst=書込）。代表値の検証で、全リソース種は網羅しません。
+>
+> 💡 ローカル認証（`*_impersonate_service_account` が空）では SA チェックが ADC 経路に切り替わり、
+> src 書込権を検出すると警告 + 続行確認します（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1`）。詳細は §2 を参照。
 
-1. 実行ユーザーで gcloud にログイン
+### 2. GCP 認証
+サービスアカウントキー (JSON) は使用しません。認証方法は 2 つあります。
+**src（オリジナル）を一切書き換えたくない場合は、SA を使わないローカル認証がおすすめ**です。
+
+#### src を書き換えたくない場合のおすすめ: ローカル認証（実行ユーザー本人の権限で動かす）
+`config.yaml` の `*_impersonate_service_account` を **すべて空**にすると、ログイン中の
+実行ユーザー（および ADC）の権限で動作します。
+
+1. 事前に実行ユーザーへ権限を付与
+   - **コピー元 (src)**: 各 src プロジェクトに **読み取り専用**（`roles/viewer` 相当）。
+   - **コピー先 (dst)**: プロジェクト作成先の**フォルダ / 組織への書き込み**（プロジェクト作成）と、
+     各 dst プロジェクトの**リソース作成・編集**（Editor 相当）。
+2. gcloud と ADC の両方にログイン
    ```bash
    gcloud auth login
+   gcloud auth application-default login
    ```
-2. **コピー元 (src)**: 実行ユーザー本人に **`roles/viewer` 相当の読み取り権限**を付与し、
-   `src_impersonate_service_account` は **空のまま（未指定）を推奨**。
-   - 利点: src 側に SA を作る必要が無く、src の IAM を書き換えなくて済む（最も安全）。
-   - src への書き込みはコード上 `is_src_read_only` ガードで impersonate の有無に関わらず常時禁止。
-3. **コピー先 (dst)**: 大量のリソース作成・削除が走るため、**専用 SA を作成して
-   `dst_impersonate_service_account` に指定することを推奨**。
-   - 実行ユーザーに対象 dst SA への `roles/iam.serviceAccountTokenCreator` を付与（impersonate 用）。
-   - 個人権限と分離することで、本番運用での監査・最小権限化がしやすくなる。
+3. `src_impersonate_service_account` / `dst_impersonate_service_account` は空のままにする。
 
-> 💡 **「src を impersonate にしたい」場合の補足**
+> ✅ **利点**: src 側に SA を作らず、src の IAM を一切書き換えずに済みます
+> （オリジナルのプロジェクトを変更したくない要件に最適）。src への書き込みはコード上
+> `is_src_read_only` ガードで常時禁止です。
+
+#### オプション: サービスアカウントの権限借用 (Impersonation)
+個人権限と分離し、監査・最小権限で運用したい場合は専用 SA を使えます。
+`*_impersonate_service_account` に SA のメールアドレスを指定してください。
+
+- 実行ユーザーに、対象 SA への `roles/iam.serviceAccountTokenCreator`（借用権限）が必要。
+- **dst**: 大量のリソース作成・削除が走るため、Editor 相当の専用 SA を指定。
+- **src**: 借用する場合は src 側に SA 作成 + 読取権限付与が必要です
+  （= **オリジナルへの IAM 書き込みが発生**します）。
+
+> 💡 **src を借用する場合のセットアップ**
 > 専用 SA で src を読みたい場合は `src_impersonate_service_account` にメールを設定。
 > その SA を src プロジェクトに作成 + 読取権限付与する一括スクリプトを用意しています。
 > **このスクリプトの実行だけは src(ORG) への IAM 書き込みを伴う**ため、`sync_env.py` の ORG 保護とは
-> 意図的に分離した手動セットアップ用です（既定は dry-run）。**未指定運用なら不要**。
+> 意図的に分離した手動セットアップ用です（既定は dry-run）。**ローカル認証（推奨）なら不要**。
 > ```bash
 > scripts/bootstrap_src_sa.sh                          # dry-run（実行されるコマンドの表示のみ）
 > scripts/bootstrap_src_sa.sh --apply                  # 実際に SA 作成・ロール付与
@@ -133,8 +133,8 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 
 > 🧰 **コピー先 (dst) 側の一括ブートストラップ（`make bootstrap-plan` / `make bootstrap`）**
 > 新しい dst プロジェクト群を用意した直後は、(a) dst SA、(b) dst SA に対する src 読取権限、
-> (c) Shared VPC 構成 の 3 点が未整備で `make plan` の SA 事前チェックが落ちます。これらを
-> まとめてセットアップする Make ターゲットを用意しています（`projects*` と同じく裸 = 実適用 / `-plan` = dry-run）。
+> (c) Shared VPC 構成 をまとめてセットアップする Make ターゲットを用意しています（`projects*` と同じく裸 = 実適用 / `-plan` = dry-run）。
+> **(a)(b) は Impersonation（オプション）を使う場合のみ必要**。ローカル認証（推奨）では (c) Shared VPC だけ整えれば十分です（`make bootstrap-shared-vpc`）。
 > ```bash
 > make bootstrap-plan     # 3 つを順に dry-run（実行されるコマンドの表示のみ）
 > make bootstrap          # 3 つを --apply で実行（dst と src(ORG) に IAM/構成を書き込みます）
@@ -161,7 +161,8 @@ cp dst/config.yaml.template dst/config.yaml
 `dst/config.yaml` で定義する主な項目:
 - **`project_mapping`**: コピー元 (src) とコピー先 (dst) のプロジェクト ID、および借用 SA
   (`src_impersonate_service_account` / `dst_impersonate_service_account` — どちらもオプション)。
-  推奨: **src 側は空、dst 側は専用 SA を指定**（理由は §2 参照）。`host_project` と `service_projects` を定義します。
+  **src を書き換えたくない場合は両方空（ローカル認証）がおすすめ**。権限借用したい場合のみ SA を指定します（理由は §2 参照）。
+  `host_project` と `service_projects` を定義します。
 - **`rename_rules`**: GCS バケット等のグローバルユニークなリソースのリネーム規則。
   `gcs.value` に固定文字列を指定するか、`"auto"` にすると日付ベースの一意 suffix
   （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に
@@ -218,7 +219,7 @@ cp dst/config.yaml.template dst/config.yaml
 ```mermaid
 graph TD
     A[dst/config.yaml を準備] --> B[make projects-plan / projects]
-    B --> B2[make bootstrap-plan / bootstrap]
+    B --> B2[make bootstrap-shared-vpc / bootstrap]
     B2 --> C[make plan: 計画をドライラン確認]
     C --> D[make mock: ローカル試走で動作検証]
     D --> E[make run: 本番クローン実行]
@@ -231,12 +232,14 @@ make projects-plan   # 何が作成されるか確認
 make projects        # 実際に作成（org_id / billing_account が必要）
 ```
 
-### Step 0.5: SA / IAM / Shared VPC のブートストラップ
-新規 dst プロジェクトでは、続けて以下を実行して SA・読取権限・Shared VPC を整えます。
+### Step 0.5: Shared VPC / IAM のブートストラップ
+新規 dst プロジェクトでは Shared VPC 構成を整えます。
 ```bash
-make bootstrap-plan    # 3 スクリプトを順に dry-run（内容を確認）
-make bootstrap         # 確認できたら --apply で実行
+make bootstrap-shared-vpc-plan   # dry-run で内容を確認
+make bootstrap-shared-vpc        # 確認できたら --apply で実行
 ```
+> 💡 **ローカル認証（推奨）なら Shared VPC だけで十分**です。Impersonation（オプション）を使う場合は
+> dst SA と src 読取権限も必要なので、`make bootstrap`（Shared VPC + dst SA + cross-project をまとめて投入）を実行します。
 
 ### Step 1: 実行計画のドライラン確認
 本番実行の前に、必ずドライランで実行計画を確認します。
@@ -373,7 +376,7 @@ make vmware-clean       # vmware/logs/ を削除
 | :--- | :--- |
 | **side による操作分類** | すべての外部コマンドは `side="src" / "dst" / "local"` のいずれかで実行されます。 |
 | **src は read-only 強制** | `side="src"` のコマンドに書き込み動詞（`create / delete / update / stop / start / attach / detach / mk / cp / rsync / apply` 等）が含まれていたら、**実行前に拒否**して停止します。 |
-| **借用 SA は推奨（必須ではない）** | `impersonate_sa` 未指定の場合はローカル認証（gcloud のアクティブアカウント / ADC）にフォールバックします。**src 書込権を持っていれば**事前チェックで警告 + 続行確認（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で許可）。`side="src"` のコマンドそのものに対する書込動詞拒否ガード (`is_src_read_only`) は impersonate の有無にかかわらず常時有効です。 |
+| **ローカル認証 / 借用 SA（src を変えないならローカル認証がおすすめ）** | `impersonate_sa` 未指定の場合はローカル認証（gcloud のアクティブアカウント / ADC）で動作します。**src 書込権を持っていれば**事前チェックで警告 + 続行確認（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で許可）。`side="src"` のコマンドそのものに対する書込動詞拒否ガード (`is_src_read_only`) は impersonate の有無にかかわらず常時有効です。 |
 | **設定バリデーション** | `src == dst`、dst が他の src と衝突、`service_projects` が空 等を検出すると、処理を何もせずに停止します。 |
 | **SA 事前チェック** | 実行前に借用 SA の**実在・借用可否・代表権限**（src=読取 / dst=書込）を検証し、不足を検出したら全件列挙して停止します。借用 SA 未指定のプロジェクトはローカル認証の **src 書込権チェック + 続行確認** に切り替わります（`make plan` でも実行、Mock はスキップ）。 |
 | **Mock は fail-closed** | Mock モードで未対応のコマンドが来たら、本物実行に進ませず即停止します。 |
@@ -420,7 +423,7 @@ make test
 
 ### 仕様書
 - [`SPEC.md`](./SPEC.md) / [`dst/SPEC.md`](./dst/SPEC.md): 詳細仕様。
-- [`dst/PROCEDURE.md`](./dst/PROCEDURE.md): 推奨手順と要件。
+- [`PROCEDURE.md`](./PROCEDURE.md): 推奨手順と要件。
 
 ---
 

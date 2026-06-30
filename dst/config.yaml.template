@@ -50,29 +50,45 @@ bootstrap:
 # ------------------------------------------------------------------------------
 # 2. プロジェクトマッピング定義 (Project Mapping)
 # ------------------------------------------------------------------------------
-# コピー元 (src) とコピー先 (dst) のプロジェクトIDを正確に指定してください。
-# 安全のため、サービスアカウントキー (JSON) は使用せず、サービスアカウントの権限借用 (Impersonation) を使用します。
-# コピー元 (src) には読み取り専用権限 (Viewer等) のサービスアカウントを、
-# コピー先 (dst) にはリソース作成権限 (Editor等) のサービスアカウントのメールアドレスを指定してください。
-# ※実行ユーザーが、対象SAに対して「サービス アカウント トークン作成者 (roles/iam.serviceAccountTokenCreator)」権限を持っている必要があります。
+# コピー元 (src) とコピー先 (dst) のプロジェクト ID を指定します。
+# サービスアカウントキー (JSON) は使用しません。認証方法は 2 つあります。
+#
+# 【おすすめ】src を一切書き換えたくない場合: ローカル認証 (実行ユーザー本人の権限で動かす)
+#   下の *_impersonate_service_account をすべて空のままにすると、ログイン中の
+#   実行ユーザー (および ADC) の権限で動作します。事前に次を用意してください。
+#     - src: 各プロジェクトに読み取り専用 (roles/viewer 等) を付与
+#     - dst: プロジェクト作成先のフォルダ / 組織への書き込み + 各 dst のリソース作成・編集 (Editor 相当)
+#     - 実行前に `gcloud auth login` と `gcloud auth application-default login` でログイン
+#   利点: src 側に SA を作らず、src の IAM を一切書き換えずに済む
+#         (オリジナルを変更しない要件に最適)。
+#
+# 【オプション】サービスアカウントの権限借用 (Impersonation)
+#   個人権限と分離し最小権限で運用したい場合のみ、専用 SA のメールを指定します。
+#     - 指定した SA に対し、実行ユーザーが
+#       「サービス アカウント トークン作成者 (roles/iam.serviceAccountTokenCreator)」を持つこと
+#     - src を借用する場合は src 側に SA 作成 + IAM 付与が必要
+#       (= オリジナルへの書き込みが発生する点に注意)
 project_mapping:
   # 共有VPCホストプロジェクト
   host_project:
     src: "<SRC_HOST_PROJECT_ID>"
     dst: "dst-sharedhost"
-    src_impersonate_service_account: "org-host-viewer@<SRC_HOST_PROJECT_ID>.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-    dst_impersonate_service_account: "dst-host-owner@dst-sharedhost.iam.gserviceaccount.com"            # [必須] コピー先用 (作成/編集権限が必要)
+    src_impersonate_service_account: ""   # [オプション] 空=ローカル認証 (推奨)。借用する場合のみ SA を指定
+    dst_impersonate_service_account: ""   # [オプション] 空=ローカル認証 (推奨)。借用する場合のみ SA を指定
+    # 借用する場合の記入例:
+    # src_impersonate_service_account: "org-host-viewer@<SRC_HOST_PROJECT_ID>.iam.gserviceaccount.com"
+    # dst_impersonate_service_account: "dst-host-owner@dst-sharedhost.iam.gserviceaccount.com"
   
   # サービスプロジェクトのリスト (複数指定可能)
   service_projects:
     - src: "<SRC_SERVICE_PROJECT_ID_1>"
       dst: "dst-sharedservice-1"
-      src_impersonate_service_account: "org-svc1-viewer@<SRC_SERVICE_PROJECT_ID_1>.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-      dst_impersonate_service_account: "dst-svc1-owner@dst-sharedservice-1.iam.gserviceaccount.com"            # [必須] コピー先用 (作成/編集権限が必要)
+      src_impersonate_service_account: ""   # [オプション] 空=ローカル認証 (推奨)
+      dst_impersonate_service_account: ""   # [オプション] 空=ローカル認証 (推奨)
     - src: "<SRC_SERVICE_PROJECT_ID_3>"
       dst: "dst-sharedservice-3"
-      src_impersonate_service_account: "org-svc3-viewer@<SRC_SERVICE_PROJECT_ID_3>.iam.gserviceaccount.com" # [必須] コピー元用 (読み取り専用推奨)
-      dst_impersonate_service_account: "dst-svc3-owner@dst-sharedservice-3.iam.gserviceaccount.com"            # [必須] コピー先用 (作成/編集権限が必要)
+      src_impersonate_service_account: ""   # [オプション] 空=ローカル認証 (推奨)
+      dst_impersonate_service_account: ""   # [オプション] 空=ローカル認証 (推奨)
 
 # ------------------------------------------------------------------------------
 # 3. リネームルール設定 (Rename Rules)

@@ -67,10 +67,20 @@
 
 ## 4. 認証と安全要件
 - **サービスアカウントキー (JSON) の排除**:
-  キーファイルの漏洩を防ぐため、ツールは常に **サービスアカウントの権限借用 (Impersonation)** を使用します。
+  キーファイルの漏洩を防ぐため、JSON キーは使用しません。認証方法は 2 つあり、`config.yaml` の
+  `*_impersonate_service_account` で切り替えます。
+  - **ローカル認証**（同フィールドを空にする）: ログイン中の実行ユーザー（`gcloud auth login` +
+    `gcloud auth application-default login` / ADC）の権限で動作する。
+  - **サービスアカウントの権限借用 (Impersonation)**（同フィールドに SA を指定）: 指定 SA を借用して動作する。
 - **不変性の保証 (Originalの保護)**:
-  - コピー元 (Original) プロジェクト操作用には、**閲覧者 (Viewer)** などの読み取り専用ロールのみを付与したサービスアカウントを指定します。
-  - コピー先 (Destination) プロジェクト操作用には、**編集者 (Editor)** 以上の権限を持つサービスアカウントを指定します。
+  - コピー元 (Original) は read-only。`side="src"` のコマンドは `is_src_read_only` ガードで書き込み動詞を
+    実行前に拒否する（impersonate の有無に関わらず常時有効）。
+  - **src（オリジナル）を一切書き換えたくない場合のおすすめは、SA を使わないローカル認証**。
+    実行ユーザーに src の **閲覧者 (Viewer)** 相当を用意し（既存の読取権限を流用してもよい）、src 側に
+    SA を作らず IAM も変更しない。Impersonation で src を借用する場合は src 側に SA 作成 + ロール付与が
+    必要になり、オリジナルへの IAM 書き込みが発生する点に注意。
+  - コピー先 (Destination) は書き込みが必要。ローカル認証なら実行ユーザーに **編集者 (Editor)** 相当を、
+    Impersonation なら Editor 相当の専用 SA を指定する。
 
 ---
 
@@ -94,11 +104,11 @@
 #### `project_mapping` (プロジェクト対応定義)
 - `host_project` (object, 必須): 共有VPCホストプロジェクト。
   - `src` / `dst` (string, 必須): コピー元 / コピー先 プロジェクトID。
-  - `src_impersonate_service_account` (string, 必須): コピー元操作用借用SA (読み取り専用推奨)。
-  - `dst_impersonate_service_account` (string, 必須): コピー先操作用借用SA (編集者以上)。
+  - `src_impersonate_service_account` (string, 任意): コピー元操作用の借用 SA。空ならローカル認証。指定する場合は読み取り専用 SA。
+  - `dst_impersonate_service_account` (string, 任意): コピー先操作用の借用 SA。空ならローカル認証。指定する場合は編集者以上の SA。
 - `service_projects` (array of objects, 必須): サービスプロジェクトのリスト。
   - `src` / `dst` (string, 必須): 同上。
-  - `src_impersonate_service_account` / `dst_impersonate_service_account` (string, 必須): 同上。
+  - `src_impersonate_service_account` / `dst_impersonate_service_account` (string, 任意): 同上（空ならローカル認証）。
 
 #### `rename_rules` (リネームルール定義)
 - `gcs` (object, 必須): GCSバケットのリネーム規則。
