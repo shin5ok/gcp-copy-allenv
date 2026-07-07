@@ -70,17 +70,18 @@
 
 3 スクリプトを順次実行。`bootstrap-plan` で内容確認 → `bootstrap` で適用（`projects*` と同じく裸 = 実適用 / `-plan` = dry-run）。
 
-> 💡 **ローカル認証（src を書き換えたくない場合のおすすめ）では 2c の Shared VPC 化だけで十分**。
-> 2a (dst SA) / 2b (src 読取権限) は Impersonation を使う場合にのみ必要なので、その場合は
-> `make bootstrap-shared-vpc` だけ実行すればよい。
+> 💡 **認証パターンに関わらず `make bootstrap-plan` → `make bootstrap` で OK**。
+> 借用 SA 未指定（ローカル認証・おすすめ）なら 2a (dst SA) / 2b (src 読取権限) はスクリプトが
+> 「対象なし」と判定して自動スキップし、2c の Shared VPC 化だけが適用される。
+> SA 指定時は 2a / 2b / 2c がすべて実行される。
 
-### 2a. `bootstrap-dst-sa` (`scripts/bootstrap_dst_sa.sh`) — Impersonation を使う場合のみ
+### 2a. `bootstrap-dst-sa` (`scripts/bootstrap_dst_sa.sh`) — Impersonation を使う場合のみ（借用 SA 未指定なら自動スキップ）
 **役割**: dst 側の書き込み用 SA を作る。dst を借用する場合、以降の書き込みはこの SA を impersonate して行う（ローカル認証なら不要）。
 - 各 dst プロジェクトに dst SA を作成
 - 付与: `roles/editor` / `roles/storage.admin` / `roles/bigquery.admin`
 - 実行アカウントに `roles/iam.serviceAccountTokenCreator`（impersonate 用）
 
-### 2b. `bootstrap-cross-project` (`scripts/bootstrap_cross_project.sh`) — Impersonation を使う場合のみ
+### 2b. `bootstrap-cross-project` (`scripts/bootstrap_cross_project.sh`) — Impersonation を使う場合のみ（借用 SA 未指定なら自動スキップ）
 **役割**: dst SA が src を「覗ける」ようにする。src への書き込み権限は与えない（ローカル認証なら不要）。
 - 各 src プロジェクトに read-only カスタムロール `migrationSrcReader` を作成（compute/GCS/BQ/CAI の read 権限のみ）
 - 対応する dst SA に `migrationSrcReader` + `roles/bigquery.dataViewer` を付与

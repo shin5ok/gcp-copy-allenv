@@ -134,7 +134,8 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > 🧰 **コピー先 (dst) 側の一括ブートストラップ（`make bootstrap-plan` / `make bootstrap`）**
 > 新しい dst プロジェクト群を用意した直後は、(a) dst SA、(b) dst SA に対する src 読取権限、
 > (c) Shared VPC 構成 をまとめてセットアップする Make ターゲットを用意しています（`projects*` と同じく裸 = 実適用 / `-plan` = dry-run）。
-> **(a)(b) は Impersonation（オプション）を使う場合のみ必要**。ローカル認証（推奨）では (c) Shared VPC だけ整えれば十分です（`make bootstrap-shared-vpc`）。
+> **認証パターンに関わらず `make bootstrap-plan` → `make bootstrap` で OK です**。(a)(b) は Impersonation（オプション）用で、
+> 借用 SA 未指定（ローカル認証・推奨）ならスクリプトが「対象なし」と判定して自動スキップし、(c) Shared VPC 構成だけが適用されます。
 > ```bash
 > make bootstrap-plan     # 3 つを順に dry-run（実行されるコマンドの表示のみ）
 > make bootstrap          # 3 つを --apply で実行（dst と src(ORG) に IAM/構成を書き込みます）
@@ -191,8 +192,8 @@ cp dst/config.yaml.template dst/config.yaml
 | `make projects` | コピー先プロジェクトを実際に作成（請求紐付け + API 有効化） |
 | `make delete-projects-plan PATTERN=xxx` | `bootstrap.folder_id` 配下の ACTIVE プロジェクトのうち `project_id` に `xxx` を含むものを **一覧表示のみ**（削除なし） |
 | `make delete-projects PATTERN=xxx` | 同上を **削除**（6 桁ランダムコードを端末に入力しないと進まない安全策つき。lien も自動解除） |
-| `make bootstrap-plan` | dst SA / src 読取権限 / Shared VPC を順に **ドライラン** で表示 |
-| `make bootstrap` | 上記 3 つを `--apply` で実行（dst と src(ORG) に IAM/構成を書き込み） |
+| `make bootstrap-plan` | dst SA / src 読取権限 / Shared VPC を順に **ドライラン** で表示（借用 SA 未指定の項目は自動スキップ） |
+| `make bootstrap` | 上記 3 つを `--apply` で実行（借用 SA 未指定なら Shared VPC のみ適用。SA 指定時は dst と src(ORG) に IAM/構成を書き込み） |
 | `make bootstrap-dst-sa` | dst SA 作成 + ロール付与のみ実行（dry-run は `-plan` 付き） |
 | `make bootstrap-cross-project` | dst SA → src の読取権限のみ実行（dry-run は `-plan` 付き） |
 | `make bootstrap-shared-vpc` | Shared VPC 化のみ実行（dry-run は `-plan` 付き） |
@@ -219,7 +220,7 @@ cp dst/config.yaml.template dst/config.yaml
 ```mermaid
 graph TD
     A[dst/config.yaml を準備] --> B[make projects-plan / projects]
-    B --> B2[make bootstrap-shared-vpc / bootstrap]
+    B --> B2[make bootstrap-plan / bootstrap]
     B2 --> C[make plan: 計画をドライラン確認]
     C --> D[make mock: ローカル試走で動作検証]
     D --> E[make run: 本番クローン実行]
@@ -233,13 +234,14 @@ make projects        # 実際に作成（org_id / billing_account が必要）
 ```
 
 ### Step 0.5: Shared VPC / IAM のブートストラップ
-新規 dst プロジェクトでは Shared VPC 構成を整えます。
+新規 dst プロジェクトでは Shared VPC 構成を整えます。認証パターンに関わらず同じコマンドで実行できます。
 ```bash
-make bootstrap-shared-vpc-plan   # dry-run で内容を確認
-make bootstrap-shared-vpc        # 確認できたら --apply で実行
+make bootstrap-plan   # dry-run で内容を確認
+make bootstrap        # 確認できたら --apply で実行
 ```
-> 💡 **ローカル認証（推奨）なら Shared VPC だけで十分**です。Impersonation（オプション）を使う場合は
-> dst SA と src 読取権限も必要なので、`make bootstrap`（Shared VPC + dst SA + cross-project をまとめて投入）を実行します。
+> 💡 借用 SA（`*_impersonate_service_account`）未指定のローカル認証（推奨）では、dst SA 作成と
+> src 読取権限付与は「対象なし」として自動スキップされ、Shared VPC 構成だけが適用されます。
+> SA を指定している場合は dst SA + cross-project + Shared VPC の 3 つがすべて実行されます。
 
 ### Step 1: 実行計画のドライラン確認
 本番実行の前に、必ずドライランで実行計画を確認します。
