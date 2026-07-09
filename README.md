@@ -10,7 +10,7 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > コード側で「src 操作は read-only のみ・書き込み動詞は実行前に拒否」を強制しています。認証は、src を一切書き換えたくない場合は **ローカル認証（実行ユーザー本人）がおすすめ**で、SA の権限借用はオプションです（src 書込権を持っていれば実行前に警告 + 続行確認）。
 > 詳細は後述の [ORG プロジェクト保護](#-org-プロジェクト保護) を参照してください。
 
-> 📚 **関連ドキュメント**: [PROCEDURE.md](./PROCEDURE.md)（推奨運用フロー）・[SPEC.md](./SPEC.md)（全体仕様）・[dst/SPEC.md](./dst/SPEC.md)（コピー先仕様）・[HISTORY.md](./HISTORY.md)（変更履歴）
+> 📚 **関連ドキュメント**: [PROCEDURE.md](./PROCEDURE.md)（推奨運用フロー）・[SPEC.md](./SPEC.md)（全体仕様）・[dst/SPEC.md](./dst/SPEC.md)（コピー先仕様）・[HISTORY.md](./HISTORY.md)（変更履歴）・[doc/outbound-quarantine-design.md](./doc/outbound-quarantine-design.md)（dst outbound 遮断（検疫）設計）
 
 ---
 
@@ -426,6 +426,7 @@ make test
 ### 仕様書
 - [`SPEC.md`](./SPEC.md) / [`dst/SPEC.md`](./dst/SPEC.md): 詳細仕様。
 - [`PROCEDURE.md`](./PROCEDURE.md): 推奨手順と要件。
+- [`doc/outbound-quarantine-design.md`](./doc/outbound-quarantine-design.md): dst 環境の outbound 遮断（検疫）設計 — egress deny + Private Google Access + VPC-SC。
 
 ---
 
