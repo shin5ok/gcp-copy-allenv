@@ -2858,10 +2858,12 @@ resource "google_storage_bucket" "mock_bucket" {{
     def _strip_reserved_ip(self, content: str) -> str:
         """google_compute_address / global_address の固定 IP 指定を外し自動採番にする。
 
-        src の予約 IP（例: 34.x.x.x）は dst プロジェクトに割り当てられていないため、
-        その IP のまま作成しようとすると "IP address is not allocated" で失敗する。
-        `address = "<ip>"` 行を削除して GCP に新しい IP を採番させる（移行先で IP が
-        変わるのは許容）。`address_type` 行は別物なので消さない。
+        src の予約 IP（実務上は内部 IP が中心。例: 10.x.x.x）は dst プロジェクトに割り当て
+        られていないため、そのまま作成すると "IP address is not allocated" で失敗する。
+        `address = "<ip>"` 行を削除して GCP に新しい IP を採番させる。dst で内部 IP が src と
+        変わるため、IP 直書きの設定（/etc/hosts、FW ルールの IP 条件等）は移行後に壊れ得る
+        （既知の制約。ISSUES.md ISSUE-05 で preserve オプション化を検討中・未実装）。
+        `address_type` 行は別物なので消さない。
         """
         if ('resource "google_compute_address"' not in content
                 and 'resource "google_compute_global_address"' not in content):
