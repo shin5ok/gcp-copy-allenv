@@ -164,6 +164,12 @@ cp dst/config.yaml.template dst/config.yaml
   (`src_impersonate_service_account` / `dst_impersonate_service_account` — どちらもオプション)。
   **src を書き換えたくない場合は両方空（ローカル認証）がおすすめ**。権限借用したい場合のみ SA を指定します（理由は §2 参照）。
   `host_project` と `service_projects` を定義します。
+  - **`host_project.skip: true`** (オプション): 既に構築済みの dst host を再利用する場合に指定。
+    host を全ステップから除外（`create_projects` / SA preflight / cai_scan / bulk_export /
+    terraform_apply / network_firewall / gce_restore / data_sync）し、
+    `terraform/active/<src_host>/` の state も孤児削除から保護して温存。
+    ID / プロジェクト番号の置換マップには host を残すため、service project 内の host 参照
+    （Shared VPC ネットワーク URL 等）は正しく dst へ書き換わる。
 - **`rename_rules`**: GCS バケット等のグローバルユニークなリソースのリネーム規則。
   `gcs.value` に固定文字列を指定するか、`"auto"` にすると日付ベースの一意 suffix
   （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に
@@ -197,10 +203,13 @@ cp dst/config.yaml.template dst/config.yaml
 | `make bootstrap-dst-sa` | dst SA 作成 + ロール付与のみ実行（dry-run は `-plan` 付き） |
 | `make bootstrap-cross-project` | dst SA → src の読取権限のみ実行（dry-run は `-plan` 付き） |
 | `make bootstrap-shared-vpc` | Shared VPC 化のみ実行（dry-run は `-plan` 付き） |
-| `make plan` | 移行処理の **ドライラン**（実行計画の表示のみ。ORG 書き込みなし） |
+| `make plan` | 移行処理の **ドライラン**（実行計画の表示のみ。ORG 書き込みなし。既存 state / `.dst_project` マーカー / `.gcs_rename_value` は温存） |
 | `make mock` | **Mock モード** でローカル試走（GCP 未接続でも動作） |
 | `make run` | 移行処理の **本番実行**（dst への書き込みを伴う） |
 | `make test` | 単体テスト (pytest) を実行 |
+| `make clean-project P=<project_id>` | 特定プロジェクトの terraform 生成物 (`active/<src>/` + `raw/<src>/`) と state のみ削除。src / dst / `.dst_project` マーカー値のいずれでも解決、他プロジェクトと `.gcs_rename_value` は温存。未知 ID 混在時は何も消さず exit 1（GCP 未接続） |
+| `make clean` | terraform 生成物と state を **全プロジェクト分** 削除して初期化（`.gcs_rename_value` も削除。特定プロジェクトのみは `clean-project`） |
+| `make clean-all` | `clean` に加えて `logs/` と `cai_export/` も削除 |
 
 各コマンドには `ARGS="..."` で追加の引数を渡せます（例: `make plan ARGS="--config path/to/config.yaml"`）。
 
@@ -290,8 +299,15 @@ make run
 > 6. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
 > 7. 全移行の最後に、dst プロジェクトを既存の VPC Service Controls ペリメタへ追加（`vpc_sc.billing_project` が必須。未設定ならスキップ）。
 
-> ♻️ **Terraform 適用の冪等性**（再実行しても 409/404 で落ちないための仕組み）
-> - dst プロジェクトが前回と変わった場合、stale な `terraform.tfstate` を破棄して import からやり直します（`active/<src>/.dst_project` マーカーで判定）。
+> ♻️ **Terraform 適用の冪等性 / state 管理**（再実行しても 409/404 で落ちないための仕組み）
+> - **`make plan` は state を消さない**（`clean` 依存を撤去済み）。同一 dst project id なら前回の
+>   `terraform/active/<src>/terraform.tfstate` と `.dst_project` マーカーを温存し、次の `make run` は
+>   `skip_on_run` の高速パスと冪等 apply に乗ります。
+> - dst プロジェクトが前回と変わった project だけ、stale な `terraform.tfstate` を自動破棄して import から
+>   やり直します（`active/<src>/.dst_project` マーカー + state 本文の dst 参照有無で判定）。
+> - 特定プロジェクトだけ state を明示リセットしたい場合は **`make clean-project P=<project_id>`**
+>   （src ID / dst ID / marker 値のいずれでも解決、他プロジェクトと `.gcs_rename_value` は温存）。
+>   config から削除済みの旧 dst の掃除もマーカー値で解決できます。
 > - `google_storage_bucket` はリネーム後の実名で import し、作成済みバケットを adopt して再 apply を冪等化。
 > - 同一プロジェクト内の network URL を `google_compute_network.<label>.self_link` 参照へ書き換え、firewall/subnetwork が network より先に作られて 404 になるのを防止。
 > - VM/disk は Step 4 ではなく Step 5 (`gce_restore`) 側で管理し、`make run` の失敗を抑制。

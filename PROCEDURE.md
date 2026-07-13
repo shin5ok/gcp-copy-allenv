@@ -47,6 +47,7 @@
 ### 0d. 設定ファイルの編集
 - `cp dst/config.yaml.template dst/config.yaml` してから 0a で集めた値を埋める:
   - `project_mapping`: src/dst プロジェクト ID、`host_project` + `service_projects`、`*_impersonate_service_account`（両方オプション。**src を書き換えたくない場合は src/dst とも未指定=ローカル認証がおすすめ**）
+    - `host_project.skip: true`（オプション）: 既に構築済みの dst host を再利用する場合に指定。host を全ステップから除外（`create_projects` / SA preflight / cai_scan / bulk_export / terraform_apply / network_firewall / gce_restore / data_sync）し、`terraform/active/<src_host>/` の state も孤児削除から保護して温存する。ID/番号置換マップには残るため service 側の host 参照（Shared VPC ネットワーク URL 等）は dst へ正しく書き換わる。
   - `rename_rules.gcs.value`: 固定文字列 or `"auto"`（日付ベース suffix `-dst-MMDDHHMM` を `terraform/.gcs_rename_value` に永続化）
   - `steps`: 8 ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `data_sync` / `vpc_sc`) の有効/無効、`gce_snapshot.max_age_days`、`bulk_export.skip_on_run`、`vpc_sc.billing_project`（**必須・明示指定**）等
   - `bootstrap`: 0a で集めた `org_id` / `folder_id` / `billing_account`
@@ -190,9 +191,13 @@
    - **誤ったプロジェクトを自動推測しない**安全方針: `access_policy` / `perimeter` / `billing_project` のいずれかが未設定なら「設定不足」として skip + WARNING（host dst や先頭 dst へ勝手にフォールバックしない）。`billing_project` には dst ORG 内で API を有効化できるプロジェクト（通常は dst ホスト）を明示する。
    - ステップ冒頭で `billing_project` に `accesscontextmanager` API を有効化（冪等 / allow_fail）してから describe/update を `--billing-project=<billing_project>` 付きで実行する。describe には `--quiet` を付け、API 無効時の対話プロンプトでハングしないようにする。
 
-> 🔁 **`bulk_export.skip_on_run: true` の挙動**（実行順とは独立した最適化）
+> 🔁 **State 温存と `bulk_export.skip_on_run: true` の挙動**
+> - `make plan` は `clean` 依存を撤去済みで、`terraform/active/<src>/` と state / `.dst_project` マーカー / `.gcs_rename_value` を温存する。同一 dst project id なら次の `make run` は skip_on_run の高速パスと冪等 apply にそのまま乗る。
 > - `terraform/active/<src>/.dst_project` マーカーが現 config の dst と一致するかで判定。一致すれば export と customize を**完全スキップ**、不一致でも `terraform/raw/` が残っていれば customize のみ再実行（bulk-export 自体は省略）。
 > - マーカーは `customize_hcl` 末尾と Step 4 の `_reset_stale_state_if_needed` の両方が書く（plan/run・skip_on_run 間で整合）。dry_run では `customize_hcl` が `.tf` を実書き出ししないためマーカーも更新しない（plan で書き出すと .tf と marker が乖離するため）。
+> - bulk-export は `raw/<src>/` を **プロジェクト単位で作り直す**（`make plan` の raw 全消しを撤去した後も src で削除済みリソースの `.tf` が残らないよう防御）。他プロジェクトの raw / active / state には影響しない。
+> - 特定プロジェクトの state だけ明示的にリセットしたい場合は **`make clean-project P=<project_id>`**（src ID / dst ID / marker 値のいずれでも解決、他プロジェクトと `.gcs_rename_value` は温存、未知 ID 混在時は何も消さず exit 1）。config から削除済みの旧 dst の掃除もマーカー値で解決できる。
+> - **`host_project.skip: true`** 指定時、`active/<src_host>/` はマーカー更新も孤児削除もされず丸ごと温存される（既に構築済みの dst host に対する不要な再 apply を回避）。
 
 ---
 
