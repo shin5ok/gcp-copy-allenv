@@ -78,6 +78,11 @@ project_mapping:
     # 借用する場合の記入例:
     # src_impersonate_service_account: "org-host-viewer@<SRC_HOST_PROJECT_ID>.iam.gserviceaccount.com"
     # dst_impersonate_service_account: "dst-host-owner@dst-sharedhost.iam.gserviceaccount.com"
+    # skip: true にすると host project を全処理から除外します（構築済みの dst host をそのまま利用）。
+    # 対象外: プロジェクト作成 / SA preflight / export / terraform 適用 / FW 同期(Step4.5) /
+    #         host VPC 複製 / VM 復元 / データ移行。terraform/active/<src>/ の state も温存。
+    # ID・プロジェクト番号の置換マップには残るため service project 側の host 参照は dst に書き換わる。
+    # skip: false
   
   # サービスプロジェクトのリスト (複数指定可能)
   service_projects:
