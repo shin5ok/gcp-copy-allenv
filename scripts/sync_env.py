@@ -2081,21 +2081,32 @@ resource "google_storage_bucket" "mock_bucket" {{
             logger.info(bar)
 
     # ----- マッピングからプロジェクト一覧を作るヘルパ -----
-    def _iter_src_projects(self):
-        """(src_proj_id, src_sa) を順に返す。"""
+    def _host_skipped(self) -> bool:
+        """project_mapping.host_project.skip=true なら host を処理対象から外す。"""
+        return bool(self.config.get('project_mapping', {})
+                    .get('host_project', {}).get('skip', False))
+
+    def _skipped_host_src(self) -> Optional[str]:
+        """skip 指定された host の src ID（skip でなければ None）。"""
+        host = self.config.get('project_mapping', {}).get('host_project', {})
+        return host.get('src') if host.get('skip', False) else None
+
+    def _iter_src_projects(self, include_skipped: bool = False):
+        """(src_proj_id, src_sa) を順に返す。skip 指定の host は既定で除外。"""
         mapping = self.config.get('project_mapping', {})
         host = mapping.get('host_project', {})
-        if host.get('src'):
+        if host.get('src') and (include_skipped or not self._host_skipped()):
             yield host['src'], host.get('src_impersonate_service_account')
         for svc in mapping.get('service_projects', []):
             if svc.get('src'):
                 yield svc['src'], svc.get('src_impersonate_service_account')
 
-    def _iter_project_pairs(self):
-        """(src, dst, src_sa, dst_sa) を順に返す。"""
+    def _iter_project_pairs(self, include_skipped: bool = False):
+        """(src, dst, src_sa, dst_sa) を順に返す。skip 指定の host は既定で除外。"""
         mapping = self.config.get('project_mapping', {})
         host = mapping.get('host_project', {})
-        if host.get('src') and host.get('dst'):
+        if (host.get('src') and host.get('dst')
+                and (include_skipped or not self._host_skipped())):
             yield (host['src'], host['dst'],
                    host.get('src_impersonate_service_account'),
                    host.get('dst_impersonate_service_account'))
@@ -2391,6 +2402,10 @@ resource "google_storage_bucket" "mock_bucket" {{
             proj_id, sa = item
             self.org_logger.info(f"  → src '{proj_id}' をエクスポート")
             proj_raw_dir = os.path.join(raw_dir, proj_id)
+            # make plan は raw 全体を作り直さない（Makefile の clean 依存を撤去）ため、
+            # 前回 export の残骸（src で削除済みリソースの .tf 等）が混ざらないよう
+            # プロジェクト単位で作り直す。
+            shutil.rmtree(proj_raw_dir, ignore_errors=True)
             os.makedirs(proj_raw_dir, exist_ok=True)
 
             if self.mock and not self.dry_run:
@@ -2448,7 +2463,9 @@ resource "google_storage_bucket" "mock_bucket" {{
         失敗するため、実行ユーザー権限（terraform と同じ local 認証）で取得する。
         """
         self.proj_num_map = {}
-        for src, dst, src_sa, dst_sa in self._iter_project_pairs():
+        # host_project.skip でも host は含める: service project の .tf 内にある
+        # host プロジェクト番号参照を dst へ置換するため（proj_id_map と同じ扱い）。
+        for src, dst, src_sa, dst_sa in self._iter_project_pairs(include_skipped=True):
             sn = self._get_project_number(src)
             dn = self._get_project_number(dst)
             if sn and dn:
@@ -2622,9 +2639,14 @@ resource "google_storage_bucket" "mock_bucket" {{
         # - 既存プロジェクト dir は .tf のみ削除し、state 等は残す
         if not self.dry_run and os.path.isdir(active_dir):
             raw_projects = set(os.listdir(raw_dir))
+            protected_host = self._skipped_host_src()
             for name in os.listdir(active_dir):
                 d = os.path.join(active_dir, name)
                 if os.path.isdir(d):
+                    if name == protected_host:
+                        # skip 指定 host は export 対象外で raw に無いが、
+                        # 孤児扱いで消さず active/state を丸ごと温存する。
+                        continue
                     if name not in raw_projects:
                         self.org_logger.info(f"  孤児プロジェクト dir を削除: {d}")
                         shutil.rmtree(d, ignore_errors=True)
@@ -2744,6 +2766,8 @@ resource "google_storage_bucket" "mock_bucket" {{
                 proj_dir = os.path.join(active_dir, name)
                 if not os.path.isdir(proj_dir):
                     continue
+                if name == self._skipped_host_src():
+                    continue
                 dst_for = proj_map.get(name)
                 if not dst_for:
                     continue
@@ -2858,10 +2882,12 @@ resource "google_storage_bucket" "mock_bucket" {{
     def _strip_reserved_ip(self, content: str) -> str:
         """google_compute_address / global_address の固定 IP 指定を外し自動採番にする。
 
-        src の予約 IP（例: 34.x.x.x）は dst プロジェクトに割り当てられていないため、
-        その IP のまま作成しようとすると "IP address is not allocated" で失敗する。
-        `address = "<ip>"` 行を削除して GCP に新しい IP を採番させる（移行先で IP が
-        変わるのは許容）。`address_type` 行は別物なので消さない。
+        src の予約 IP（実務上は内部 IP が中心。例: 10.x.x.x）は dst プロジェクトに割り当て
+        られていないため、そのまま作成すると "IP address is not allocated" で失敗する。
+        `address = "<ip>"` 行を削除して GCP に新しい IP を採番させる。dst で内部 IP が src と
+        変わるため、IP 直書きの設定（/etc/hosts、FW ルールの IP 条件等）は移行後に壊れ得る
+        （既知の制約。ISSUES.md ISSUE-05 で preserve オプション化を検討中・未実装）。
+        `address_type` 行は別物なので消さない。
         """
         if ('resource "google_compute_address"' not in content
                 and 'resource "google_compute_global_address"' not in content):
@@ -3313,9 +3339,15 @@ resource "google_storage_bucket" "mock_bucket" {{
         されている前提。直下に .tf が無いディレクトリ（中間階層のみ）は除外する。
         """
         roots: List[str] = []
+        skipped_host = self._skipped_host_src()
         for name in sorted(os.listdir(active_dir)):
             d = os.path.join(active_dir, name)
             if not os.path.isdir(d):
+                continue
+            if name == skipped_host:
+                self.dst_logger.info(
+                    f"  host_project.skip=true のため Terraform 適用から除外: {d}"
+                )
                 continue
             try:
                 if any(f.endswith('.tf') for f in os.listdir(d)):
@@ -3352,6 +3384,12 @@ resource "google_storage_bucket" "mock_bucket" {{
 
         if not src_host or not dst_host:
             self.dst_logger.warning("  host_project が未設定のため network_firewall をスキップ")
+            return
+
+        if self._host_skipped():
+            self.dst_logger.info(
+                "  host_project.skip=true のため Step 4.5 をスキップ（dst host の FW は既存構成を利用）"
+            )
             return
 
         # dst host の VPC topology を Step 4.5 で先に用意する (bug fix)。
@@ -4583,6 +4621,11 @@ resource "google_storage_bucket" "mock_bucket" {{
         dst_sa = host.get('dst_impersonate_service_account')
         if not src_host or not dst_host:
             return
+        if self._host_skipped():
+            self.dst_logger.info(
+                "  [Network] host_project.skip=true のため host VPC 複製をスキップ（既存 dst host を利用）"
+            )
+            return
         self.dst_logger.info(f"  [Network] src host '{src_host}' → dst host '{dst_host}' VPC 複製")
 
         nets_json = self.run_command(
@@ -4847,6 +4890,99 @@ resource "google_storage_bucket" "mock_bucket" {{
             self._parallel_for_each(tables, table_worker, f"bq-cp-{ds_id}")
 
 
+def _mapping_pairs(config: Dict) -> List[Tuple[str, str]]:
+    """config の project_mapping から (src, dst) 一覧を返す（host → service の順）。"""
+    mapping = config.get('project_mapping') or {}
+    pairs: List[Tuple[str, str]] = []
+    host = mapping.get('host_project') or {}
+    if host.get('src'):
+        pairs.append((host['src'], host.get('dst') or ''))
+    for svc in mapping.get('service_projects') or []:
+        if svc.get('src'):
+            pairs.append((svc['src'], svc.get('dst') or ''))
+    return pairs
+
+
+def resolve_clean_targets(
+    config: Dict, ids: List[str], tf_base: str
+) -> Tuple[List[str], List[str]]:
+    """--clean-state 対象の削除ディレクトリを解決する。
+
+    各 id は src ID / config の dst ID / active/<src>/.dst_project マーカー値
+    （config から消えた旧 dst の掃除用）のいずれでもマッチする。
+    戻り値: (削除対象ディレクトリ list, 解決できなかった id list)。
+    """
+    active_dir = os.path.join(tf_base, 'active')
+    raw_dir = os.path.join(tf_base, 'raw')
+    dir_srcs: List[str] = []
+    if os.path.isdir(active_dir):
+        dir_srcs = [n for n in os.listdir(active_dir)
+                    if os.path.isdir(os.path.join(active_dir, n))]
+
+    def marker_of(src: str) -> str:
+        try:
+            with open(os.path.join(active_dir, src, '.dst_project'),
+                      encoding='utf-8') as f:
+                return f.read().strip()
+        except OSError:
+            return ''
+
+    pairs = _mapping_pairs(config)
+    targets: List[str] = []
+    unresolved: List[str] = []
+    seen = set()
+    for pid in ids:
+        pid = (pid or '').strip()
+        if not pid:
+            unresolved.append("(空)")
+            continue
+        srcs = {s for s, d in pairs if pid in (s, d)}
+        srcs |= {s for s in dir_srcs if s == pid or marker_of(s) == pid}
+        if not srcs:
+            unresolved.append(pid)
+            continue
+        for s in sorted(srcs):
+            for d in (os.path.join(active_dir, s), os.path.join(raw_dir, s)):
+                if d not in seen and os.path.isdir(d):
+                    seen.add(d)
+                    targets.append(d)
+    return targets, unresolved
+
+
+def run_clean_state(config_path: str, ids: List[str]) -> int:
+    """指定プロジェクトの terraform 生成物 (active/<src>・raw/<src>) だけ削除する。
+
+    他プロジェクトの state と terraform/.gcs_rename_value には触れない。
+    GCP には接続しない（ローカル生成物の削除のみ）。
+    1 つでも解決できない id があれば何も削除せず中止する。
+    """
+    try:
+        with open(config_path, encoding='utf-8') as f:
+            config = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        print(f"config を読み込めません: {config_path}: {e}", file=sys.stderr)
+        return 1
+    tf_base = ((config.get('steps') or {}).get('bulk_export') or {}) \
+        .get('output_dir', './terraform')
+    targets, unresolved = resolve_clean_targets(config, ids, tf_base)
+    if unresolved:
+        print("解決できないプロジェクト ID があるため何も削除しません: "
+              + ", ".join(unresolved), file=sys.stderr)
+        known = [x for s, d in _mapping_pairs(config) for x in (s, d) if x]
+        if known:
+            print("  指定可能な ID (config): " + ", ".join(known), file=sys.stderr)
+        return 1
+    if not targets:
+        print("削除対象の生成物が見つかりません（既にクリーンです）")
+        return 0
+    for d in targets:
+        shutil.rmtree(d, ignore_errors=True)
+        print(f"削除: {d}")
+    print(f"✓ {len(targets)} ディレクトリを削除しました"
+          "（他プロジェクトの state と .gcs_rename_value は温存）")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="GCP プロジェクトまるごとコピー (Terraform ベース、ORG read-only 保証)"
@@ -4858,7 +4994,15 @@ def main():
     parser.add_argument("--no-verbose", action="store_false", dest="verbose", help="詳細ログを無効化")
     parser.add_argument("--mock", action="store_true", default=None, help="Mock モードを有効化")
     parser.add_argument("--no-mock", action="store_false", dest="mock", help="Mock モードを無効化")
+    parser.add_argument(
+        "--clean-state", action="append", metavar="PROJECT_ID",
+        help="指定プロジェクトの terraform 生成物 (active/raw) と state だけ削除して終了。"
+             "src / dst どちらの ID でも可。複数指定可",
+    )
     args = parser.parse_args()
+
+    if args.clean_state:
+        sys.exit(run_clean_state(args.config, args.clean_state))
 
     orchestrator = MigrationOrchestrator(
         config_path=args.config,

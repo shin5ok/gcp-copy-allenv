@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: setup run plan mock test projects projects-plan help clean clean-all \
+.PHONY: setup run plan mock test projects projects-plan help clean clean-all clean-project \
         delete-projects delete-projects-plan \
         bootstrap bootstrap-plan \
         bootstrap-dst-sa bootstrap-dst-sa-plan \
@@ -27,8 +27,8 @@ help:
 setup:
 	uv sync
 
-## plan: ドライランで実行計画を表示します（ORG への書き込みは発生しません / 先に clean 実施）
-plan: setup clean
+## plan: ドライランで実行計画を表示します（ORG への書き込みは発生しません / state・生成物は保持）
+plan: setup
 	uv run python3 scripts/sync_env.py --dry-run $(ARGS)
 
 ## mock: Mock モードで一連の処理をローカル試走（GCP 未接続でも動きます）
@@ -43,7 +43,7 @@ run: setup
 test:
 	PYTHONPATH=. uv run pytest
 
-## clean: 前回 run のゴミ（terraform active/raw/state、GCS rename 値）を削除して初期化
+## clean: terraform 生成物と state を全プロジェクト分削除して初期化（特定のみは clean-project）
 clean:
 	@echo "===== terraform/ 配下の生成物を削除 ====="
 	@rm -rf terraform/active terraform/raw
@@ -61,6 +61,14 @@ clean-all: clean
 	@echo "===== logs/ と cai_export/ も削除 ====="
 	@rm -rf logs cai_export
 	@echo "  ✓ logs と cai_export を削除しました"
+
+## clean-project: 指定プロジェクトの terraform 生成物と state のみ削除 要 P=<src または dst の project id>
+clean-project: setup
+	@if [ -z "$(P)" ]; then \
+		echo "ERROR: P を指定してください。例: make clean-project P=my-dst-project" >&2; \
+		exit 1; \
+	fi
+	uv run python3 scripts/sync_env.py --clean-state "$(P)" $(ARGS)
 
 ## projects-plan: コピー先プロジェクト作成のドライラン
 projects-plan: setup

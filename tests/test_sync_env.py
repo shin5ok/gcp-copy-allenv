@@ -23,6 +23,8 @@ from scripts.sync_env import (
     analyze_cai_tf_diff,
     format_diff_report,
     _parse_gcloud_describe_json,
+    resolve_clean_targets,
+    run_clean_state,
 )
 
 
@@ -1803,3 +1805,139 @@ class TestFinalizeVmPowerStates:
         with patch("subprocess.run", return_value=ok_res):
             ok = o._try_dst_suspend("vm-s", "zone-a", "dst-p", None)
         assert ok is True
+
+
+# ============================================================
+# host_project.skip: host を処理対象から外す
+# ============================================================
+class TestHostSkip:
+    def _orch(self, temp_dir, skip):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        if skip is not None:
+            cfg["project_mapping"]["host_project"]["skip"] = skip
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_iterators_include_host_by_default(self, temp_dir):
+        o = self._orch(temp_dir, skip=None)
+        assert [s for s, _ in o._iter_src_projects()] == ["src-host", "src-svc-1"]
+        assert [p[0] for p in o._iter_project_pairs()] == ["src-host", "src-svc-1"]
+
+    def test_iterators_exclude_skipped_host(self, temp_dir):
+        o = self._orch(temp_dir, skip=True)
+        assert [s for s, _ in o._iter_src_projects()] == ["src-svc-1"]
+        assert [p[0] for p in o._iter_project_pairs()] == ["src-svc-1"]
+
+    def test_id_and_number_maps_keep_skipped_host(self, temp_dir):
+        """service .tf 内の host 参照置換に必要なため、マップからは外さない。"""
+        o = self._orch(temp_dir, skip=True)
+        assert o._build_proj_id_map() == {
+            "src-host": "dst-host", "src-svc-1": "dst-svc-1"}
+        assert [p[0] for p in o._iter_project_pairs(include_skipped=True)] == [
+            "src-host", "src-svc-1"]
+
+    def test_collect_terraform_roots_excludes_skipped_host(self, temp_dir):
+        o = self._orch(temp_dir, skip=True)
+        active = os.path.join(temp_dir, "active")
+        for name in ("src-host", "src-svc-1"):
+            os.makedirs(os.path.join(active, name))
+            with open(os.path.join(active, name, "main.tf"), "w", encoding="utf-8") as f:
+                f.write("# tf\n")
+        assert o._collect_terraform_roots(active) == [
+            os.path.join(active, "src-svc-1")]
+
+    def _customize(self, o, temp_dir):
+        raw = os.path.join(temp_dir, "raw")
+        active = os.path.join(temp_dir, "active")
+        os.makedirs(os.path.join(raw, "src-svc-1"), exist_ok=True)
+        with open(os.path.join(raw, "src-svc-1", "b.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_storage_bucket" "b" {\n'
+                    '  name = "src-bucket"\n  project = "src-svc-1"\n}\n')
+        host_dir = os.path.join(active, "src-host")
+        os.makedirs(host_dir, exist_ok=True)
+        with open(os.path.join(host_dir, "terraform.tfstate"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        with open(os.path.join(host_dir, "old.tf"), "w", encoding="utf-8") as f:
+            f.write("# old\n")
+        o.customize_hcl(raw, active)
+        return host_dir
+
+    def test_customize_hcl_preserves_skipped_host_dir(self, temp_dir):
+        """raw に無い skip host の active/ を孤児扱いで消さない（state 温存）。"""
+        o = self._orch(temp_dir, skip=True)
+        host_dir = self._customize(o, temp_dir)
+        assert os.path.exists(os.path.join(host_dir, "terraform.tfstate"))
+        assert os.path.exists(os.path.join(host_dir, "old.tf"))
+        assert not os.path.exists(os.path.join(host_dir, ".dst_project"))
+
+    def test_customize_hcl_removes_orphan_host_dir_without_skip(self, temp_dir):
+        o = self._orch(temp_dir, skip=False)
+        host_dir = self._customize(o, temp_dir)
+        assert not os.path.exists(host_dir)
+
+
+# ============================================================
+# --clean-state: 特定プロジェクトの生成物だけ削除
+# ============================================================
+class TestCleanState:
+    def _prep(self, temp_dir):
+        tf_base = os.path.join(temp_dir, "terraform")
+        cfg = _full_config(
+            temp_dir, steps={"bulk_export": {"output_dir": tf_base}})
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        for sub in (os.path.join("active", "src-host"),
+                    os.path.join("active", "src-svc-1"),
+                    os.path.join("raw", "src-svc-1")):
+            os.makedirs(os.path.join(tf_base, sub))
+        with open(os.path.join(tf_base, "active", "src-svc-1", "terraform.tfstate"),
+                  "w", encoding="utf-8") as f:
+            f.write("{}")
+        with open(os.path.join(tf_base, ".gcs_rename_value"), "w", encoding="utf-8") as f:
+            f.write("-dst-x")
+        return path, tf_base, cfg
+
+    def test_resolve_by_src_and_dst_id(self, temp_dir):
+        _path, tf_base, cfg = self._prep(temp_dir)
+        for pid in ("src-svc-1", "dst-svc-1"):
+            targets, unresolved = resolve_clean_targets(cfg, [pid], tf_base)
+            assert unresolved == []
+            assert targets == [
+                os.path.join(tf_base, "active", "src-svc-1"),
+                os.path.join(tf_base, "raw", "src-svc-1"),
+            ]
+
+    def test_resolve_by_marker_for_removed_project(self, temp_dir):
+        """config から消えた旧プロジェクトも .dst_project マーカーで解決できる。"""
+        _path, tf_base, cfg = self._prep(temp_dir)
+        old_dir = os.path.join(tf_base, "active", "src-old")
+        os.makedirs(old_dir)
+        with open(os.path.join(old_dir, ".dst_project"), "w", encoding="utf-8") as f:
+            f.write("dst-old\n")
+        targets, unresolved = resolve_clean_targets(cfg, ["dst-old"], tf_base)
+        assert unresolved == []
+        assert targets == [old_dir]
+
+    def test_unknown_id_is_unresolved(self, temp_dir):
+        _path, tf_base, cfg = self._prep(temp_dir)
+        targets, unresolved = resolve_clean_targets(cfg, ["nope"], tf_base)
+        assert targets == []
+        assert unresolved == ["nope"]
+
+    def test_run_clean_state_removes_only_target(self, temp_dir):
+        path, tf_base, _cfg = self._prep(temp_dir)
+        assert run_clean_state(path, ["dst-svc-1"]) == 0
+        assert not os.path.isdir(os.path.join(tf_base, "active", "src-svc-1"))
+        assert not os.path.isdir(os.path.join(tf_base, "raw", "src-svc-1"))
+        assert os.path.isdir(os.path.join(tf_base, "active", "src-host"))
+        assert os.path.exists(os.path.join(tf_base, ".gcs_rename_value"))
+
+    def test_run_clean_state_aborts_on_unknown_id(self, temp_dir):
+        """1 つでも解決できない ID があれば何も削除しない。"""
+        path, tf_base, _cfg = self._prep(temp_dir)
+        assert run_clean_state(path, ["dst-svc-1", "typo"]) == 1
+        assert os.path.isdir(os.path.join(tf_base, "active", "src-svc-1"))

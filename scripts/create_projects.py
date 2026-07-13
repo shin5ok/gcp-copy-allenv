@@ -275,7 +275,12 @@ class ProjectProvisioner:
         projects: List[str] = []
         host = mapping.get('host_project', {})
         if host.get('dst'):
-            projects.append(host['dst'])
+            if host.get('skip', False):
+                self.logger.info(
+                    f"  host_project.skip=true のため dst host '{host['dst']}' の作成をスキップ"
+                )
+            else:
+                projects.append(host['dst'])
         for svc in mapping.get('service_projects', []) or []:
             if svc.get('dst'):
                 projects.append(svc['dst'])
