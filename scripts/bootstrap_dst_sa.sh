@@ -60,7 +60,8 @@ if [[ ! -f "${CONFIG}" ]]; then
 fi
 
 # --- config.yaml から (dst_project, sa_email) を抽出 --------------------------
-# host_project と service_projects[] の dst / dst_impersonate_service_account。
+# host_project / service_projects[] / standalone_projects[] の
+# dst / dst_impersonate_service_account。
 PAIRS="$(uv run python3 - "${CONFIG}" <<'PY'
 import sys, yaml
 with open(sys.argv[1], encoding="utf-8") as f:
@@ -71,6 +72,7 @@ h = m.get("host_project")
 if isinstance(h, dict):
     ents.append(h)
 ents += [e for e in (m.get("service_projects") or []) if isinstance(e, dict)]
+ents += [e for e in (m.get("standalone_projects") or []) if isinstance(e, dict)]
 for e in ents:
     dst = e.get("dst")
     sa = e.get("dst_impersonate_service_account")

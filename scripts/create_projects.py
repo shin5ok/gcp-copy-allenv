@@ -114,12 +114,17 @@ class ProjectProvisioner:
         if not mapping:
             return ["project_mapping が定義されていません"]
         entries = []
-        host = mapping.get('host_project', {})
-        if isinstance(host, dict):
+        # host 未定義は standalone_projects のみの構成で許容する
+        # （Shared VPC 構成での host 必須チェックは sync_env.validate_config が担う）。
+        host = mapping.get('host_project') or {}
+        if isinstance(host, dict) and host:
             entries.append(("host_project", host))
         for i, svc in enumerate(mapping.get('service_projects', []) or []):
             if isinstance(svc, dict):
                 entries.append((f"service_projects[{i}]", svc))
+        for i, ent in enumerate(mapping.get('standalone_projects', []) or []):
+            if isinstance(ent, dict):
+                entries.append((f"standalone_projects[{i}]", ent))
 
         src_ids = {e.get('src') for _, e in entries if e.get('src')}
         for label, ent in entries:
@@ -284,6 +289,9 @@ class ProjectProvisioner:
         for svc in mapping.get('service_projects', []) or []:
             if svc.get('dst'):
                 projects.append(svc['dst'])
+        for ent in mapping.get('standalone_projects', []) or []:
+            if isinstance(ent, dict) and ent.get('dst'):
+                projects.append(ent['dst'])
         if not projects:
             self.logger.info("dst プロジェクトが mapping にありません。何もしません。")
             return

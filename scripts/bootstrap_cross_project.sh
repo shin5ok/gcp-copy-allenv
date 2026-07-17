@@ -54,6 +54,7 @@ h = m.get("host_project")
 if isinstance(h, dict):
     ents.append(h)
 ents += [e for e in (m.get("service_projects") or []) if isinstance(e, dict)]
+ents += [e for e in (m.get("standalone_projects") or []) if isinstance(e, dict)]
 for e in ents:
     src = e.get("src"); sa = e.get("dst_impersonate_service_account")
     if src and sa:

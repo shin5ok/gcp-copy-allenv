@@ -89,6 +89,7 @@ make vmware-all # VMware → GCE フル処理
 - TERMINATED は `run_command(allow_fail=True)` のまま（stop は ACPI 失敗時に forceful fallback があり通常成功）。
 - transient (`PROVISIONING / STAGING / STOPPING / REPAIRING / SUSPENDING`) と不明値は pending リストに入れず RUNNING のまま残す。
 - 新しい状態遷移コマンド（`suspend` / `resume` など）を増やす時は **`_WRITE_VERBS`（src 拒否リスト）と `_MOCK_KNOWN_PATTERNS`（mock 許容リスト）の両方** に追加。片方だけだと src で実行される / mock が fail-closed で止まる。
+- **user-managed SA は src email のまま dst VM にアタッチできない**（SA は project スコープ。cross-project attach は org policy `iam.disableCrossProjectServiceAccountUsage` 既定 enforced + actAs で "does not have access to service account" になる。regression: my-osaka）。`_resolve_dst_vm_service_account` が proj_map で `<id>@<dst_proj>.iam.gserviceaccount.com` に置換し、dst に無ければ**空 SA を冪等作成**（IAM ロールは複製せず WARNING で手動付与を案内）。proj_map 外プロジェクトの SA は dst 既定 SA に落として WARNING（secure_tag と同じ安全側パターン）。default compute SA（`<番号>-compute@`）は従来どおり除去。
 
 ### Network Firewall Policy（Step 4.5）
 

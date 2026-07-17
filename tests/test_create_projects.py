@@ -220,3 +220,39 @@ def test_provision_parallel_failure_isolated(mock_run, temp_dir):
     # 他プロジェクトは完走している
     for pid in ("d-host", "d-2"):
         assert any(f"billing projects link {pid}" in c for c in cmds)
+
+
+@patch("subprocess.run")
+def test_provision_includes_standalone_projects(mock_run, temp_dir):
+    """standalone_projects の dst も作成対象に含まれる（host 無し構成でも動く）。"""
+    config_data = {
+        "global": {"log_dir": os.path.join(temp_dir, "logs"), "dry_run": True},
+        "bootstrap": {"org_id": "111122223333", "billing_account": "AAAA-BBBB-CCCC"},
+        "project_mapping": {
+            "standalone_projects": [
+                {"src": "src-alone-1", "dst": "dst-alone-1"},
+            ],
+        },
+    }
+    config_path = os.path.join(temp_dir, "config.yaml")
+    _write_yaml(config_path, config_data)
+    mock_run.return_value = MagicMock(returncode=1, stderr="Not found")
+    p = ProjectProvisioner(config_path, dry_run_override=True)
+    p.provision()
+    cmds = [call[0][0] for call in mock_run.call_args_list]
+    assert any("gcloud projects describe dst-alone-1" in c for c in cmds)
+
+
+def test_validate_mapping_checks_standalone_entries(temp_dir):
+    config_data = {
+        "global": {"log_dir": os.path.join(temp_dir, "logs"), "dry_run": True},
+        "bootstrap": {"org_id": "111", "billing_account": "AAAA-BBBB-CCCC"},
+        "project_mapping": {
+            "standalone_projects": [{"src": "same", "dst": "same"}],
+        },
+    }
+    config_path = os.path.join(temp_dir, "config.yaml")
+    _write_yaml(config_path, config_data)
+    p = ProjectProvisioner(config_path)
+    with pytest.raises(SystemExit):
+        p.load_config()

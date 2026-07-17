@@ -10,7 +10,9 @@
 - これらのファイルをインプットとし、自動化スクリプトが各環境の構築・削除・同期制御を行う。
 
 ## 構成要素 (インフラ設計)
-共有VPC（Shared VPC）構成を前提とする。
+共有VPC（Shared VPC）構成を基本とする。加えて、共有 VPC に所属しない独立プロジェクト
+（`project_mapping.standalone_projects`）もサポートする: 自前 VPC / FW を持つプロジェクトを
+src → dst に直接複製し、standalone のみの構成では `host_project` / `service_projects` を省略できる。
 
 ### 1. プロジェクト構造とネットワーク
 - **Host Project (ホストプロジェクト)**: `<SRC_HOST_PROJECT_ID>` (オリジナル)

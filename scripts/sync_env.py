@@ -88,6 +88,7 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud compute network-firewall-policies associations create",
     "gcloud access-context-manager perimeters describe",
     "gcloud access-context-manager perimeters update",
+    "gcloud iam service-accounts create",
     "gcloud services enable",
     "bq ls",
     "bq show",
@@ -1025,6 +1026,8 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
     検証項目:
     - project_mapping の存在
     - host_project と service_projects の src/dst が埋まっている
+      （standalone_projects のみの構成では host/service を省略可能）
+    - standalone_projects（共有 VPC 非所属の独立プロジェクト）の src/dst が埋まっている
     - src と dst が同一でないこと
     - dst 側 ID が src 側 ID と重複していないこと（ORG を上書きしないため）
     - dst が複数の src にマップされていないこと
@@ -1041,18 +1044,36 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
         return ["project_mapping が定義されていません"]
 
     entries = []
+    standalones = mapping.get('standalone_projects', [])
+    if standalones and not isinstance(standalones, list):
+        errors.append("project_mapping.standalone_projects はリストで定義してください")
+        standalones = []
+    has_standalone = isinstance(standalones, list) and len(standalones) > 0
+
     host = mapping.get('host_project')
+    services = mapping.get('service_projects', [])
+    has_services = isinstance(services, list) and len(services) > 0
+
+    # host は Shared VPC 構成（service_projects あり）でのみ必須。
+    # standalone のみの構成では host_project / service_projects とも省略可。
     if not isinstance(host, dict):
-        errors.append("project_mapping.host_project が定義されていません")
+        if has_services or not has_standalone:
+            errors.append("project_mapping.host_project が定義されていません"
+                          "（standalone_projects のみの構成では省略可）")
     else:
         entries.append(("host_project", host))
 
-    services = mapping.get('service_projects', [])
-    if not isinstance(services, list) or len(services) == 0:
-        errors.append("project_mapping.service_projects が空、または定義されていません")
+    if not has_services:
+        if not has_standalone:
+            errors.append("project_mapping.service_projects が空、または定義されていません"
+                          "（共有 VPC 非所属のみなら standalone_projects を定義）")
     else:
         for i, svc in enumerate(services):
             entries.append((f"service_projects[{i}]", svc))
+
+    if has_standalone:
+        for i, ent in enumerate(standalones):
+            entries.append((f"standalone_projects[{i}]", ent))
 
     src_ids = set()
     dst_to_src: Dict[str, str] = {}
@@ -1186,6 +1207,10 @@ class MigrationOrchestrator:
         self.start_t = time.time()
         # src プロジェクト番号 → dst プロジェクト番号 の対応（customize で番号置換に使用）
         self.proj_num_map: Dict[str, str] = {}
+        # VM 復元時の user-managed SA 解決キャッシュ {src_sa_email: dst_sa_email|None}。
+        # 並列 restore worker から同一 SA を二重作成しないよう lock で直列化する。
+        self._vm_sa_resolved: Dict[str, Optional[str]] = {}
+        self._vm_sa_lock = threading.Lock()
 
     # ----- 設定 -----
     def load_config(self):
@@ -2091,6 +2116,12 @@ resource "google_storage_bucket" "mock_bucket" {{
         host = self.config.get('project_mapping', {}).get('host_project', {})
         return host.get('src') if host.get('skip', False) else None
 
+    def _standalone_entries(self) -> List[Dict]:
+        """共有 VPC 非所属の standalone_projects エントリ（dict のみ）を返す。"""
+        raw = (self.config.get('project_mapping', {})
+               .get('standalone_projects', []) or [])
+        return [e for e in raw if isinstance(e, dict)]
+
     def _iter_src_projects(self, include_skipped: bool = False):
         """(src_proj_id, src_sa) を順に返す。skip 指定の host は既定で除外。"""
         mapping = self.config.get('project_mapping', {})
@@ -2100,6 +2131,9 @@ resource "google_storage_bucket" "mock_bucket" {{
         for svc in mapping.get('service_projects', []):
             if svc.get('src'):
                 yield svc['src'], svc.get('src_impersonate_service_account')
+        for ent in self._standalone_entries():
+            if ent.get('src'):
+                yield ent['src'], ent.get('src_impersonate_service_account')
 
     def _iter_project_pairs(self, include_skipped: bool = False):
         """(src, dst, src_sa, dst_sa) を順に返す。skip 指定の host は既定で除外。"""
@@ -2115,6 +2149,11 @@ resource "google_storage_bucket" "mock_bucket" {{
                 yield (svc['src'], svc['dst'],
                        svc.get('src_impersonate_service_account'),
                        svc.get('dst_impersonate_service_account'))
+        for ent in self._standalone_entries():
+            if ent.get('src') and ent.get('dst'):
+                yield (ent['src'], ent['dst'],
+                       ent.get('src_impersonate_service_account'),
+                       ent.get('dst_impersonate_service_account'))
 
     def _parallel_for_each(self, items: List[Any], worker, thread_prefix: str):
         """items の各要素に worker(item) を並列実行。parallel_jobs=1 のときは直列。"""
@@ -2487,6 +2526,9 @@ resource "google_storage_bucket" "mock_bucket" {{
         for svc in mapping.get('service_projects', []):
             if svc.get('src') and svc.get('dst'):
                 proj_map[svc['src']] = svc['dst']
+        for ent in self._standalone_entries():
+            if ent.get('src') and ent.get('dst'):
+                proj_map[ent['src']] = ent['dst']
         return proj_map
 
     def _build_dst_sa_map(self) -> Dict[str, str]:
@@ -3381,26 +3423,43 @@ resource "google_storage_bucket" "mock_bucket" {{
         dst_host = host.get('dst')
         src_sa = host.get('src_impersonate_service_account')
         dst_sa = host.get('dst_impersonate_service_account')
+        standalones = [e for e in self._standalone_entries()
+                       if e.get('src') and e.get('dst')]
 
+        # --- host (Shared VPC) 分 ---
         if not src_host or not dst_host:
-            self.dst_logger.warning("  host_project が未設定のため network_firewall をスキップ")
-            return
-
-        if self._host_skipped():
+            if not standalones:
+                self.dst_logger.warning("  host_project が未設定のため network_firewall をスキップ")
+                return
             self.dst_logger.info(
-                "  host_project.skip=true のため Step 4.5 をスキップ（dst host の FW は既存構成を利用）"
+                "  host_project が未設定（standalone のみ構成）のため host FW 同期をスキップ"
             )
-            return
+        elif self._host_skipped():
+            self.dst_logger.info(
+                "  host_project.skip=true のため host FW 同期をスキップ（dst host の FW は既存構成を利用）"
+            )
+        else:
+            # dst host の VPC topology を Step 4.5 で先に用意する (bug fix)。
+            # Step 5 (gce_restore) でも同じ呼び出しがあるが冪等なので問題ない。
+            self._replicate_host_networks()
+            self.dst_logger.info(
+                f"  [Network] dst host {dst_host} VPC topology ready — FW 同期へ進む"
+            )
+            self._sync_classic_firewall_rules(src_host, dst_host, src_sa, dst_sa)
+            self._sync_network_firewall_policies(src_host, dst_host, src_sa, dst_sa)
 
-        # dst host の VPC topology を Step 4.5 で先に用意する (bug fix)。
-        # Step 5 (gce_restore) でも同じ呼び出しがあるが冪等なので問題ない。
-        self._replicate_host_networks()
-        self.dst_logger.info(
-            f"  [Network] dst host {dst_host} VPC topology ready — FW 同期へ進む"
-        )
+        # --- standalone (共有 VPC 非所属) 分 ---
+        # standalone プロジェクトの FW は自プロジェクトの VPC に属するため、
+        # host と同じ同期処理を src→dst の同一プロジェクトペアで実行する。
+        for ent in standalones:
+            s_src, s_dst = ent['src'], ent['dst']
+            s_src_sa = ent.get('src_impersonate_service_account')
+            s_dst_sa = ent.get('dst_impersonate_service_account')
+            self.dst_logger.info(f"  [Standalone FW] {s_src} → {s_dst}")
+            self._replicate_project_networks(s_src, s_dst, s_src_sa, s_dst_sa)
+            self._sync_classic_firewall_rules(s_src, s_dst, s_src_sa, s_dst_sa)
+            self._sync_network_firewall_policies(s_src, s_dst, s_src_sa, s_dst_sa)
 
-        self._sync_classic_firewall_rules(src_host, dst_host, src_sa, dst_sa)
-        self._sync_network_firewall_policies(src_host, dst_host, src_sa, dst_sa)
         self.dst_logger.info("  ✓ Step 4.5 完了")
 
     def _sync_classic_firewall_rules(
@@ -3836,8 +3895,9 @@ resource "google_storage_bucket" "mock_bucket" {{
         # 通常は Step 4.5 (step_network_firewall) で既に作成済み。冪等なので
         # ここでは _gcloud_exists で skip するだけで実 create は走らない。
         # Step 5 単体実行 (network_firewall.enabled = false) でも動くよう、
-        # 呼び出しは残しておくこと。
+        # 呼び出しは残しておくこと。standalone プロジェクトの自前 VPC も同様。
         self._replicate_host_networks()
+        self._replicate_standalone_networks()
 
         # 1) プロジェクトごとの (vms, snapshots) を並列取得（src read-only）
         project_data: Dict[str, Tuple[List[Dict], List[Dict], str, Optional[str], Optional[str]]] = {}
@@ -3967,7 +4027,7 @@ resource "google_storage_bucket" "mock_bucket" {{
             self._create_disk_from_snapshot(dst_disk_name, snap_path, zone, dst_proj, dst_sa)
             nic = self._build_restore_nic(vm, proj_map, dst_proj, dst_sa)
             with tempfile.TemporaryDirectory(prefix=f"vm-{vm_name}-") as tmpdir:
-                extra = self._build_vm_create_extra_args(vm, tmpdir)
+                extra = self._build_vm_create_extra_args(vm, tmpdir, proj_map, dst_sa)
                 self.run_command(
                     f"gcloud compute instances create {vm_name} --zone={zone} "
                     f"--project={dst_proj} --machine-type={machine_type} {nic} "
@@ -4226,12 +4286,103 @@ resource "google_storage_bucket" "mock_bucket" {{
             parts.append("no-address")
         return "--network-interface=" + ",".join(parts)
 
-    def _build_vm_create_extra_args(self, vm: Dict, tmpdir: str) -> str:
+    def _resolve_dst_vm_service_account(
+        self, sa_email: str, proj_map: Dict[str, str], dst_sa: Optional[str],
+    ) -> Optional[str]:
+        """src VM の user-managed SA email を dst 側 SA email に解決する。
+
+        SA は project スコープのリソースで、src email のまま dst VM にアタッチすると
+        cross-project SA attach となり org policy
+        (constraints/iam.disableCrossProjectServiceAccountUsage 既定 enforced) と
+        actAs 権限の両方で拒否される（"does not have access to service account"）。
+
+        - SA のプロジェクトが proj_map にあれば `<id>@<dst_proj>.iam.gserviceaccount.com`
+          に置換。dst に未存在なら **空の SA を冪等作成**する（IAM ロールは複製しない。
+          必要な権限は WARNING で手動付与を案内）。
+        - proj_map 外プロジェクトの SA / 解釈できない email は None を返し、呼び出し元は
+          --service-account を付けない（dst の compute 既定 SA で起動）+ WARNING。
+          FW の未登録 secure tag と同じ「安全側に倒して WARNING」パターン。
+        - 結果は SA 単位でキャッシュし、並列 restore worker からの二重作成を防ぐ。
+        """
+        with self._vm_sa_lock:
+            if sa_email in self._vm_sa_resolved:
+                return self._vm_sa_resolved[sa_email]
+
+            result: Optional[str] = None
+            m = re.match(r'^([^@]+)@([^.]+)\.iam\.gserviceaccount\.com$', sa_email)
+            if not m:
+                self.dst_logger.warning(
+                    f"  [VM SA] '{sa_email}' を解釈できないため複製せず、"
+                    f"dst の既定 SA で起動します"
+                )
+            elif m.group(2) not in proj_map:
+                self.dst_logger.warning(
+                    f"  [VM SA] '{sa_email}' のプロジェクト '{m.group(2)}' は "
+                    f"project_mapping に無いため複製せず、dst の既定 SA で起動します"
+                    f"（必要なら project_mapping への追加 or 手動で SA 作成 + 指定）"
+                )
+            else:
+                account_id = m.group(1)
+                dst_proj_for_sa = proj_map[m.group(2)]
+                dst_email = f"{account_id}@{dst_proj_for_sa}.iam.gserviceaccount.com"
+                if self._gcloud_exists(
+                    f"gcloud iam service-accounts describe {dst_email} "
+                    f"--project={dst_proj_for_sa} --format='value(email)'",
+                    dst_sa,
+                ):
+                    self.dst_logger.info(f"  [VM SA] {dst_email} は dst に既存。再利用")
+                    result = dst_email
+                else:
+                    out = self.run_command(
+                        f"gcloud iam service-accounts create {account_id} "
+                        f"--project={dst_proj_for_sa} "
+                        f"--display-name={shlex.quote(account_id)} --quiet",
+                        side="dst", logger=self.dst_logger,
+                        desc=f"Create SA {account_id}",
+                        explanation=(
+                            f"dst {dst_proj_for_sa} に VM 用 SA {dst_email} を作成"
+                            f"（IAM ロールは複製しない）"
+                        ),
+                        impersonate_sa=dst_sa, allow_fail=True,
+                    )
+                    if out is None and not (self.dry_run or self.mock):
+                        # 作成失敗（権限不足等）。既定 SA で起動にフォールバック
+                        self.dst_logger.warning(
+                            f"  [VM SA] {dst_email} を作成できませんでした。"
+                            f"dst の既定 SA で起動します"
+                        )
+                    else:
+                        # 新規 SA は伝播に数秒かかることがある。実行モードでは
+                        # instances create が NOT_FOUND にならないよう可視化を待つ。
+                        if not (self.dry_run or self.mock):
+                            for _ in range(6):
+                                if self._gcloud_exists(
+                                    f"gcloud iam service-accounts describe {dst_email} "
+                                    f"--project={dst_proj_for_sa} --format='value(email)'",
+                                    dst_sa,
+                                ):
+                                    break
+                                time.sleep(5)
+                        self.dst_logger.warning(
+                            f"  [VM SA] {dst_email} を新規作成しました。"
+                            f"src SA '{sa_email}' の IAM ロールは複製していません。"
+                            f"必要な権限は dst で手動付与してください"
+                        )
+                        result = dst_email
+
+            self._vm_sa_resolved[sa_email] = result
+            return result
+
+    def _build_vm_create_extra_args(
+        self, vm: Dict, tmpdir: str,
+        proj_map: Dict[str, str], dst_sa: Optional[str],
+    ) -> str:
         """src VM の追加属性（metadata/tags/labels/SA/scheduling 等）を
         gcloud compute instances create の引数文字列に変換する。
 
         - metadata は値に , や = や改行を含むため `--metadata-from-file key=path` で渡す
         - compute 既定 SA（プロジェクト番号始まり）は dst で別 ID になるため SA 指定しない
+        - user-managed SA は _resolve_dst_vm_service_account で dst 側 email に解決する
         - 値は shlex.quote でエスケープ
         """
         args: List[str] = []
@@ -4251,9 +4402,13 @@ resource "google_storage_bucket" "mock_bucket" {{
         # `<project-number>-compute@developer.gserviceaccount.com` は dst で番号違いとなり
         # 借用不可。dst の compute 既定 SA を使わせるため email は付けない。
         if sa_email and not re.match(r'^\d+-compute@developer\.gserviceaccount\.com$', sa_email):
-            args.append(f"--service-account={shlex.quote(sa_email)}")
-            if sa_scopes:
-                args.append("--scopes=" + ",".join(sa_scopes))
+            # user-managed SA は project スコープ。src email のままでは
+            # cross-project attach となり org policy で拒否されるため dst へ解決する。
+            dst_sa_email = self._resolve_dst_vm_service_account(sa_email, proj_map, dst_sa)
+            if dst_sa_email:
+                args.append(f"--service-account={shlex.quote(dst_sa_email)}")
+                if sa_scopes:
+                    args.append("--scopes=" + ",".join(sa_scopes))
 
         sched = vm.get('scheduling') or {}
         if sched.get('preemptible'):
@@ -4485,6 +4640,9 @@ resource "google_storage_bucket" "mock_bucket" {{
         for svc in mapping.get('service_projects', []):
             if svc.get('dst'):
                 dst_projects.append(svc['dst'])
+        for ent in self._standalone_entries():
+            if ent.get('dst'):
+                dst_projects.append(ent['dst'])
 
         # quota/billing project は明示必須（フォールバックしない）。
         # access-context-manager は --project を持たないため、未指定だと gcloud が
@@ -4626,20 +4784,44 @@ resource "google_storage_bucket" "mock_bucket" {{
                 "  [Network] host_project.skip=true のため host VPC 複製をスキップ（既存 dst host を利用）"
             )
             return
-        self.dst_logger.info(f"  [Network] src host '{src_host}' → dst host '{dst_host}' VPC 複製")
+        self._replicate_project_networks(src_host, dst_host, src_sa, dst_sa)
+
+    def _replicate_standalone_networks(self):
+        """standalone_projects の VPC/subnet を各 dst に複製する（冪等）。
+
+        standalone プロジェクトの VPC は bulk-export → terraform apply (Step 4) が
+        作成することもあるが、network_firewall/gce_restore 単体実行や export 漏れに
+        備え、host と同じ gcloud ベースの複製を describe ガード付きで通しておく。
+        """
+        for ent in self._standalone_entries():
+            src, dst = ent.get('src'), ent.get('dst')
+            if not src or not dst:
+                continue
+            self._replicate_project_networks(
+                src, dst,
+                ent.get('src_impersonate_service_account'),
+                ent.get('dst_impersonate_service_account'),
+            )
+
+    def _replicate_project_networks(
+        self, src_host: str, dst_host: str,
+        src_sa: Optional[str], dst_sa: Optional[str],
+    ):
+        """src プロジェクトの custom VPC/subnet を dst プロジェクトへ冪等複製する本体。"""
+        self.dst_logger.info(f"  [Network] src '{src_host}' → dst '{dst_host}' VPC 複製")
 
         nets_json = self.run_command(
             f"gcloud compute networks list --project={src_host} --format=json",
             side="src", logger=self.org_logger,
             desc=f"List Src Networks {src_host}",
-            explanation=f"{src_host} の VPC 一覧を取得（dst host に複製）",
+            explanation=f"{src_host} の VPC 一覧を取得（dst に複製）",
             impersonate_sa=src_sa, allow_fail=True,
         )
         subs_json = self.run_command(
             f"gcloud compute networks subnets list --project={src_host} --format=json",
             side="src", logger=self.org_logger,
             desc=f"List Src Subnets {src_host}",
-            explanation=f"{src_host} のサブネット一覧を取得（dst host に複製）",
+            explanation=f"{src_host} のサブネット一覧を取得（dst に複製）",
             impersonate_sa=src_sa, allow_fail=True,
         )
         try:
@@ -4661,14 +4843,14 @@ resource "google_storage_bucket" "mock_bucket" {{
                 f"--format='value(name)'",
                 dst_sa,
             ):
-                self.dst_logger.info(f"    VPC {name} は dst host に既存。再利用")
+                self.dst_logger.info(f"    VPC {name} は dst {dst_host} に既存。再利用")
             else:
                 self.run_command(
                     f"gcloud compute networks create {name} --subnet-mode={mode} "
                     f"--project={dst_host} --quiet",
                     side="dst", logger=self.dst_logger,
                     desc=f"Create Network {name}",
-                    explanation=f"dst host {dst_host} に VPC {name}（{mode}）を作成",
+                    explanation=f"dst {dst_host} に VPC {name}（{mode}）を作成",
                     impersonate_sa=dst_sa,
                 )
             if mode != 'custom':
@@ -4693,7 +4875,7 @@ resource "google_storage_bucket" "mock_bucket" {{
                     f"--region={region} --range={cidr} --project={dst_host} --quiet",
                     side="dst", logger=self.dst_logger,
                     desc=f"Create Subnet {sname}",
-                    explanation=f"dst host に サブネット {sname}（{region},{cidr}）を作成",
+                    explanation=f"dst {dst_host} に サブネット {sname}（{region},{cidr}）を作成",
                     impersonate_sa=dst_sa,
                 )
 
@@ -4766,8 +4948,24 @@ resource "google_storage_bucket" "mock_bucket" {{
                     rf'(?<![A-Za-z0-9_-]){re.escape(s)}(?![A-Za-z0-9_-])',
                     proj_map[s], base,
                 )
-            if base in overrides:
+            # overrides は src 実名 (orig) でも置換後名 (base) でも引ける
+            if orig in overrides:
+                dst_bucket = overrides[orig]
+            elif base in overrides:
                 dst_bucket = overrides[base]
+            elif '.' in orig:
+                # ドット入り（ドメイン形式）バケットはドメイン検証済み TLD 配下でないと
+                # dst に作成できない（HTTP 400）。特に *.appspot.com（us.artifacts.* =
+                # Container Registry レイヤー / staging.* = App Engine）は Google 管理の
+                # システムバケットで別プロジェクトへの複製自体が不可能。
+                # 意図せず失敗を量産しないよう skip + WARNING（secure_tag_map と同パターン）。
+                self.dst_logger.warning(
+                    f"    gs://{orig}: ドット入り（ドメイン形式）バケットは dst に作成"
+                    f"できないためスキップ。データを移行する場合は rename_rules.gcs."
+                    f"overrides で '{orig}' にドット無しの dst バケット名を指定してください"
+                )
+                self.stats.incr("skipped")
+                return
             else:
                 if method == 'suffix':
                     renamed = f"{base}{value}"
@@ -4891,7 +5089,7 @@ resource "google_storage_bucket" "mock_bucket" {{
 
 
 def _mapping_pairs(config: Dict) -> List[Tuple[str, str]]:
-    """config の project_mapping から (src, dst) 一覧を返す（host → service の順）。"""
+    """config の project_mapping から (src, dst) 一覧を返す（host → service → standalone の順）。"""
     mapping = config.get('project_mapping') or {}
     pairs: List[Tuple[str, str]] = []
     host = mapping.get('host_project') or {}
@@ -4900,6 +5098,9 @@ def _mapping_pairs(config: Dict) -> List[Tuple[str, str]]:
     for svc in mapping.get('service_projects') or []:
         if svc.get('src'):
             pairs.append((svc['src'], svc.get('dst') or ''))
+    for ent in mapping.get('standalone_projects') or []:
+        if isinstance(ent, dict) and ent.get('src'):
+            pairs.append((ent['src'], ent.get('dst') or ''))
     return pairs
 
 

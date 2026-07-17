@@ -56,6 +56,21 @@ PY
 )"
 
 if [[ -z "${HOST_DST}" ]]; then
+  # standalone_projects のみの構成（共有 VPC なし）なら Shared VPC 化は不要なので
+  # エラーにせずスキップする。make bootstrap を standalone 構成でも通すため。
+  HAS_STANDALONE="$(uv run python3 - "${CONFIG}" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+m = cfg.get("project_mapping") or {}
+ents = [e for e in (m.get("standalone_projects") or []) if isinstance(e, dict) and e.get("dst")]
+print("yes" if ents else "")
+PY
+)"
+  if [[ -n "${HAS_STANDALONE}" ]]; then
+    echo "情報: host_project.dst が未定義で standalone_projects のみの構成です。"
+    echo "      共有 VPC ブートストラップは不要のためスキップします。"
+    exit 0
+  fi
   echo "エラー: host_project.dst を取得できませんでした。" >&2
   exit 1
 fi
