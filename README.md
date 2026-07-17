@@ -170,6 +170,13 @@ cp dst/config.yaml.template dst/config.yaml
     `terraform/active/<src_host>/` の state も孤児削除から保護して温存。
     ID / プロジェクト番号の置換マップには host を残すため、service project 内の host 参照
     （Shared VPC ネットワーク URL 等）は正しく dst へ書き換わる。
+  - **`standalone_projects`** (オプション): 共有 VPC に**所属しない**独立プロジェクトのリスト
+    （エントリの形式は `service_projects` と同じ）。自前の VPC/subnet と
+    classic FW rule / network firewall policy は Step 4.5 で src → dst プロジェクトへ
+    直接同期され、VM 復元時の network 参照も自プロジェクトの dst に書き換わる。
+    Shared VPC 化 (`make bootstrap-shared-vpc`) の対象外。
+    **standalone_projects のみの構成では `host_project` / `service_projects` を丸ごと省略可能**
+    （その場合 `bootstrap-shared-vpc` は「対象なし」として自動スキップ）。
 - **`rename_rules`**: GCS バケット等のグローバルユニークなリソースのリネーム規則。
   `gcs.value` に固定文字列を指定するか、`"auto"` にすると日付ベースの一意 suffix
   （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に

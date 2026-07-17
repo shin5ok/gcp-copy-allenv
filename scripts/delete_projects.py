@@ -88,6 +88,9 @@ def _collect_config_dst_map(config: Dict[str, Any]) -> Dict[str, Dict[str, str]]
     for svc in mapping.get("service_projects", []) or []:
         if isinstance(svc, dict) and svc.get("dst"):
             out[svc["dst"]] = {"kind": "svc", "src": svc.get("src", "")}
+    for ent in mapping.get("standalone_projects", []) or []:
+        if isinstance(ent, dict) and ent.get("dst"):
+            out[ent["dst"]] = {"kind": "standalone", "src": ent.get("src", "")}
     return out
 
 

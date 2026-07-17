@@ -54,7 +54,8 @@ if [[ ! -f "${CONFIG}" ]]; then
 fi
 
 # --- config.yaml から (src_project, sa_email) を抽出 --------------------------
-# host_project と service_projects[] の src / src_impersonate_service_account。
+# host_project / service_projects[] / standalone_projects[] の
+# src / src_impersonate_service_account。
 PAIRS="$(uv run python3 - "${CONFIG}" <<'PY'
 import sys, yaml
 with open(sys.argv[1], encoding="utf-8") as f:
@@ -65,6 +66,7 @@ h = m.get("host_project")
 if isinstance(h, dict):
     ents.append(h)
 ents += [e for e in (m.get("service_projects") or []) if isinstance(e, dict)]
+ents += [e for e in (m.get("standalone_projects") or []) if isinstance(e, dict)]
 for e in ents:
     src = e.get("src")
     sa = e.get("src_impersonate_service_account")

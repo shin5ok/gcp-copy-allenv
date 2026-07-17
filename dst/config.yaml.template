@@ -95,6 +95,19 @@ project_mapping:
       src_impersonate_service_account: ""   # [オプション] 空=ローカル認証 (推奨)
       dst_impersonate_service_account: ""   # [オプション] 空=ローカル認証 (推奨)
 
+  # 共有 VPC に所属しない独立プロジェクトのリスト (任意 / 複数指定可能)
+  # 自前の VPC・ファイアウォールを持つプロジェクトをそのまま src → dst に複製します。
+  #   - VPC/subnet と classic FW rule / network firewall policy は Step 4.5 で
+  #     src プロジェクト → dst プロジェクトへ直接同期されます
+  #   - Shared VPC 化 (make bootstrap-shared-vpc) の対象外です
+  #   - standalone_projects のみの構成では host_project / service_projects を
+  #     丸ごと省略できます
+  # standalone_projects:
+  #   - src: "<SRC_STANDALONE_PROJECT_ID>"
+  #     dst: "dst-standalone-1"
+  #     src_impersonate_service_account: ""   # [オプション] 空=ローカル認証 (推奨)
+  #     dst_impersonate_service_account: ""   # [オプション] 空=ローカル認証 (推奨)
+
 # ------------------------------------------------------------------------------
 # 3. リネームルール設定 (Rename Rules)
 # ------------------------------------------------------------------------------
@@ -110,8 +123,14 @@ rename_rules:
                                       # plan/run・skip_on_run 間で同じ値が再利用される。
                                       # 別名で作り直したい場合はこのファイルを削除する。
     # 個別マッピング (特定のバケット名を明示的に指定したい場合に使用)
+    # キーは src の実バケット名（または src→dst プロジェクト ID 置換後の名前）。
+    # 注意: ドット入り（ドメイン形式）バケット（例: us.artifacts.<proj>.appspot.com /
+    # staging.<proj>.appspot.com）は Google 管理のシステムバケットで、dst には
+    # ドット入り名を作成できないため既定では skip + WARNING になります。
+    # データを移行したい場合のみ、ここでドット無しの dst 名を明示指定してください。
     # overrides:
     #   "original-bucket-name": "exact-destination-bucket-name"
+    #   "us.artifacts.src-proj.appspot.com": "us-artifacts-dst-proj"
 
 # ------------------------------------------------------------------------------
 # 4. ステップ制御 (Step Control)

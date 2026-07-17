@@ -1941,3 +1941,323 @@ class TestCleanState:
         path, tf_base, _cfg = self._prep(temp_dir)
         assert run_clean_state(path, ["dst-svc-1", "typo"]) == 1
         assert os.path.isdir(os.path.join(tf_base, "active", "src-svc-1"))
+
+
+# ============================================================
+# standalone_projects: 共有 VPC 非所属プロジェクトの移行
+# ============================================================
+_STANDALONE_ENTRY = {
+    "src": "src-alone-1",
+    "dst": "dst-alone-1",
+    "src_impersonate_service_account": "",
+    "dst_impersonate_service_account": "",
+}
+
+
+class TestValidateConfigStandalone:
+    def test_standalone_with_shared_vpc_ok(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"]["standalone_projects"] = [dict(_STANDALONE_ENTRY)]
+        assert validate_config(cfg) == []
+
+    def test_standalone_only_ok(self, temp_dir):
+        """standalone のみなら host_project / service_projects を省略できる。"""
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"] = {
+            "standalone_projects": [dict(_STANDALONE_ENTRY)],
+        }
+        assert validate_config(cfg) == []
+
+    def test_services_without_host_still_rejected(self, temp_dir):
+        """service_projects がある（Shared VPC 構成）なら host は必須のまま。"""
+        cfg = _full_config(temp_dir)
+        del cfg["project_mapping"]["host_project"]
+        cfg["project_mapping"]["standalone_projects"] = [dict(_STANDALONE_ENTRY)]
+        errors = validate_config(cfg)
+        assert any("host_project" in e for e in errors)
+
+    def test_all_empty_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"] = {"standalone_projects": []}
+        errors = validate_config(cfg)
+        assert errors  # host / service いずれかのエラーが出る
+
+    def test_standalone_src_eq_dst_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        ent = dict(_STANDALONE_ENTRY)
+        ent["dst"] = ent["src"]
+        cfg["project_mapping"]["standalone_projects"] = [ent]
+        errors = validate_config(cfg)
+        assert any("standalone_projects[0]" in e and "同一" in e for e in errors)
+
+    def test_standalone_dst_collides_with_src_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        ent = dict(_STANDALONE_ENTRY)
+        ent["dst"] = "src-host"
+        cfg["project_mapping"]["standalone_projects"] = [ent]
+        errors = validate_config(cfg)
+        assert any("standalone_projects[0]" in e for e in errors)
+
+    def test_standalone_not_a_list_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"]["standalone_projects"] = {"src": "a", "dst": "b"}
+        errors = validate_config(cfg)
+        assert any("リスト" in e for e in errors)
+
+
+class TestStandaloneProjects:
+    def _orch(self, temp_dir, standalone_only=False):
+        cfg = _full_config(temp_dir)
+        if standalone_only:
+            cfg["project_mapping"] = {
+                "standalone_projects": [dict(_STANDALONE_ENTRY)],
+            }
+        else:
+            cfg["project_mapping"]["standalone_projects"] = [dict(_STANDALONE_ENTRY)]
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_iterators_include_standalone(self, temp_dir):
+        o = self._orch(temp_dir)
+        assert [s for s, _ in o._iter_src_projects()] == [
+            "src-host", "src-svc-1", "src-alone-1"]
+        assert [p[0] for p in o._iter_project_pairs()] == [
+            "src-host", "src-svc-1", "src-alone-1"]
+
+    def test_proj_id_map_includes_standalone(self, temp_dir):
+        o = self._orch(temp_dir)
+        assert o._build_proj_id_map() == {
+            "src-host": "dst-host",
+            "src-svc-1": "dst-svc-1",
+            "src-alone-1": "dst-alone-1",
+        }
+
+    def test_standalone_only_iterators(self, temp_dir):
+        o = self._orch(temp_dir, standalone_only=True)
+        assert [p[0] for p in o._iter_project_pairs()] == ["src-alone-1"]
+        assert o._build_proj_id_map() == {"src-alone-1": "dst-alone-1"}
+
+    def test_network_firewall_syncs_standalone(self, temp_dir):
+        """Step 4.5 は host に加えて standalone の FW も src→dst で同期する。"""
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        with patch.object(o, "_replicate_project_networks") as rep, \
+             patch.object(o, "_replicate_host_networks") as rep_host, \
+             patch.object(o, "_sync_classic_firewall_rules") as classic, \
+             patch.object(o, "_sync_network_firewall_policies") as pol:
+            o.step_network_firewall()
+        rep_host.assert_called_once()
+        rep.assert_called_once_with("src-alone-1", "dst-alone-1", "", "")
+        assert ("src-host", "dst-host") in [
+            (c.args[0], c.args[1]) for c in classic.call_args_list]
+        assert ("src-alone-1", "dst-alone-1") in [
+            (c.args[0], c.args[1]) for c in classic.call_args_list]
+        assert ("src-alone-1", "dst-alone-1") in [
+            (c.args[0], c.args[1]) for c in pol.call_args_list]
+
+    def test_network_firewall_standalone_only_skips_host(self, temp_dir):
+        """host 未定義でも standalone があれば Step 4.5 は WARNING 終了しない。"""
+        from unittest.mock import patch
+        o = self._orch(temp_dir, standalone_only=True)
+        with patch.object(o, "_replicate_project_networks") as rep, \
+             patch.object(o, "_replicate_host_networks") as rep_host, \
+             patch.object(o, "_sync_classic_firewall_rules") as classic, \
+             patch.object(o, "_sync_network_firewall_policies") as pol:
+            o.step_network_firewall()
+        rep_host.assert_not_called()
+        rep.assert_called_once_with("src-alone-1", "dst-alone-1", "", "")
+        classic.assert_called_once()
+        pol.assert_called_once()
+
+    def test_replicate_standalone_networks(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        with patch.object(o, "_replicate_project_networks") as rep:
+            o._replicate_standalone_networks()
+        rep.assert_called_once_with("src-alone-1", "dst-alone-1", "", "")
+
+    def test_host_skip_and_standalone_coexist(self, temp_dir):
+        """host_project.skip=true でも standalone は処理対象に残る。"""
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"]["host_project"]["skip"] = True
+        cfg["project_mapping"]["standalone_projects"] = [dict(_STANDALONE_ENTRY)]
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        assert [p[0] for p in o._iter_project_pairs()] == [
+            "src-svc-1", "src-alone-1"]
+
+    def test_resolve_clean_targets_includes_standalone(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"]["standalone_projects"] = [dict(_STANDALONE_ENTRY)]
+        tf_base = os.path.join(temp_dir, "tf")
+        for sub in ("active", "raw"):
+            os.makedirs(os.path.join(tf_base, sub, "src-alone-1"), exist_ok=True)
+        targets, unresolved = resolve_clean_targets(cfg, ["dst-alone-1"], tf_base)
+        assert unresolved == []
+        assert os.path.join(tf_base, "active", "src-alone-1") in targets
+
+
+# ============================================================
+# VM user-managed SA の dst remap（cross-project attach 回避）
+# ============================================================
+class TestVmServiceAccountRemap:
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["project_mapping"]["standalone_projects"] = [dict(_STANDALONE_ENTRY)]
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_mapped_sa_reused_when_exists(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        pm = o._build_proj_id_map()
+        with patch.object(o, "_gcloud_exists", return_value=True), \
+             patch.object(o, "run_command") as rc:
+            got = o._resolve_dst_vm_service_account(
+                "editor@src-alone-1.iam.gserviceaccount.com", pm, None)
+        assert got == "editor@dst-alone-1.iam.gserviceaccount.com"
+        rc.assert_not_called()
+
+    def test_mapped_sa_created_when_missing(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        pm = o._build_proj_id_map()
+        with patch.object(o, "_gcloud_exists", return_value=False), \
+             patch.object(o, "run_command", return_value="") as rc:
+            got = o._resolve_dst_vm_service_account(
+                "editor@src-alone-1.iam.gserviceaccount.com", pm, None)
+        assert got == "editor@dst-alone-1.iam.gserviceaccount.com"
+        cmd = rc.call_args.args[0]
+        assert "gcloud iam service-accounts create editor" in cmd
+        assert "--project=dst-alone-1" in cmd
+
+    def test_unmapped_project_falls_back_to_default(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        pm = o._build_proj_id_map()
+        with patch.object(o, "run_command") as rc:
+            got = o._resolve_dst_vm_service_account(
+                "editor@unrelated-proj.iam.gserviceaccount.com", pm, None)
+        assert got is None
+        rc.assert_not_called()
+
+    def test_result_cached_across_calls(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        pm = o._build_proj_id_map()
+        with patch.object(o, "_gcloud_exists", return_value=True) as ge, \
+             patch.object(o, "run_command"):
+            a = o._resolve_dst_vm_service_account(
+                "editor@src-alone-1.iam.gserviceaccount.com", pm, None)
+            b = o._resolve_dst_vm_service_account(
+                "editor@src-alone-1.iam.gserviceaccount.com", pm, None)
+        assert a == b
+        assert ge.call_count == 1
+
+    def test_extra_args_remaps_user_sa(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        pm = o._build_proj_id_map()
+        vm = {
+            "serviceAccounts": [{
+                "email": "editor@src-alone-1.iam.gserviceaccount.com",
+                "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+            }],
+        }
+        with patch.object(o, "_gcloud_exists", return_value=True):
+            extra = o._build_vm_create_extra_args(vm, temp_dir, pm, None)
+        assert "--service-account=editor@dst-alone-1.iam.gserviceaccount.com" in extra
+        assert "src-alone-1.iam.gserviceaccount.com" not in extra
+
+    def test_extra_args_drops_default_compute_sa(self, temp_dir):
+        o = self._orch(temp_dir)
+        pm = o._build_proj_id_map()
+        vm = {"serviceAccounts": [{
+            "email": "123456789-compute@developer.gserviceaccount.com",
+            "scopes": ["x"]}]}
+        extra = o._build_vm_create_extra_args(vm, temp_dir, pm, None)
+        assert "--service-account" not in extra
+
+    def test_extra_args_drops_unmapped_sa_email(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        pm = o._build_proj_id_map()
+        vm = {"serviceAccounts": [{
+            "email": "editor@unrelated.iam.gserviceaccount.com", "scopes": ["x"]}]}
+        with patch.object(o, "run_command"):
+            extra = o._build_vm_create_extra_args(vm, temp_dir, pm, None)
+        assert "--service-account" not in extra
+
+
+# ============================================================
+# data_sync GCS: ドット入り（ドメイン形式）バケットの扱い
+# ============================================================
+class TestSyncGcsDotBuckets:
+    def _orch(self, temp_dir, overrides=None):
+        cfg = _full_config(temp_dir)
+        cfg["rename_rules"]["gcs"]["overrides"] = overrides or {}
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def _run_sync(self, o, buckets, overrides):
+        """_sync_gcs を run_command/_gcloud_exists を patch して実行し、
+        発行された dst 側コマンド一覧を返す。"""
+        from unittest.mock import patch
+        issued = []
+
+        def fake_run(cmd, **kw):
+            if cmd.startswith("gcloud storage buckets list"):
+                return json.dumps(buckets)
+            issued.append(cmd)
+            return ""
+
+        with patch.object(o, "run_command", side_effect=fake_run), \
+             patch.object(o, "_gcloud_exists", return_value=False):
+            o._sync_gcs("src-svc-1", "dst-svc-1", None, None,
+                        "suffix", "-dst-x", overrides)
+        return issued
+
+    def test_dot_bucket_skipped_with_warning(self, temp_dir):
+        """appspot.com 等のドメイン形式バケットは create/rsync とも実行しない。"""
+        o = self._orch(temp_dir)
+        issued = self._run_sync(
+            o, [{"name": "us.artifacts.src-svc-1.appspot.com", "location": "US"}], {})
+        assert issued == []
+
+    def test_dot_bucket_with_override_synced(self, temp_dir):
+        """overrides に src 実名で dst 名を指定すればドット入りでも同期する。"""
+        o = self._orch(temp_dir)
+        ov = {"us.artifacts.src-svc-1.appspot.com": "artifacts-dst-svc-1"}
+        issued = self._run_sync(
+            o, [{"name": "us.artifacts.src-svc-1.appspot.com", "location": "US"}], ov)
+        assert any("buckets create gs://artifacts-dst-svc-1" in c for c in issued)
+        assert any(
+            "rsync gs://us.artifacts.src-svc-1.appspot.com gs://artifacts-dst-svc-1" in c
+            for c in issued)
+
+    def test_override_by_projmapped_name_still_works(self, temp_dir):
+        """従来互換: proj_map 置換後の名前をキーにした overrides も引き続き有効。"""
+        o = self._orch(temp_dir)
+        ov = {"us.artifacts.dst-svc-1.appspot.com": "artifacts-dst-svc-1"}
+        issued = self._run_sync(
+            o, [{"name": "us.artifacts.src-svc-1.appspot.com", "location": "US"}], ov)
+        assert any("buckets create gs://artifacts-dst-svc-1" in c for c in issued)
+
+    def test_normal_bucket_renamed_and_synced(self, temp_dir):
+        o = self._orch(temp_dir)
+        issued = self._run_sync(
+            o, [{"name": "my-data-bucket", "location": "US"}], {})
+        assert any("buckets create gs://my-data-bucket-dst-x-" in c for c in issued)
+        assert any("rsync gs://my-data-bucket gs://my-data-bucket-dst-x-" in c
+                   for c in issued)
