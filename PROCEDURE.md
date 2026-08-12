@@ -34,7 +34,7 @@
   読取権限を用意する（既存の読取権限があればそれを流用）。
   - 利点: src 側に SA を作らずに済み、src の IAM を書き換えずに読める。
   - src への書き込みはコード上 `is_src_read_only` ガードで impersonate の有無に関わらず常時禁止。
-  - 事前チェックで実行ユーザーに src 書込権が検出された場合は警告 + `[y/N]` 続行確認（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で明示許可）。
+  - 事前チェックで実行ユーザーに src 書込権が検出された場合は警告 + `[y/N]` 続行確認（非対話は `make plan YES=1` / `make run YES=1` で明示許可）。
 - **impersonate 経路を使う場合（オプション）**: `scripts/bootstrap_src_sa.sh --apply` で read-only SA を各 src プロジェクトに作成
   - 付与: `roles/viewer` / `roles/cloudasset.viewer` / 実行ユーザーへ `roles/iam.serviceAccountTokenCreator`
   - **このスクリプトの実行は src(ORG) への IAM 書き込みを伴う**ため、src を一切変更したくない要件には不向き。`sync_env.py` の ORG 保護とは意図的に分離した手動セットアップ用
@@ -116,7 +116,7 @@
   - 不足は全件列挙して即停止（dst SA の不備もここで検出）
 - 借用 SA 未指定のときのフォールバック:
   - `*_impersonate_service_account` 未指定はエラーにせず、ローカル認証（gcloud のアクティブアカウント / ADC）を使う
-  - その認証主体が **src プロジェクトに書込相当の権限を持っていれば**、対象プロジェクトと付与権限を一覧で警告し `[y/N]` で続行確認（非対話セッションは `COPY_ALL_ENV_AUTO_APPROVE=1` で明示許可した時のみ続行）
+  - その認証主体が **src プロジェクトに書込相当の権限を持っていれば**、対象プロジェクトと付与権限を一覧で警告し `[y/N]` で続行確認（非対話セッションは `--yes` = `make plan/run YES=1` を明示指定した時のみ続行。環境変数での自動承認は不可）
   - src 側のコマンド書込動詞拒否ガード (`is_src_read_only`) は impersonate の有無に関わらず常時有効
 
 ### 計画ステップ（src は read-only）

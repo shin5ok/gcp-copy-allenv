@@ -518,23 +518,22 @@ class TestCheckServiceAccounts:
         o.check_service_accounts()  # 例外なし
 
     def test_adc_with_dangerous_perms_aborts_non_tty(self, temp_dir, monkeypatch):
-        # ADC が src に書込権を持つ + 非対話 + AUTO_APPROVE 未指定 → 中断
+        # ADC が src に書込権を持つ + 非対話 + --yes 未指定 → 中断
         o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
         o._sa_preflight_run = self._fake_local_runner()
         o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
         monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
-        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
         with pytest.raises(SystemExit) as ei:
             o.check_service_accounts()
         assert ei.value.code == 1
 
-    def test_adc_auto_approve_env_skips_prompt(self, temp_dir, monkeypatch):
-        # AUTO_APPROVE=1 が指定されていれば非対話でも続行
+    def test_adc_auto_approve_flag_skips_prompt(self, temp_dir, monkeypatch):
+        # --yes が指定されていれば非対話でも続行
         o = self._setup_adc(temp_dir, cai_scan={"enabled": True})
+        o.auto_approve = True
         o._sa_preflight_run = self._fake_local_runner()
         o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
         monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
-        monkeypatch.setenv("COPY_ALL_ENV_AUTO_APPROVE", "1")
         o.check_service_accounts()  # 例外なし
 
     def test_adc_interactive_yes_continues(self, temp_dir, monkeypatch):
@@ -543,7 +542,6 @@ class TestCheckServiceAccounts:
         o._sa_preflight_run = self._fake_local_runner()
         o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
         monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
-        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
         monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
         o.check_service_accounts()  # 例外なし
 
@@ -553,7 +551,6 @@ class TestCheckServiceAccounts:
         o._sa_preflight_run = self._fake_local_runner()
         o._test_iam_permissions = self._fake_perms(granted={"compute.instances.create"})
         monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
-        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
         monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
         with pytest.raises(SystemExit) as ei:
             o.check_service_accounts()
@@ -587,24 +584,40 @@ class TestConfirmAdcSrcWriteOrAbort:
         monkeypatch.setattr("builtins.input", lambda _p="": (_ for _ in ()).throw(AssertionError("called")))
         o._confirm_adc_src_write_or_abort([])  # 例外なし
 
-    def test_non_tty_without_env_exits(self, temp_dir, monkeypatch):
+    def test_non_tty_without_yes_exits(self, temp_dir, monkeypatch):
         o = self._orch(temp_dir)
         monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
-        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
         with pytest.raises(SystemExit) as ei:
             o._confirm_adc_src_write_or_abort(["src 'p': compute.instances.create"])
         assert ei.value.code == 1
 
-    def test_env_overrides_non_tty(self, temp_dir, monkeypatch):
+    def test_yes_flag_overrides_non_tty(self, temp_dir, monkeypatch):
+        o = self._orch(temp_dir)
+        o.auto_approve = True
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
+        monkeypatch.setattr("builtins.input", lambda _p="": (_ for _ in ()).throw(AssertionError("called")))
+        o._confirm_adc_src_write_or_abort(["src 'p': storage.buckets.delete"])  # 例外なし
+
+    def test_yes_flag_skips_prompt_on_tty(self, temp_dir, monkeypatch):
+        # 対話セッションでも --yes があればプロンプトを出さない
+        o = self._orch(temp_dir)
+        o.auto_approve = True
+        monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda _p="": (_ for _ in ()).throw(AssertionError("called")))
+        o._confirm_adc_src_write_or_abort(["src 'p': storage.buckets.delete"])  # 例外なし
+
+    def test_env_var_is_not_honored(self, temp_dir, monkeypatch):
+        # 環境変数による暗黙承認は廃止（気付かないまま承認される事故を防ぐ）
         o = self._orch(temp_dir)
         monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: False)
         monkeypatch.setenv("COPY_ALL_ENV_AUTO_APPROVE", "1")
-        o._confirm_adc_src_write_or_abort(["src 'p': storage.buckets.delete"])  # 例外なし
+        with pytest.raises(SystemExit) as ei:
+            o._confirm_adc_src_write_or_abort(["src 'p': storage.buckets.delete"])
+        assert ei.value.code == 1
 
     def test_interactive_yes(self, temp_dir, monkeypatch):
         o = self._orch(temp_dir)
         monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
-        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
         monkeypatch.setattr("builtins.input", lambda _p="": "yes")
         o._confirm_adc_src_write_or_abort(["src 'p': compute.disks.delete"])  # 例外なし
 
@@ -612,7 +625,6 @@ class TestConfirmAdcSrcWriteOrAbort:
         # Enter キーのみ（空文字）はデフォルト N 扱いで中断
         o = self._orch(temp_dir)
         monkeypatch.setattr("scripts.sync_env.sys.stdin.isatty", lambda: True)
-        monkeypatch.delenv("COPY_ALL_ENV_AUTO_APPROVE", raising=False)
         monkeypatch.setattr("builtins.input", lambda _p="": "")
         with pytest.raises(SystemExit) as ei:
             o._confirm_adc_src_write_or_abort(["src 'p': iam.serviceAccountKeys.create"])

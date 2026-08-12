@@ -1649,6 +1649,7 @@ class MigrationOrchestrator:
         dry_run_override: Optional[bool] = None,
         verbose_override: Optional[bool] = None,
         mock_override: Optional[bool] = None,
+        auto_approve: bool = False,
     ):
         self.config_path = config_path
         self.config: Dict[str, Any] = {}
@@ -1662,6 +1663,9 @@ class MigrationOrchestrator:
         self.dry_run_override = dry_run_override
         self.verbose_override = verbose_override
         self.mock_override = mock_override
+        # --yes / -y。続行確認 ([y/N]) を自動承認する。
+        # 環境変数では「いつ設定したか気付けない」ため、明示的な引数だけを承認手段とする。
+        self.auto_approve = auto_approve
         self.stats = StageStats()
         self.start_t = time.time()
         # src プロジェクト番号 → dst プロジェクト番号 の対応（customize で番号置換に使用）
@@ -1871,8 +1875,9 @@ class MigrationOrchestrator:
         """ローカル認証が src に書込権を持つ場合の警告 + 続行確認。
 
         - warnings が空ならノーオペ。
-        - 環境変数 `COPY_ALL_ENV_AUTO_APPROVE=1` で確認スキップ（CI/非対話用）。
-        - 非対話セッション（stdin が tty でない）かつ AUTO_APPROVE 未指定ならエラー終了。
+        - `--yes` / `-y`（`make plan/run YES=1`）で確認スキップ（CI/非対話用）。
+          環境変数による承認は採用しない（設定済みであることに気付けず暗黙承認になるため）。
+        - 非対話セッション（stdin が tty でない）かつ `--yes` 未指定ならエラー終了。
         - 対話なら `[y/N]` を求め、y/yes 以外は中断。
         """
         if not warnings:
@@ -1903,16 +1908,16 @@ class MigrationOrchestrator:
         )
         print("=" * 60, file=sys.stderr)
 
-        if os.environ.get("COPY_ALL_ENV_AUTO_APPROVE") == "1":
+        if self.auto_approve:
             self.org_logger.warning(
-                "  [SA事前チェック] COPY_ALL_ENV_AUTO_APPROVE=1 により続行確認を自動承認"
+                "  [SA事前チェック] --yes により続行確認を自動承認"
             )
             return
 
         if not sys.stdin.isatty():
             print(
                 " 非対話セッションのため自動続行できません。"
-                " 続行する場合は環境変数 COPY_ALL_ENV_AUTO_APPROVE=1 を設定してください。",
+                " 続行する場合は --yes (make plan/run YES=1) を明示指定してください。",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -5996,6 +6001,10 @@ def main():
     parser.add_argument("--mock", action="store_true", default=None, help="Mock モードを有効化")
     parser.add_argument("--no-mock", action="store_false", dest="mock", help="Mock モードを無効化")
     parser.add_argument(
+        "-y", "--yes", action="store_true", default=False,
+        help="SA 事前チェックの続行確認 ([y/N]) を自動承認する（非対話 / CI 用）",
+    )
+    parser.add_argument(
         "--clean-state", action="append", metavar="PROJECT_ID",
         help="指定プロジェクトの terraform 生成物 (active/raw) と state だけ削除して終了。"
              "src / dst どちらの ID でも可。複数指定可",
@@ -6010,6 +6019,7 @@ def main():
         dry_run_override=args.dry_run,
         verbose_override=args.verbose,
         mock_override=args.mock,
+        auto_approve=args.yes,
     )
     orchestrator.execute()
     if orchestrator.stats.failed > 0:

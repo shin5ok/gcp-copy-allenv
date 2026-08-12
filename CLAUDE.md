@@ -37,7 +37,8 @@ make vmware-all # VMware → GCE フル処理
 - src プロジェクトへの書き込みは禁止（コード上も強制 = `is_src_read_only` ガード）。これは impersonate の有無に関わらず常時適用される最終防衛線。
 - SA impersonation は `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` 経由のみ（推奨だが必須ではない）。`config.yaml` の `*_impersonate_service_account` 未指定はエラーにせず、ローカル認証（gcloud のアクティブアカウント / ADC）にフォールバックする。
   - その認証主体が **src プロジェクトに書込相当の権限**（`_SRC_DANGEROUS_PERMS`）を持っていれば、`check_service_accounts` が事前に対象プロジェクトと付与権限を列挙して警告し、`[y/N]` で続行確認する。
-  - 非対話セッションは `COPY_ALL_ENV_AUTO_APPROVE=1` を明示指定したときのみ続行（デフォルトは abort）。
+  - 続行確認をスキップしたい場合は `--yes` / `-y`（`make plan YES=1` / `make run YES=1`）を**コマンドラインで明示指定**する。非対話セッションは `--yes` があるときのみ続行（デフォルトは abort）。
+  - **環境変数による自動承認は採用しない**（過去の `COPY_ALL_ENV_AUTO_APPROVE` は廃止）。export したまま忘れると「気付かないうちに毎回承認済み」になるため、承認は必ず起動コマンドに現れる形にする。同種の危険操作の承認フラグを増やすときもこの方針に従う（Makefile 側も `YES :=` で環境変数を無視し、コマンドライン指定のみ有効にしてある）。
 - `.env` / `*.key` / `*.json`（サービスアカウントキー）は絶対に編集・コミットしない
 
 ## 禁止事項

@@ -85,7 +85,7 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > - **SA 事前チェック**: 借用 SA の実在・借用可否と代表権限（src=読取 / dst=書込）。代表値の検証で、全リソース種は網羅しません。
 >
 > 💡 ローカル認証（`*_impersonate_service_account` が空）では SA チェックが ADC 経路に切り替わり、
-> src 書込権を検出すると警告 + 続行確認します（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1`）。詳細は §2 を参照。
+> src 書込権を検出すると警告 + 続行確認します（自動承認は `make plan YES=1` / `make run YES=1`）。詳細は §2 を参照。
 
 ### 2. GCP 認証
 サービスアカウントキー (JSON) は使用しません。認証方法は 2 つあります。
@@ -442,7 +442,7 @@ make vmware-clean       # vmware/logs/ を削除
 | :--- | :--- |
 | **side による操作分類** | すべての外部コマンドは `side="src" / "dst" / "local"` のいずれかで実行されます。 |
 | **src は read-only 強制** | `side="src"` のコマンドに書き込み動詞（`create / delete / update / stop / start / attach / detach / mk / cp / rsync / apply` 等）が含まれていたら、**実行前に拒否**して停止します。 |
-| **ローカル認証 / 借用 SA（src を変えないならローカル認証がおすすめ）** | `impersonate_sa` 未指定の場合はローカル認証（gcloud のアクティブアカウント / ADC）で動作します。**src 書込権を持っていれば**事前チェックで警告 + 続行確認（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で許可）。`side="src"` のコマンドそのものに対する書込動詞拒否ガード (`is_src_read_only`) は impersonate の有無にかかわらず常時有効です。 |
+| **ローカル認証 / 借用 SA（src を変えないならローカル認証がおすすめ）** | `impersonate_sa` 未指定の場合はローカル認証（gcloud のアクティブアカウント / ADC）で動作します。**src 書込権を持っていれば**事前チェックで警告 + 続行確認（自動承認は `--yes` / `-y` = `make plan YES=1` / `make run YES=1`。環境変数での自動承認は「設定したまま忘れる」事故防止のため提供しません）。`side="src"` のコマンドそのものに対する書込動詞拒否ガード (`is_src_read_only`) は impersonate の有無にかかわらず常時有効です。 |
 | **設定バリデーション** | `src == dst`、dst が他の src と衝突、`service_projects` が空 等を検出すると、処理を何もせずに停止します。 |
 | **SA 事前チェック** | 実行前に借用 SA の**実在・借用可否・代表権限**（src=読取 / dst=書込）を検証し、不足を検出したら全件列挙して停止します。借用 SA 未指定のプロジェクトはローカル認証の **src 書込権チェック + 続行確認** に切り替わります（`make plan` でも実行、Mock はスキップ）。 |
 | **Mock は fail-closed** | Mock モードで未対応のコマンドが来たら、本物実行に進ませず即停止します。 |

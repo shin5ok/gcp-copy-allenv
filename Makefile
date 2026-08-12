@@ -16,6 +16,12 @@
 VMWARE_CONFIG ?= config.yaml
 VMWARE_MAKE   := $(MAKE) -C vmware CONFIG=$(VMWARE_CONFIG)
 
+# 続行確認 ([y/N]) を自動承認する（非対話 / CI 用）
+#   make plan YES=1 / make run YES=1
+# `?=` ではなく `:=` にして環境変数 YES を無視する（コマンドラインでの明示指定のみ有効）
+YES      :=
+YES_FLAG := $(if $(YES),--yes,)
+
 ## help: ターゲット一覧を表示します
 help:
 	@echo "使用方法: make [target] [ARGS=\"...\"]"
@@ -27,17 +33,17 @@ help:
 setup:
 	uv sync
 
-## plan: ドライランで実行計画を表示します（ORG への書き込みは発生しません / state・生成物は保持）
+## plan: ドライランで実行計画を表示します（ORG への書き込みは発生しません / state・生成物は保持）※YES=1 で続行確認を自動承認
 plan: setup
-	uv run python3 scripts/sync_env.py --dry-run $(ARGS)
+	uv run python3 scripts/sync_env.py --dry-run $(YES_FLAG) $(ARGS)
 
 ## mock: Mock モードで一連の処理をローカル試走（GCP 未接続でも動きます）
 mock: setup
 	uv run python3 scripts/sync_env.py --mock --no-dry-run $(ARGS)
 
-## run: 本番実行（dst プロジェクトに対する書き込みを伴います）
+## run: 本番実行（dst プロジェクトに対する書き込みを伴います）※YES=1 で続行確認を自動承認
 run: setup
-	uv run python3 scripts/sync_env.py --no-dry-run $(ARGS)
+	uv run python3 scripts/sync_env.py --no-dry-run $(YES_FLAG) $(ARGS)
 
 ## test: 単体テスト（pytest）を実行
 test:
