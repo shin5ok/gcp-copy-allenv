@@ -22,6 +22,8 @@ from scripts.sync_env import (
     gcloud_recreate_command,
     analyze_cai_tf_diff,
     format_diff_report,
+    classify_missing_asset,
+    bound_custom_role_ids,
     _parse_gcloud_describe_json,
     resolve_clean_targets,
     run_clean_state,
@@ -1460,6 +1462,102 @@ class TestAnalyzeCaiTfDiff:
         # 自動処理/対象外 (gce_restore, None) は本文に列挙しない
         assert "subnet-svc-missing" not in md
         assert "```bash" in md  # コマンドが fenced コードブロックで提示される
+        # 先頭に WHAT / WHY / HOW テーブルが来る（詳細より前）
+        assert "## 要対応" in md
+        assert "| WHAT（何が dst に無いか） | WHY（なぜ対応が必要か） | HOW（どう対応するか） |" in md
+        assert md.index("## 要対応") < md.index("## プロジェクト別 詳細")
+        assert "## 参考（対応不要と判定したもの）" in md
+
+
+class TestClassifyMissingAsset:
+    def _item(self, atype, short, full="", coverage_step="terraform_apply"):
+        return {
+            "asset_type": atype, "short_name": short,
+            "full_name": full or f"//x/{short}", "location": "global",
+            "coverage_step": coverage_step, "reason": "bulk-export が出力しなかった",
+        }
+
+    def test_user_managed_sa_is_reference_when_iam_sync_enabled(self):
+        c = classify_missing_asset(
+            self._item("iam.googleapis.com/ServiceAccount",
+                       "editor@src-svc.iam.gserviceaccount.com"),
+            iam_sync_enabled=True)
+        assert c["level"] == "reference"
+        assert "iam_sync" in c["why"]
+
+    def test_user_managed_sa_is_action_when_iam_sync_disabled(self):
+        c = classify_missing_asset(
+            self._item("iam.googleapis.com/ServiceAccount",
+                       "editor@src-svc.iam.gserviceaccount.com"),
+            iam_sync_enabled=False)
+        assert c["level"] == "action"
+
+    def test_default_compute_sa_is_reference(self):
+        c = classify_missing_asset(
+            self._item("iam.googleapis.com/ServiceAccount",
+                       "1234567890-compute@developer.gserviceaccount.com"))
+        assert c["level"] == "reference"
+
+    def test_migration_tool_role_is_reference(self):
+        c = classify_missing_asset(self._item(
+            "iam.googleapis.com/Role", "migrationSrcReader",
+            "//iam.googleapis.com/projects/src-svc/roles/migrationSrcReader"))
+        assert c["level"] == "reference"
+
+    def test_unbound_custom_role_is_reference_bound_one_is_action(self):
+        bound = {"projects/src-svc/roles/Incre"}
+        unbound = classify_missing_asset(
+            self._item("iam.googleapis.com/Role", "incre2",
+                       "//iam.googleapis.com/projects/src-svc/roles/incre2"),
+            bound_custom_roles=bound)
+        assert unbound["level"] == "reference"
+        used = classify_missing_asset(
+            self._item("iam.googleapis.com/Role", "Incre",
+                       "//iam.googleapis.com/projects/src-svc/roles/Incre"),
+            bound_custom_roles=bound)
+        assert used["level"] == "action"
+
+    def test_custom_role_is_action_when_bindings_unknown(self):
+        # 判定材料が無い場合は安全側 (要対応) に倒す
+        c = classify_missing_asset(
+            self._item("iam.googleapis.com/Role", "incre2",
+                       "//iam.googleapis.com/projects/src-svc/roles/incre2"),
+            bound_custom_roles=None)
+        assert c["level"] == "action"
+
+    def test_default_log_resources_are_reference_custom_is_action(self):
+        for name in ("_Default", "_Required"):
+            for atype in ("logging.googleapis.com/LogBucket",
+                          "logging.googleapis.com/LogSink"):
+                assert classify_missing_asset(
+                    self._item(atype, name))["level"] == "reference"
+        assert classify_missing_asset(self._item(
+            "logging.googleapis.com/LogSink", "audit-to-bq"))["level"] == "action"
+
+    def test_address_and_unknown_type_are_action(self):
+        assert classify_missing_asset(self._item(
+            "compute.googleapis.com/Address", "svc1-ip"))["level"] == "action"
+        assert classify_missing_asset(self._item(
+            "fake.googleapis.com/Unknown", "x",
+            coverage_step="<unknown>"))["level"] == "action"
+
+
+class TestBoundCustomRoleIds:
+    def test_collects_only_custom_roles_from_bindings(self):
+        policies = {
+            "src-svc": {"bindings": [
+                {"role": "roles/viewer", "members": ["user:a@example.com"]},
+                {"role": "projects/src-svc/roles/Incre", "members": ["user:a@example.com"]},
+                {"role": "organizations/123/roles/OrgRole", "members": []},
+                "not-a-dict",
+            ]},
+            "src-empty": {},
+        }
+        out = bound_custom_role_ids(policies)
+        assert out == {"projects/src-svc/roles/Incre", "organizations/123/roles/OrgRole"}
+
+    def test_empty_input(self):
+        assert bound_custom_role_ids({}) == set()
 
 
 class TestEmitCaiTfDiff:

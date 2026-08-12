@@ -628,9 +628,135 @@ def gcloud_recreate_command(
     ]
 
 
+# ---------------------------------------------------------------------------
+# DIFF.md の「要対応 (action)」/「参考 (reference)」分類
+# ---------------------------------------------------------------------------
+# CAI ↔ TF の欠落は放置すると数十件になり、本当に手を動かす必要があるものが埋もれる。
+# 「dst に無いと実害があるか」で二分し、先頭の WHAT / WHY / HOW テーブルには action
+# だけを載せる。reference も消さずに残す（後から判断を追える形で記録する）。
+#
+# GCP が全プロジェクトに自動生成する logging リソース。dst にも既に存在し create 不可。
+_MANAGED_LOG_RESOURCE_NAMES = frozenset({"_Default", "_Required"})
+# 移行オーケストレータ自身が bootstrap_cross_project.sh で src に作る借用 SA 用ロール。
+# 移行後の dst 運用には不要なので複製しない。
+_MIGRATION_TOOL_ROLE_IDS = frozenset({"migrationSrcReader"})
+
+
+def bound_custom_role_ids(src_policies: Dict[str, Dict[str, Any]]) -> set:
+    """src の project IAM ポリシーで実際に誰かへ付与されているカスタムロール ID の集合。
+
+    `projects/<p>/roles/<r>` / `organizations/<id>/roles/<r>` 形式のみ返す。
+    定義だけあってどこにも付与されていないカスタムロールを DIFF.md の
+    「参考」に落とすための判定材料。
+    """
+    out: set = set()
+    for policy in (src_policies or {}).values():
+        for b in ((policy or {}).get('bindings') or []):
+            if not isinstance(b, dict):
+                continue
+            role = b.get('role') or ''
+            if role.startswith("projects/") or role.startswith("organizations/"):
+                out.add(role)
+    return out
+
+
+def classify_missing_asset(
+    item: Dict[str, Any],
+    iam_sync_enabled: bool = True,
+    bound_custom_roles: Optional[set] = None,
+) -> Dict[str, str]:
+    """欠落 1 件を action / reference に分類し、WHAT 用の種別と WHY / HOW を返す。
+
+    Args:
+        item: analyze_cai_tf_diff が組み立てる missing エントリ
+        iam_sync_enabled: Step 5.7 iam_sync が有効か（SA を dst に作る担当）
+        bound_custom_roles: src の project IAM ポリシーで付与済みのカスタムロール ID。
+                            None は「判定材料が無い」= 安全側で action に倒す。
+
+    Returns: `{'level': 'action'|'reference', 'kind': str, 'why': str, 'how': str}`
+
+    判定できないものは必ず action 側に倒す（見落とすより過剰報告を選ぶ）。
+    """
+    atype = item.get("asset_type", "")
+    short = item.get("short_name", "")
+    full = item.get("full_name", "")
+    kind = atype.split("/", 1)[1] if "/" in atype else atype
+
+    def ref(why: str, how: str = "対応不要。") -> Dict[str, str]:
+        return {"level": "reference", "kind": kind, "why": why, "how": how}
+
+    def act(why: str, how: str) -> Dict[str, str]:
+        return {"level": "action", "kind": kind, "why": why, "how": how}
+
+    if atype == "iam.googleapis.com/ServiceAccount":
+        if not parse_user_managed_sa(short):
+            return ref(
+                "default compute / appspot / Google 管理 service agent。dst には dst 自身の"
+                "プロジェクト番号を持つ同等 SA が既定で存在する（同名で作っても別物になる）。")
+        if iam_sync_enabled:
+            return ref(
+                "Step 5.7 iam_sync が dst に同名 SA を冪等作成し、src の project IAM ロールも"
+                "あわせて複製する。",
+                "dst.log の `[SA] ... を新規作成しました` を確認。無ければ `make run` を再実行。")
+        return act(
+            "steps.iam_sync.enabled=false のため、この SA を dst に作るステップが存在しない。",
+            "iam_sync を有効化して `make run` するか、下記の create コマンドを手動実行。")
+
+    if atype == "iam.googleapis.com/Role":
+        role_id = full.rsplit("/", 1)[-1] if full else short
+        if role_id in _MIGRATION_TOOL_ROLE_IDS:
+            return ref(
+                "移行ツール自身が bootstrap_cross_project.sh で src に作った借用 SA 用ロール。"
+                "移行後の dst 運用には不要。")
+        role_name = full.split("//iam.googleapis.com/", 1)[-1] if full else ""
+        if bound_custom_roles is not None and role_name and role_name not in bound_custom_roles:
+            return ref(
+                "src の project IAM ポリシーで誰にも付与されていない（定義だけが残っている）。"
+                "複製しなくても src と dst で実効権限は変わらない。",
+                "バケット / データセット等リソース単位で付与している場合のみ手動複製。")
+        return act(
+            "src で SA に付与されているカスタムロール。dst に定義が無いと Step 5.7 が付与を"
+            "スキップし、dst SA の権限が src より不足する。",
+            "`gcloud iam roles describe <ID> --project=<src> --format=json` で定義を取得 → "
+            "下記の create コマンドで dst に作成 → `make run` 再実行（Step 5.7 が付与）。")
+
+    if atype in ("logging.googleapis.com/LogBucket", "logging.googleapis.com/LogSink"):
+        if short in _MANAGED_LOG_RESOURCE_NAMES:
+            return ref(
+                "GCP が全プロジェクトに自動生成する既定リソース。dst にも既に存在し、create は"
+                "「already exists」で失敗する。",
+                "src で保持期間 / フィルタをカスタムしている場合のみ dst 側を "
+                "`gcloud logging buckets update` / `sinks update` で合わせる。")
+        return act(
+            "ユーザー定義のログルーティング設定。dst に無いとログの転送先 / 保持期間が src と"
+            "変わる。",
+            "src で `describe` した内容で下記の create コマンドを埋めて実行。")
+
+    if atype == "compute.googleapis.com/Address":
+        return act(
+            "bulk-export が Address を出力しないため dst に予約されない。src で使用中の"
+            "予約 IP は dst に存在せず、参照している VM / LB / DNS が壊れる。",
+            "src で `gcloud compute addresses describe <名前> --project=<src> "
+            "--format='value(address,status,users)'` を実行 → users が空でなければ下記の "
+            "create コマンドで dst に予約（**IP 値は変わる**ので参照側の設定も更新）。")
+
+    if item.get("coverage_step") == "<unknown>":
+        return act(
+            "_ASSET_COVERAGE に未登録の assetType。どのステップも複製を担当しておらず、複製漏れ"
+            "の可能性がある。",
+            "dst で必要か判断し、必要なら手動作成。恒久対応として scripts/sync_env.py の "
+            "_ASSET_COVERAGE に担当ステップ（不要なら None）を追記。")
+
+    return act(
+        item.get("reason") or "自動複製されていない。",
+        "下記詳細の推奨コマンドを確認し、必要なら dst で手動作成。")
+
+
 def analyze_cai_tf_diff(
     cai_path: str, tf_dirs: List[str],
     src_project: str, dst_project: str,
+    iam_sync_enabled: bool = True,
+    bound_custom_roles: Optional[set] = None,
 ) -> Dict[str, Any]:
     """CAI と terraform 出力を突合し、欠落リソースとリカバリコマンドを返す。
 
@@ -640,6 +766,7 @@ def analyze_cai_tf_diff(
                    先頭から順に資料を統合し、いずれかに resource が見つかれば「カバー済み」。
         src_project: src プロジェクト ID（ログ表示用）
         dst_project: dst プロジェクト ID（生成コマンドに埋め込む）
+        iam_sync_enabled / bound_custom_roles: classify_missing_asset に渡す判定材料
 
     Returns:
         {
@@ -649,7 +776,9 @@ def analyze_cai_tf_diff(
             'tf_total':    int,
             'covered':     int,
             'missing':     [ {asset_type, short_name, full_name, location,
-                              tf_resource_type, coverage_step, reason, commands}, ...],
+                              tf_resource_type, coverage_step, reason, commands,
+                              level, kind, why, how}, ...],
+            'action_total': int,   # level == 'action' の件数
             'unknown_types': [str, ...],
         }
     """
@@ -702,7 +831,7 @@ def analyze_cai_tf_diff(
             auto_handled += 1
             continue
 
-        missing.append({
+        entry = {
             "asset_type": atype,
             "short_name": short,
             "full_name": full,
@@ -711,7 +840,12 @@ def analyze_cai_tf_diff(
             "coverage_step": coverage_step,
             "reason": reason,
             "commands": gcloud_recreate_command(atype, short, loc, dst_project, full),
-        })
+        }
+        entry.update(classify_missing_asset(
+            entry, iam_sync_enabled=iam_sync_enabled,
+            bound_custom_roles=bound_custom_roles,
+        ))
+        missing.append(entry)
 
     return {
         "src_project": src_project,
@@ -721,43 +855,128 @@ def analyze_cai_tf_diff(
         "covered": covered,
         "auto_handled": auto_handled,
         "missing": missing,
+        "action_total": sum(1 for m in missing if m["level"] == "action"),
         "unknown_types": sorted(unknown_types),
     }
+
+
+def _md_cell(text: str) -> str:
+    """Markdown テーブルのセルとして安全な 1 行文字列にする。"""
+    return (text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _diff_summary_rows(
+    reports: List[Dict[str, Any]], level: str,
+) -> List[Tuple[str, str, str]]:
+    """missing を (dst, kind, why) でまとめ、(WHAT, WHY, HOW) の行に畳む。
+
+    同じ理由の欠落が 1 プロジェクトに何十件も出る（Address 等）ため、件数と代表名
+    だけをテーブルに載せ、個別の gcloud コマンドは詳細セクションへ譲る。
+    """
+    groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    order: List[Tuple[str, str, str]] = []
+    for r in reports:
+        dst = r["dst_project"] or "<未設定>"
+        for m in r["missing"]:
+            if m["level"] != level:
+                continue
+            key = (dst, m["kind"], m["why"])
+            if key not in groups:
+                groups[key] = {"names": [], "how": m["how"]}
+                order.append(key)
+            groups[key]["names"].append(m["short_name"])
+
+    rows: List[Tuple[str, str, str]] = []
+    for key in order:
+        dst, kind, why = key
+        names = groups[key]["names"]
+        shown = ", ".join(f"`{n}`" for n in names[:3])
+        if len(names) > 3:
+            shown += f" 他 {len(names) - 3} 件"
+        what = f"`{dst}` の **{kind}** {len(names)} 件<br>{shown}"
+        rows.append((_md_cell(what), _md_cell(why), _md_cell(groups[key]["how"])))
+    return rows
 
 
 def format_diff_report(reports: List[Dict[str, Any]]) -> str:
     """analyze_cai_tf_diff の結果群を Markdown レポートに整形する。
 
+    構成は「先頭に要対応の WHAT / WHY / HOW テーブル → 参考（対応不要と判定した
+    もの）→ プロジェクト別の詳細」。実際に手を動かす必要があるものが 50 件超の
+    一覧に埋もれないようにするのが目的。
+
     DIFF.md と stdout の両方で同じテキストを使い、ログには `\n`.split() で行ごと書く。
     """
+    action_rows = _diff_summary_rows(reports, "action")
+    ref_rows = _diff_summary_rows(reports, "reference")
+    action_total = sum(r.get("action_total", 0) for r in reports)
+    ref_total = sum(
+        len(r["missing"]) - r.get("action_total", 0) for r in reports
+    )
+
     lines: List[str] = []
     lines.append("# CAI ↔ Terraform bulk-export 差分レポート")
     lines.append("")
     lines.append("Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、")
-    lines.append("bulk-export / terraform で **自動再現されず、手動で dst 作成・調整が必要なもの** だけを")
-    lines.append("プロジェクトごとに列挙し、dst 側に再現するための gcloud コマンドを併記します。")
-    lines.append("（read 操作の describe / list は省き、作成系コマンドのみ掲載）")
+    lines.append("bulk-export / terraform で自動再現されなかったものを、")
+    lines.append("**要対応**（dst に無いと実害があるもの）と **参考**（別ステップが処理済み /")
+    lines.append("dst に既定で存在する等、対応不要と判定したもの）に分けて記録します。")
     lines.append("")
-    lines.append("掲載対象（要手動対応）:")
-    lines.append("- 「未登録」: `_ASSET_COVERAGE` に無い assetType（複製漏れの可能性）。")
-    lines.append("- 「bulk-export が出力しなかった」: terraform_apply 担当のはずが TF 出力に無い。")
+    lines.append(
+        f"- 要対応: **{action_total}** 件 / 参考: **{ref_total}** 件"
+    )
     lines.append("")
-    lines.append("非掲載（自動処理 / 対象外。件数のみ集計）:")
+    lines.append("## 要対応")
+    lines.append("")
+    if not action_rows:
+        lines.append("要対応の欠落はありません。 ✓")
+        lines.append("")
+    else:
+        lines.append("| WHAT（何が dst に無いか） | WHY（なぜ対応が必要か） | HOW（どう対応するか） |")
+        lines.append("| --- | --- | --- |")
+        for what, why, how in action_rows:
+            lines.append(f"| {what} | {why} | {how} |")
+        lines.append("")
+        lines.append("個別リソースの gcloud コマンドは「プロジェクト別 詳細」を参照してください。")
+        lines.append("")
+
+    lines.append("## 参考（対応不要と判定したもの）")
+    lines.append("")
+    lines.append("記録として残しますが、放置して問題ありません。")
+    lines.append("判定が環境に合わない場合のみ、詳細のコマンドを使って手動対応してください。")
+    lines.append("")
+    if not ref_rows:
+        lines.append("該当なし。")
+        lines.append("")
+    else:
+        lines.append("| WHAT | 対応不要と判定した理由 | 補足 |")
+        lines.append("| --- | --- | --- |")
+        for what, why, how in ref_rows:
+            lines.append(f"| {what} | {why} | {how} |")
+        lines.append("")
+
+    lines.append("なお、以下は差分としても数えていません（件数のみ集計）:")
+    lines.append("")
     lines.append("- 専用ステップ（Step 4.5 network_firewall / Step 5 gce_restore / Step 6 data_sync）が複製。")
     lines.append("- `_ASSET_COVERAGE` で None 指定の意図的対象外（実害なし）。")
+    lines.append("")
+    lines.append("## プロジェクト別 詳細")
+    lines.append("")
+    lines.append("（read 操作の describe / list は省き、作成系コマンドのみ掲載）")
     lines.append("")
 
     grand_total = 0
     for r in reports:
         sp = r["src_project"]
         dp = r["dst_project"] or "<未設定>"
-        lines.append(f"## プロジェクト: `{sp}` → `{dp}`")
+        lines.append(f"### プロジェクト: `{sp}` → `{dp}`")
         lines.append("")
         lines.append(
             f"- CAI 検出リソース: **{r['cai_total']}** 件"
             f" / TF 出力リソース: **{r['tf_total']}** 件"
             f" / 一致: **{r['covered']}** 件"
-            f" / 要手動対応: **{len(r['missing'])}** 件"
+            f" / 要対応: **{r.get('action_total', 0)}** 件"
+            f" / 参考: **{len(r['missing']) - r.get('action_total', 0)}** 件"
             f" / 自動処理・対象外: **{r.get('auto_handled', 0)}** 件"
         )
         if r["unknown_types"]:
@@ -766,39 +985,58 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
             )
         lines.append("")
         if not r["missing"]:
-            lines.append("要手動対応の欠落なし。 ✓")
+            lines.append("欠落なし。 ✓")
             lines.append("")
             continue
 
-        # 種別ごとにグルーピングして読みやすくする
+        # 種別ごとにグルーピングし、要対応を先に並べる
         by_type: Dict[str, List[Dict[str, Any]]] = {}
         for m in r["missing"]:
             by_type.setdefault(m["asset_type"], []).append(m)
-        for atype in sorted(by_type.keys()):
-            items = by_type[atype]
-            lines.append(f"### `{atype}` （{len(items)} 件）")
+        for atype in sorted(
+            by_type, key=lambda t: (
+                all(x["level"] != "action" for x in by_type[t]), t,
+            )
+        ):
+            items = sorted(by_type[atype], key=lambda x: x["level"] != "action")
+            n_act = sum(1 for x in items if x["level"] == "action")
+            lines.append(
+                f"#### `{atype}` （{len(items)} 件 / うち要対応 {n_act} 件）"
+            )
             lines.append("")
+            # 同じ WHY / HOW を項目ごとに繰り返すと読めなくなるため、判定単位で
+            # 見出しにまとめ、項目にはリソース固有の情報だけを書く。
+            sub: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
             for m in items:
-                grand_total += 1
-                lines.append(
-                    f"#### `{m['short_name']}` "
-                    f"(location=`{m['location'] or 'global'}`)"
-                )
+                sub.setdefault((m["level"], m["why"], m["how"]), []).append(m)
+            for (level, why, how), group in sub.items():
+                badge = "要対応" if level == "action" else "参考"
+                lines.append(f"##### [{badge}] {len(group)} 件")
                 lines.append("")
-                lines.append(f"- full name: `{m['full_name']}`")
-                cov = m.get("coverage_step")
+                lines.append(f"- WHY: {why}")
+                lines.append(f"- HOW: {how}")
+                cov = group[0].get("coverage_step")
                 cov_disp = cov if cov is not None else "意図的対象外 (None)"
                 lines.append(f"- 担当ステップ: `{cov_disp}`")
-                lines.append(f"- 期待 TF 型: `{m['tf_resource_type'] or 'なし'}`")
-                lines.append(f"- 判定理由: {m['reason']}")
-                lines.append("- 推奨コマンド:")
-                lines.append("  ```bash")
-                for c in m["commands"]:
-                    lines.append(f"  {c}")
-                lines.append("  ```")
+                lines.append(f"- 期待 TF 型: `{group[0]['tf_resource_type'] or 'なし'}`")
+                lines.append(f"- 検出理由: {group[0]['reason']}")
                 lines.append("")
+                for m in group:
+                    grand_total += 1
+                    lines.append(
+                        f"`{m['short_name']}` (location=`{m['location'] or 'global'}`)"
+                        f" — `{m['full_name']}`"
+                    )
+                    lines.append("")
+                    lines.append("```bash")
+                    for c in m["commands"]:
+                        lines.append(c)
+                    lines.append("```")
+                    lines.append("")
     lines.append("---")
-    lines.append(f"合計（要手動対応）: **{grand_total}** 件")
+    lines.append(
+        f"合計: 要対応 **{action_total}** 件 / 参考 **{grand_total - action_total}** 件"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -1432,6 +1670,9 @@ class MigrationOrchestrator:
         # 並列 restore worker から同一 SA を二重作成しないよう lock で直列化する。
         self._vm_sa_resolved: Dict[str, Optional[str]] = {}
         self._vm_sa_lock = threading.Lock()
+        # Step 5.7 が取得した src の project IAM ポリシー。DIFF.md の分類
+        # （カスタムロールが実際に誰かへ付与されているか）で再利用する。
+        self._src_iam_policies: Dict[str, Dict[str, Any]] = {}
 
     # ----- 設定 -----
     def load_config(self):
@@ -2261,6 +2502,14 @@ resource "google_storage_bucket" "mock_bucket" {{
         tf_base = bulk_cfg.get('output_dir', './terraform')
         proj_map = self._build_proj_id_map()
 
+        # 要対応 / 参考 の分類材料。Step 5.7 が取得済みの src ポリシーを再利用し、
+        # 未取得（iam_sync 無効 / 取得失敗）なら None を渡して安全側（要対応）に倒す。
+        iam_sync_enabled = step_enabled(self.config.get('steps', {}), 'iam_sync')
+        bound_roles = (
+            bound_custom_role_ids(self._src_iam_policies)
+            if self._src_iam_policies else None
+        )
+
         reports: List[Dict[str, Any]] = []
         for src_proj, _sa in self._iter_src_projects():
             cai_path = os.path.join(cai_dir, f"cai_resources_{src_proj}.txt")
@@ -2279,12 +2528,15 @@ resource "google_storage_bucket" "mock_bucket" {{
                 tf_dirs=tf_dirs,
                 src_project=src_proj,
                 dst_project=proj_map.get(src_proj, ""),
+                iam_sync_enabled=iam_sync_enabled,
+                bound_custom_roles=bound_roles,
             )
             reports.append(report)
             self.org_logger.info(
                 f"  {src_proj}: CAI {report['cai_total']} 件 / "
                 f"TF {report['tf_total']} 件 / 一致 {report['covered']} 件 / "
-                f"要手動 {len(report['missing'])} 件 / "
+                f"要対応 {report['action_total']} 件 / "
+                f"参考 {len(report['missing']) - report['action_total']} 件 / "
                 f"自動・対象外 {report.get('auto_handled', 0)} 件"
             )
 
@@ -4910,6 +5162,8 @@ resource "google_storage_bucket" "mock_bucket" {{
                 policies[src_proj] = obj
 
         self._parallel_for_each(targets, worker, "iam-scan")
+        # DIFF.md の分類（カスタムロールが実際に付与されているか）で再利用する。
+        self._src_iam_policies = policies
         return policies
 
     def _gcloud_json(self, cmd: str, impersonate_sa: Optional[str]) -> Optional[Any]:

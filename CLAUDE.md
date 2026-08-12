@@ -130,6 +130,19 @@ make vmware-all # VMware → GCE フル処理
 - 付与は **dst プロジェクト単位で並列 / プロジェクト内は直列**。`add-iam-policy-binding` は read-modify-write なので同一プロジェクトへ並列実行すると etag 競合（ABORTED）になる。
 - `--condition=None` を必ず付ける（既存ポリシーに条件付きバインディングがあると gcloud が対話プロンプトを出してハングする）。
 
+### DIFF.md の要対応 / 参考 分類（Step 99）
+
+- DIFF.md は放置すると 50 件超になり、**実際に手を動かす必要があるものが埋もれる**。`classify_missing_asset()` が欠落 1 件を `action` / `reference` に分け、`format_diff_report()` が先頭に **WHAT / WHY / HOW テーブル（action のみ）** → 参考テーブル → プロジェクト別詳細の順で出す。
+- reference に落とす条件（＝実害が無いと言い切れるものだけ）:
+  - user-managed SA … `iam_sync` 有効なら Step 5.7 が dst に作成 + ロール複製する（**無効なら action**）
+  - default compute / appspot / Google 管理 service agent … dst に dst 自身の番号を持つ同等物が既定で存在
+  - `_MANAGED_LOG_RESOURCE_NAMES`（`_Default` / `_Required`）… GCP 自動生成。create は「already exists」で失敗する
+  - `_MIGRATION_TOOL_ROLE_IDS`（`migrationSrcReader`）… 移行ツール自身が src に作った借用 SA 用ロール
+  - src の project IAM ポリシーで**誰にも付与されていない**カスタムロール（`bound_custom_role_ids()` で判定）
+- **判定材料が無い場合は必ず action に倒す**（`bound_custom_roles=None` 等）。見落とすより過剰報告を選ぶ。
+- カスタムロールの付与判定は `step_iam_sync` が取った src ポリシー（`self._src_iam_policies`）の再利用。iam_sync 無効時は取得されず `None` → 全カスタムロールが action になる（意図どおり）。
+- 分類は純粋関数なのでテストは直接叩く（`TestClassifyMissingAsset` / `TestBoundCustomRoleIds`）。**新しい「実は対応不要」パターンを見つけたら reference 条件に足す**。逆に判断が付かないものを reference に入れてはいけない。
+
 ### VPC Service Controls の quota project（Step 7）
 
 - `gcloud access-context-manager perimeters describe/update` は **org/policy スコープのコマンドで `--project` を持たない**。quota/billing project を明示しないと gcloud が **ローカル `gcloud config` の `core/project`（移行と無関係なプロジェクト）** を quota に使い、そのプロジェクトで API 無効のまま `accesscontextmanager.googleapis.com ... SERVICE_DISABLED` / `(y/N)?` プロンプトで失敗する（regression）。
@@ -151,6 +164,8 @@ make vmware-all # VMware → GCE フル処理
   - `Co-Authored-By: Claude ...` 行を付けない
   - `🤖 Generated with Claude Code` などの行も付けない
   - 勝手にコミットやプッシュしない
+  - GitHub Flow に従う
+  - branch は feat/branchname ではなく branchname で作る
 
 ## ツール
 以下のツールを積極的に使う
