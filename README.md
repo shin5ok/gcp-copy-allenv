@@ -34,7 +34,9 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 #### C. コピー元 (src) 側
 - [ ] 各 src プロジェクトの **プロジェクト ID** を把握している
       （`config.yaml` の `project_mapping.host_project.src` / `service_projects[].src` に記入）
-- [ ] 各 src プロジェクトに実行ユーザーの**読み取り権限**（`roles/viewer` 相当）を付与済み（ローカル認証）
+- [ ] 各 src プロジェクトに実行ユーザーの**読み取り権限**を付与済み（ローカル認証）
+      → `roles/viewer` だけでは不足します。必要なロール一覧は
+      [推奨構成: 最小権限の principal を 1 つ用意する](#推奨構成-最小権限の-principal-を-1-つ用意する) を参照
       → Impersonation を使う場合は `scripts/bootstrap_src_sa.sh --apply` で read-only SA を一括投入（`roles/viewer` + `roles/cloudasset.viewer` + 実行ユーザーへ `roles/iam.serviceAccountTokenCreator`）
 - [ ] 移行対象の **全 GCE VM に期限内スナップショット**（既定 30 日以内）が存在
       → 無いと Step 2 `gce_snapshot` がエラーで停止（`make plan` でも検出）
@@ -152,6 +154,30 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 >
 > SA 事前チェックで dst SA の借用に失敗した場合、`make plan` / `make run` の停止メッセージに
 > 上記コマンドが自動表示されます。
+
+#### 推奨構成: 最小権限の principal を 1 つ用意する
+
+**移行実行専用の principal（ユーザーアカウントまたは SA）を 1 つ用意し、src には読み取りのみ・dst には書き込みを付ける**のが、いま取れる最も安全な構成です。
+
+| 対象 | 付与するロール | 理由 |
+| :--- | :--- | :--- |
+| **src（全プロジェクト）** | `roles/viewer` | compute / GCS の read、`resourcemanager.projects.getIamPolicy`（Step 5.7）を含む |
+| | `roles/cloudasset.viewer` | `cloudasset.assets.searchAllResources`（Step 1 `cai_scan` / Step 3 `bulk_export`）。**`roles/viewer` には含まれません** |
+| | `roles/bigquery.dataViewer` | BigQuery のデータ読み取り（Step 6 `data_sync`） |
+| | `migrationSrcReader`（カスタム） | `compute.snapshots.useReadOnly` など定義済みロールで賄えない read 権限。`scripts/bootstrap_cross_project.sh` が作成 |
+| **dst（全プロジェクト）** | `bootstrap_dst_sa.sh` の `ROLES` 相当 | `roles/editor` + `storage.admin` + `bigquery.admin` + `iam.roleAdmin` + `resourcemanager.projectIamAdmin`。dst では事実上 owner 相当の権限が必要です |
+
+> ⚠️ **`roles/viewer` だけでは足りません。** 上表の 4 つを揃えないと Step 1 / 3 / 5 / 6 が権限不足で失敗します。
+
+**なぜ安全か**: src 側に書き込み権限が無ければ、コードのバグや将来の改修があっても API が 403 で弾きます。
+これは `is_src_read_only` ガード（コードレベル）の**外側**にある保証で、多層防御になります。
+さらに SA 事前チェックが src の代表的な書込権を実測するため、**`[y/N]` の続行確認が一度も出なければ「書込権を持っていない」ことの実行時証拠**になります（出た場合は最小権限になっていないシグナル）。
+
+**ADC 直接指定と Impersonation のどちらでも使えます**が、`src_impersonate_service_account` に指定する方がわずかに優れます（src 読み取りに使う資格情報を実行ユーザー本人と明示的に分離でき、監査ログでも区別できるため）。
+
+> 📌 **注意**: `bootstrap_src_sa.sh` / `bootstrap_cross_project.sh` は **src(ORG) に IAM を書き込みます**。
+> read-only の principal では実行できないので、これらは別の管理者アカウントで先に済ませてから、
+> 移行本体を最小権限 principal で回してください。
 
 ### 3. 設定ファイル (config.yaml) の準備
 テンプレートからコピーして、環境に合わせて編集します。
