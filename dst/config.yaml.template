@@ -192,6 +192,33 @@ steps:
     # 0 にすると待たない。suspend は ACPI S3 応答に依存するため、短すぎると失敗しやすい。
     power_state_wait_seconds: 120
 
+  # [Step 5.7] src の SA に付いている IAM ロールを dst の同名 SA へ複製
+  # このキー自体を書かなくても有効（設定不要で動く）。無効化したいときだけ false。
+  #
+  # 対象: src 各プロジェクトの project IAM ポリシーのうち、user-managed SA
+  #       (<id>@<project>.iam.gserviceaccount.com) 宛のバインディング。
+  #       ロール ID と SA email を project_mapping で dst 側に読み替えて付与する。
+  #       dst に SA が無ければ空の SA を冪等作成する。
+  #
+  # 意図的に複製しないもの（いずれも dst の権限が緩む方向には作用しない）:
+  #   - 条件付きバインディング (IAM Conditions) … 条件式が src のリソース名を参照しうる
+  #   - ORG カスタムロール organizations/<id>/roles/... … dst ORG に同じ ID が無い
+  #   - project_mapping 外のプロジェクトの SA / カスタムロール
+  #   - default compute / appspot / Google 管理 service agent … dst に同等物がある
+  #   - SA リソース自身の IAM ポリシー（誰がその SA を借用できるか）
+  #   - プロジェクト以外（バケット / データセット等）のリソース単位バインディング
+  #
+  # 必要権限:
+  #   src … resourcemanager.projects.getIamPolicy (roles/viewer に含まれる)
+  #   dst … roles/resourcemanager.projectIamAdmin
+  #         (bootstrap_dst_sa.sh が付与。無い場合はエラーにせず
+  #          「スキップ + 手動 add-iam-policy-binding コマンド案内」に倒す)
+  #
+  # roles/owner 等の超高権限ロールも src と同じであれば複製する。付与した場合は
+  # 実行ログの最後に取り消しコマンド付きで WARNING を出すので必ずレビューすること。
+  iam_sync:
+    enabled: true
+
   # [Step 6] データの移行 (GCS, BigQueryなど)
   data_sync:
     enabled: true

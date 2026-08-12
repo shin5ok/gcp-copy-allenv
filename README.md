@@ -145,7 +145,8 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > make bootstrap-shared-vpc             # host を Shared VPC 化、svc をアタッチ、networkUser 付与
 > ```
 > 中身（呼び出されるスクリプト）:
-> - `scripts/bootstrap_dst_sa.sh` … dst SA を各 dst プロジェクトに作成し、`roles/editor`・`roles/storage.admin`・`roles/bigquery.admin` と、実行アカウントへの `roles/iam.serviceAccountTokenCreator` を付与。
+> - `scripts/bootstrap_dst_sa.sh` … dst SA を各 dst プロジェクトに作成し、`roles/editor`・`roles/storage.admin`・`roles/bigquery.admin`・`roles/iam.roleAdmin`・`roles/resourcemanager.projectIamAdmin` と、実行アカウントへの `roles/iam.serviceAccountTokenCreator` を付与。
+>   `projectIamAdmin` は Step 5.7 (`iam_sync`) で src SA のロールを dst SA へ付与するために必要です（`roles/editor` に `setIamPolicy` は含まれません）。この SA が「任意の principal に任意のロールを配れる」力を持つ点は理解した上で運用してください。IAM 複製が不要なら `steps.iam_sync.enabled: false` にしてこのロールを外せます。**既存環境では再実行が必要です。**
 > - `scripts/bootstrap_cross_project.sh` … 各 src プロジェクトに read-only カスタムロール `migrationSrcReader` を作成し、対応する dst SA に付与（さらに `roles/bigquery.dataViewer`）。**src(ORG) への read-only IAM 付与**を伴うため、`sync_env.py` の ORG 保護から意図的に分離されています。
 > - `scripts/bootstrap_shared_vpc.sh` … dst host を Shared VPC ホストにし、dst svc プロジェクトをアタッチ、各 svc の cloudservices/compute SA と svc 借用 SA に `roles/compute.networkUser` を付与。
 >
@@ -182,10 +183,23 @@ cp dst/config.yaml.template dst/config.yaml
   （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に
   永続化され、`make plan` / `make run` / `skip_on_run` 間で同じ値が再利用されます
   （別名で作り直す場合はこのファイルを削除）。
-- **`steps`**: 各ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `data_sync` / `vpc_sc`) の有効/無効と個別設定（スナップショット期限など）。
+- **`steps`**: 各ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `iam_sync` / `data_sync` / `vpc_sc`) の有効/無効と個別設定（スナップショット期限など）。
   `bulk_export.skip_on_run: true` にすると本番実行 (`make run`) では export/customize を
   スキップし、`make plan` で生成済みの `terraform/active/` を再利用して高速化します
   （`make plan` 自体は常に最新を取り直します）。
+  - **`iam_sync`** (Step 5.7): src の SA に付いている IAM ロールを dst の同名 SA へ複製。
+    **キー未指定でも有効**（設定不要で動きます）。無効にするときだけ `enabled: false`。
+    - 対象は **src 各プロジェクトの project IAM ポリシー**のうち user-managed SA
+      (`<id>@<project>.iam.gserviceaccount.com`) 宛のバインディング。ロール ID と SA email を
+      `project_mapping` で dst 側に読み替えて付与し、dst に SA が無ければ空 SA を冪等作成します。
+    - **複製しないもの**（いずれも dst の権限が緩む方向には作用しません。理由付きで WARNING）:
+      条件付きバインディング / ORG カスタムロール / `project_mapping` 外のプロジェクトの SA・
+      カスタムロール / default compute・appspot・Google 管理 service agent /
+      SA 自身の IAM ポリシー（誰が借用できるか）/ バケット・データセット等のリソース単位バインディング。
+    - **`roles/owner` 等の超高権限ロールも src と同じなら複製します**。付与した場合は実行ログの
+      最後に「何を・どこに・なぜ・取消コマンド」を WARNING でまとめて出すので必ずレビューしてください。
+    - dst 側に `roles/resourcemanager.projectIamAdmin` が必要（`bootstrap_dst_sa.sh` が付与）。
+      権限が無い場合は**エラーにせず**スキップし、手動用の `add-iam-policy-binding` コマンドを案内します。
   - **`vpc_sc`** (Step 7): 既存の VPC Service Controls ペリメタへ dst プロジェクトを追加。
     `access_policy` / `perimeter` に加え **`billing_project` が必須**（access-context-manager は
     `--project` を持たず、未指定だとローカル `gcloud config` の無関係なプロジェクトを quota に
@@ -302,9 +316,10 @@ make run
 > 2. classic firewall ルールと Network Firewall Policy は **Step 4.5 (`network_firewall`)** で `gcloud` 経由で複製（dst host VPC が Step 1 で出来ている前提。`secure_tag_map` で別 ORG の tagValues 変換、未登録参照は skip + WARNING）。
 > 3. Original の有効なスナップショット（期限内）から、コピー先にディスクを復元。
 > 4. 復元したブートディスクを VM に差し替えて起動（OS 状態・データごと完全復元）。電源状態（RUNNING / TERMINATED / SUSPENDED）は Step 5 最終フェーズでまとめて反映。
-> 5. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
-> 6. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
-> 7. 全移行の最後に、dst プロジェクトを既存の VPC Service Controls ペリメタへ追加（`vpc_sc.billing_project` が必須。未設定ならスキップ）。
+> 5. src の SA に付いていた IAM ロールを **Step 5.7 (`iam_sync`)** で dst の同名 SA へ複製（別 ORG で ID が変わるロールはスキップ + WARNING。`roles/owner` を付与した場合は末尾に警告）。
+> 6. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
+> 7. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
+> 8. 全移行の最後に、dst プロジェクトを既存の VPC Service Controls ペリメタへ追加（`vpc_sc.billing_project` が必須。未設定ならスキップ）。
 
 > ♻️ **Terraform 適用の冪等性 / state 管理**（再実行しても 409/404 で落ちないための仕組み）
 > - **`make plan` は state を消さない**（`clean` 依存を撤去済み）。同一 dst project id なら前回の

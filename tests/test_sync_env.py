@@ -25,6 +25,11 @@ from scripts.sync_env import (
     _parse_gcloud_describe_json,
     resolve_clean_targets,
     run_clean_state,
+    step_enabled,
+    parse_user_managed_sa,
+    remap_sa_email,
+    remap_iam_role,
+    build_iam_replication_plan,
 )
 
 
@@ -403,10 +408,36 @@ class TestCheckServiceAccounts:
             "resourcemanager.projects.get",
             "cloudasset.assets.searchAllResources",
         }
-        o = self._setup(temp_dir, cai_scan={"enabled": True})
+        o = self._setup(temp_dir, cai_scan={"enabled": True},
+                        network_firewall={"enabled": False},
+                        iam_sync={"enabled": False})
         o._sa_preflight_run = self._fake_token()
         o._test_iam_permissions = self._fake_perms(granted=granted)
         o.check_service_accounts()  # 例外なし
+
+    def test_default_enabled_steps_perms_are_required(self, temp_dir):
+        """キー未指定でも有効なステップ (iam_sync / network_firewall) の権限も要求する。
+
+        execute() と preflight の enabled 既定値は step_enabled() で共通化されている。
+        片方だけ既定が違うと「preflight は通るのに本体で権限エラー」になる。
+        """
+        granted = {
+            "resourcemanager.projects.get",
+            "cloudasset.assets.searchAllResources",
+            "resourcemanager.projects.getIamPolicy",
+            "iam.serviceAccounts.create",
+            "compute.firewalls.list",
+            "compute.networkFirewallPolicies.list",
+            "compute.firewalls.create",
+            "compute.networkFirewallPolicies.create",
+        }
+        o = self._setup(temp_dir, cai_scan={"enabled": True})
+        o._sa_preflight_run = self._fake_token()
+        checker = self._fake_perms(granted=granted)
+        o._test_iam_permissions = checker
+        o.check_service_accounts()  # 例外なし
+        assert any("resourcemanager.projects.getIamPolicy" in perms
+                   for _proj, perms in checker.calls)
 
     def test_unverifiable_permission_warns_and_continues(self, temp_dir, monkeypatch):
         # 借用は成功、権限は検証不能(None) → 警告のみで停止しない
@@ -431,7 +462,10 @@ class TestCheckServiceAccounts:
             "resourcemanager.projects.get",
             "cloudasset.assets.searchAllResources",
         }
-        o = self._setup(temp_dir, cai_scan={"enabled": True}, data_sync={"enabled": False})
+        o = self._setup(temp_dir, cai_scan={"enabled": True},
+                        data_sync={"enabled": False},
+                        network_firewall={"enabled": False},
+                        iam_sync={"enabled": False})
         o._sa_preflight_run = self._fake_token()
         checker = self._fake_perms(granted=granted)
         o._test_iam_permissions = checker
@@ -2261,3 +2295,345 @@ class TestSyncGcsDotBuckets:
         assert any("buckets create gs://my-data-bucket-dst-x-" in c for c in issued)
         assert any("rsync gs://my-data-bucket gs://my-data-bucket-dst-x-" in c
                    for c in issued)
+
+
+# ============================================================
+# Step 5.7: IAM ロール複製 (src SA → dst SA)
+# ============================================================
+_PM = {"src-host": "dst-host", "src-svc-1": "dst-svc-1"}
+
+
+class TestStepEnabledDefaults:
+    def test_missing_key_uses_per_step_default(self):
+        assert step_enabled({}, "iam_sync") is True
+        assert step_enabled({}, "network_firewall") is True
+        assert step_enabled({}, "data_sync") is False
+
+    def test_explicit_value_wins(self):
+        assert step_enabled({"iam_sync": {"enabled": False}}, "iam_sync") is False
+        assert step_enabled({"data_sync": {"enabled": True}}, "data_sync") is True
+
+    def test_non_dict_falls_back_to_default(self):
+        assert step_enabled({"iam_sync": None}, "iam_sync") is True
+
+
+class TestParseUserManagedSa:
+    def test_user_managed_sa(self):
+        assert parse_user_managed_sa(
+            "editor@my-argolis.iam.gserviceaccount.com") == ("editor", "my-argolis")
+
+    @pytest.mark.parametrize("email", [
+        "123456789-compute@developer.gserviceaccount.com",
+        "my-proj@appspot.gserviceaccount.com",
+        "service-123@gcp-sa-pubsub.iam.gserviceaccount.com",
+        "alice@example.com",
+        "",
+        None,
+    ])
+    def test_non_user_managed_rejected(self, email):
+        assert parse_user_managed_sa(email) is None
+
+    def test_remap_uses_proj_map(self):
+        assert remap_sa_email("editor@src-svc-1.iam.gserviceaccount.com", _PM) == \
+            "editor@dst-svc-1.iam.gserviceaccount.com"
+
+    def test_remap_unmapped_project_is_none(self):
+        assert remap_sa_email("editor@other.iam.gserviceaccount.com", _PM) is None
+
+
+class TestRemapIamRole:
+    def test_predefined_role_passes_through(self):
+        assert remap_iam_role("roles/storage.admin", _PM) == ("roles/storage.admin", "")
+
+    def test_owner_is_not_special_cased_here(self):
+        assert remap_iam_role("roles/owner", _PM)[0] == "roles/owner"
+
+    def test_project_custom_role_remapped(self):
+        got, reason = remap_iam_role("projects/src-svc-1/roles/customViewer", _PM)
+        assert got == "projects/dst-svc-1/roles/customViewer"
+        assert reason == ""
+
+    def test_unmapped_project_custom_role_skipped(self):
+        got, reason = remap_iam_role("projects/other/roles/customViewer", _PM)
+        assert got is None
+        assert "project_mapping" in reason
+
+    def test_org_custom_role_skipped(self):
+        got, reason = remap_iam_role("organizations/1234/roles/orgRole", _PM)
+        assert got is None
+        assert "ORG" in reason
+
+    def test_garbage_role_skipped(self):
+        assert remap_iam_role("nonsense", _PM)[0] is None
+        assert remap_iam_role("", _PM)[0] is None
+
+
+def _policy(*bindings):
+    return {"bindings": list(bindings), "etag": "BwX=="}
+
+
+class TestBuildIamReplicationPlan:
+    def test_basic_predefined_role(self):
+        pol = {"src-svc-1": _policy({
+            "role": "roles/storage.admin",
+            "members": ["serviceAccount:editor@src-svc-1.iam.gserviceaccount.com"],
+        })}
+        grants, warns = build_iam_replication_plan(pol, _PM)
+        assert warns == []
+        assert grants == [{
+            "dst_project": "dst-svc-1",
+            "dst_member": "serviceAccount:editor@dst-svc-1.iam.gserviceaccount.com",
+            "dst_role": "roles/storage.admin",
+            "src_project": "src-svc-1",
+            "src_member": "serviceAccount:editor@src-svc-1.iam.gserviceaccount.com",
+            "src_role": "roles/storage.admin",
+            "high_privilege": False,
+        }]
+
+    def test_owner_is_replicated_and_flagged(self):
+        pol = {"src-svc-1": _policy({
+            "role": "roles/owner",
+            "members": ["serviceAccount:editor@src-svc-1.iam.gserviceaccount.com"],
+        })}
+        grants, _ = build_iam_replication_plan(pol, _PM)
+        assert len(grants) == 1
+        assert grants[0]["dst_role"] == "roles/owner"
+        assert grants[0]["high_privilege"] is True
+
+    def test_cross_project_sa_binding_uses_binding_project(self):
+        """src-host のポリシーに src-svc-1 の SA が居たら dst-host に付与する。"""
+        pol = {"src-host": _policy({
+            "role": "roles/compute.viewer",
+            "members": ["serviceAccount:app@src-svc-1.iam.gserviceaccount.com"],
+        })}
+        grants, _ = build_iam_replication_plan(pol, _PM)
+        assert grants[0]["dst_project"] == "dst-host"
+        assert grants[0]["dst_member"] == "serviceAccount:app@dst-svc-1.iam.gserviceaccount.com"
+
+    def test_google_managed_members_ignored_without_warning(self):
+        pol = {"src-svc-1": _policy({
+            "role": "roles/editor",
+            "members": [
+                "serviceAccount:123456789-compute@developer.gserviceaccount.com",
+                "serviceAccount:src-svc-1@appspot.gserviceaccount.com",
+                "user:alice@example.com",
+                "group:team@example.com",
+            ],
+        })}
+        grants, warns = build_iam_replication_plan(pol, _PM)
+        assert grants == []
+        assert warns == []
+
+    def test_conditional_binding_skipped_with_warning(self):
+        pol = {"src-svc-1": _policy({
+            "role": "roles/bigquery.dataViewer",
+            "members": ["serviceAccount:editor@src-svc-1.iam.gserviceaccount.com"],
+            "condition": {"title": "expire", "expression": "request.time < timestamp('2030-01-01T00:00:00Z')"},
+        })}
+        grants, warns = build_iam_replication_plan(pol, _PM)
+        assert grants == []
+        assert any("条件付き" in w and "expire" in w for w in warns)
+
+    def test_org_custom_role_skipped_with_warning(self):
+        pol = {"src-svc-1": _policy({
+            "role": "organizations/1234/roles/orgRole",
+            "members": ["serviceAccount:editor@src-svc-1.iam.gserviceaccount.com"],
+        })}
+        grants, warns = build_iam_replication_plan(pol, _PM)
+        assert grants == []
+        assert any("organizations/1234/roles/orgRole" in w for w in warns)
+
+    def test_unmapped_sa_project_skipped_with_warning(self):
+        pol = {"src-svc-1": _policy({
+            "role": "roles/storage.admin",
+            "members": ["serviceAccount:editor@unrelated.iam.gserviceaccount.com"],
+        })}
+        grants, warns = build_iam_replication_plan(pol, _PM)
+        assert grants == []
+        assert any("unrelated" in w for w in warns)
+
+    def test_excluded_migration_sa_ignored(self):
+        pol = {"src-svc-1": _policy({
+            "role": "roles/viewer",
+            "members": ["serviceAccount:viewer@src-svc-1.iam.gserviceaccount.com"],
+        })}
+        grants, warns = build_iam_replication_plan(
+            pol, _PM, {"VIEWER@src-svc-1.iam.gserviceaccount.com"})
+        assert grants == []
+        assert warns == []
+
+    def test_policy_of_unmapped_project_ignored(self):
+        pol = {"src-other": _policy({
+            "role": "roles/storage.admin",
+            "members": ["serviceAccount:editor@src-svc-1.iam.gserviceaccount.com"],
+        })}
+        grants, _ = build_iam_replication_plan(pol, _PM)
+        assert grants == []
+
+    def test_duplicates_collapsed_and_sorted(self):
+        binding = {
+            "role": "roles/storage.admin",
+            "members": ["serviceAccount:editor@src-svc-1.iam.gserviceaccount.com"],
+        }
+        pol = {"src-svc-1": _policy(binding, dict(binding))}
+        grants, _ = build_iam_replication_plan(pol, _PM)
+        assert len(grants) == 1
+
+    def test_deterministic_order(self):
+        pol = {
+            "src-svc-1": _policy(
+                {"role": "roles/storage.admin",
+                 "members": ["serviceAccount:zz@src-svc-1.iam.gserviceaccount.com"]},
+                {"role": "roles/compute.viewer",
+                 "members": ["serviceAccount:aa@src-svc-1.iam.gserviceaccount.com"]},
+            ),
+            "src-host": _policy(
+                {"role": "roles/viewer",
+                 "members": ["serviceAccount:aa@src-host.iam.gserviceaccount.com"]},
+            ),
+        }
+        got = [(g["dst_project"], g["dst_member"], g["dst_role"])
+               for g in build_iam_replication_plan(pol, _PM)[0]]
+        assert got == sorted(got)
+
+    def test_malformed_policy_tolerated(self):
+        for pol in ({"src-svc-1": {}}, {"src-svc-1": None},
+                    {"src-svc-1": {"bindings": None}},
+                    {"src-svc-1": {"bindings": ["junk"]}}):
+            assert build_iam_replication_plan(pol, _PM) == ([], [])
+
+
+class TestStepIamSync:
+    def _orch(self, temp_dir, **cfg_over):
+        cfg = _full_config(temp_dir)
+        cfg["steps"]["iam_sync"] = {"enabled": True}
+        cfg.update(cfg_over)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def _policies(self, **extra):
+        pol = {
+            "src-host": _policy(),
+            "src-svc-1": _policy({
+                "role": "roles/storage.admin",
+                "members": ["serviceAccount:editor@src-svc-1.iam.gserviceaccount.com"],
+            }),
+        }
+        pol.update(extra)
+        return pol
+
+    def test_grants_are_issued_per_binding(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        issued = []
+        with patch.object(o, "_fetch_src_iam_policies", return_value=self._policies()), \
+             patch.object(o, "_resolve_dst_vm_service_account",
+                          return_value="editor@dst-svc-1.iam.gserviceaccount.com"), \
+             patch.object(o, "_dst_can_set_iam_policy", return_value=True), \
+             patch.object(o, "_dst_existing_bindings", return_value=set()), \
+             patch.object(o, "run_command",
+                          side_effect=lambda cmd, **kw: issued.append(cmd) or ""):
+            o.step_iam_sync()
+        assert len(issued) == 1
+        assert "add-iam-policy-binding dst-svc-1" in issued[0]
+        assert "--member=serviceAccount:editor@dst-svc-1.iam.gserviceaccount.com" in issued[0]
+        assert "--role=roles/storage.admin" in issued[0]
+        assert "--condition=None" in issued[0]
+
+    def test_existing_binding_skipped(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        existing = {("serviceAccount:editor@dst-svc-1.iam.gserviceaccount.com",
+                     "roles/storage.admin")}
+        with patch.object(o, "_fetch_src_iam_policies", return_value=self._policies()), \
+             patch.object(o, "_resolve_dst_vm_service_account",
+                          return_value="editor@dst-svc-1.iam.gserviceaccount.com"), \
+             patch.object(o, "_dst_can_set_iam_policy", return_value=True), \
+             patch.object(o, "_dst_existing_bindings", return_value=existing), \
+             patch.object(o, "run_command") as rc:
+            o.step_iam_sync()
+        rc.assert_not_called()
+
+    def test_missing_set_iam_policy_skips_without_failure(self, temp_dir):
+        """setIamPolicy が無い場合はエラーにせず手動コマンド案内でスキップする。"""
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        with patch.object(o, "_fetch_src_iam_policies", return_value=self._policies()), \
+             patch.object(o, "_resolve_dst_vm_service_account",
+                          return_value="editor@dst-svc-1.iam.gserviceaccount.com"), \
+             patch.object(o, "_dst_can_set_iam_policy", return_value=False), \
+             patch.object(o, "run_command") as rc:
+            o.step_iam_sync()
+        rc.assert_not_called()
+        assert o.stats.failed == 0
+
+    def test_unresolvable_dst_sa_skips_grant(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        with patch.object(o, "_fetch_src_iam_policies", return_value=self._policies()), \
+             patch.object(o, "_resolve_dst_vm_service_account", return_value=None), \
+             patch.object(o, "run_command") as rc:
+            o.step_iam_sync()
+        rc.assert_not_called()
+        assert o.stats.failed == 0
+
+    def test_owner_grant_emits_final_warning(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        pol = self._policies(**{"src-svc-1": _policy({
+            "role": "roles/owner",
+            "members": ["serviceAccount:editor@src-svc-1.iam.gserviceaccount.com"],
+        })})
+        warned = []
+        with patch.object(o, "_fetch_src_iam_policies", return_value=pol), \
+             patch.object(o, "_resolve_dst_vm_service_account",
+                          return_value="editor@dst-svc-1.iam.gserviceaccount.com"), \
+             patch.object(o, "_dst_can_set_iam_policy", return_value=True), \
+             patch.object(o, "_dst_existing_bindings", return_value=set()), \
+             patch.object(o, "run_command", return_value=""), \
+             patch.object(o.dst_logger, "warning", side_effect=warned.append):
+            o.step_iam_sync()
+        joined = "\n".join(warned)
+        assert "超高権限ロール" in joined
+        assert "roles/owner" in joined
+        assert "remove-iam-policy-binding" in joined
+
+    def test_no_owner_no_warning(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        warned = []
+        with patch.object(o, "_fetch_src_iam_policies", return_value=self._policies()), \
+             patch.object(o, "_resolve_dst_vm_service_account",
+                          return_value="editor@dst-svc-1.iam.gserviceaccount.com"), \
+             patch.object(o, "_dst_can_set_iam_policy", return_value=True), \
+             patch.object(o, "_dst_existing_bindings", return_value=set()), \
+             patch.object(o, "run_command", return_value=""), \
+             patch.object(o.dst_logger, "warning", side_effect=warned.append):
+            o.step_iam_sync()
+        assert "超高権限ロール" not in "\n".join(warned)
+
+    def test_src_policy_read_is_read_only(self, temp_dir):
+        """src へ発行するコマンドが ORG 保護（read-only）を通ること。"""
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        issued = []
+        with patch.object(o, "run_command",
+                          side_effect=lambda cmd, **kw: issued.append(cmd) or "{}"):
+            o._fetch_src_iam_policies()
+        assert issued
+        for cmd in issued:
+            assert cmd.startswith("gcloud projects get-iam-policy ")
+            assert is_src_read_only(cmd)
+            assert is_known_mock_command(cmd)
+
+    def test_grant_command_is_mock_known(self):
+        cmd = MigrationOrchestrator._iam_grant_command({
+            "dst_project": "dst-svc-1",
+            "dst_member": "serviceAccount:editor@dst-svc-1.iam.gserviceaccount.com",
+            "dst_role": "roles/storage.admin",
+        })
+        assert is_known_mock_command(cmd)
+        assert not is_src_read_only(cmd)  # add は書き込み動詞 = src では必ず拒否される

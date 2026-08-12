@@ -63,6 +63,8 @@ make vmware-all # VMware → GCE フル処理
 | 5 gce_restore (restore) | **VM** | flat (project, vm) units で並列 |
 | 5 secondary disks (create) | ディスク | attach は同一 VM 内で直列（409 回避） |
 | 5.5 power state (stop / suspend) | VM | `_finalize_vm_power_states` の pending を並列実行 |
+| 5.7 iam_sync (src policy 取得) | プロジェクト | src read-only |
+| 5.7 iam_sync (付与) | **dst プロジェクト** | プロジェクト内は直列（add-iam-policy-binding は read-modify-write で etag 競合する） |
 | 6 data_sync (GCS/BQ) | バケット / テーブル | 既存 |
 
 実装ルール:
@@ -110,6 +112,23 @@ make vmware-all # VMware → GCE フル処理
   - dst host VPC の作成は `_replicate_host_networks()` の責務。元々は `step_gce_restore` (Step 5) からしか呼ばれず Step 4.5 が先に走って詰んでいたため、現在は **`step_network_firewall` の冒頭でも呼ぶ**。冪等 (`_gcloud_exists` ガード) なので Step 5 で再度呼ばれても describe のみで安全。
   - 追加の防御として `_sync_classic_firewall_rules` 冒頭で参照される dst network を一括 pre-flight チェックし、`_sync_fw_policy_associations` でも assoc 単位で existence チェックして、未存在なら skip + WARNING に倒す（cryptic な API エラー量産を防ぐ）。
   - Shared VPC ホスト化・サービスプロジェクト関連付け・networkUser 付与は別途 `bootstrap_shared_vpc.sh` の担当。VPC 自体は作らない点に注意。
+
+### IAM ロール複製（Step 5.7 / `step_iam_sync`）
+
+- **既定で有効**（`steps.iam_sync` キーが無くても走る）。`_STEP_ENABLED_DEFAULTS` + `step_enabled()` に集約。**`execute()` と `check_service_accounts()` の両方がこの関数を通ること** — 片方だけ既定が違うと「preflight は権限を要求しないのに本体は走る」不整合になる（network_firewall が実際にそうなっていた）。
+- 複製元は **src 各プロジェクトの project IAM ポリシーのみ**。バインディングは SA ではなくリソース側にあるので、バケット / データセット / SA 自身の IAM は対象外（対象にすると走査範囲が無限定になる）。
+- 変換は純粋関数に分離してテストする: `parse_user_managed_sa()` / `remap_sa_email()` / `remap_iam_role()` / `build_iam_replication_plan()`。
+- **別 ORG で ID が変わるものはスキップ + WARNING**（secure tag と同じパターン）:
+  - ORG カスタムロール `organizations/<id>/roles/<r>` … dst ORG に同 ID が無い
+  - project_mapping 外のプロジェクトのカスタムロール / SA
+  - 条件付きバインディング（条件式が src のリソース名を参照しうる）
+  - いずれも **dst の権限が src より緩くならない方向**にだけ倒すこと。
+- default compute (`<番号>-compute@developer`) / appspot / Google 管理 service agent (`service-<番号>@` / `gcp-sa-*`) は `parse_user_managed_sa()` の時点で弾く。dst に同等物が既定で存在するため複製してはいけない（warning も出さない。出すと大量ノイズになる）。
+- **`roles/owner` 等も src と同じなら複製する**（＝忠実再現が既定）。ただし `_IAM_HIGH_PRIVILEGE_ROLES` に載っているロールを付与したら `_warn_high_privilege_grants()` が実行ログ末尾に「何を・どこに・なぜ・取消コマンド」を WARNING でまとめて出す。高権限ロールを増やすときはこの集合に足す。
+- **`resourcemanager.projects.setIamPolicy` は `_DST_PERMS_BY_STEP` に入れない**。既存の dst SA（roles/editor 等）には無く、preflight で fail-fast にすると bootstrap 再実行まで移行全体が止まる。代わりに `_dst_can_set_iam_policy()` が dst プロジェクト単位で確認し、無ければ **スキップ + 手動 `add-iam-policy-binding` コマンド案内**（failed カウントしない）。判定不能（トークン不可・API 不通）は `None` を返して「あるものとして続行」。
+- 付与に必要なロールは `bootstrap_dst_sa.sh` の `ROLES` に `roles/resourcemanager.projectIamAdmin` として追加済み。src 側の read は `resourcemanager.projects.getIamPolicy`（`roles/viewer` に含まれる。絞ったカスタムロールを使う `bootstrap_cross_project.sh` には明示追加済み）。
+- 付与は **dst プロジェクト単位で並列 / プロジェクト内は直列**。`add-iam-policy-binding` は read-modify-write なので同一プロジェクトへ並列実行すると etag 競合（ABORTED）になる。
+- `--condition=None` を必ず付ける（既存ポリシーに条件付きバインディングがあると gcloud が対話プロンプトを出してハングする）。
 
 ### VPC Service Controls の quota project（Step 7）
 
