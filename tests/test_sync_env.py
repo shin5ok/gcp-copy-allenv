@@ -32,6 +32,12 @@ from scripts.sync_env import (
     remap_sa_email,
     remap_iam_role,
     build_iam_replication_plan,
+    is_gke_node_vm,
+    is_gke_managed_name,
+    api_from_asset_type,
+    cai_api_hints,
+    build_api_enable_plan,
+    _DST_API_SKIP,
 )
 
 
@@ -305,7 +311,13 @@ class TestCheckPrerequisites:
         o.check_prerequisites()  # 例外なし
 
     def test_skipped_when_bulk_export_disabled(self, temp_dir, monkeypatch):
-        o = self._setup(temp_dir, bulk_export={"enabled": False})
+        # gcloud を要求するステップ（enable_apis は既定 true）も切って、
+        # bulk-export 無効なら config-connector 未インストールでも通ることを見る
+        o = self._setup(
+            temp_dir,
+            bulk_export={"enabled": False},
+            enable_apis={"enabled": False},
+        )
         monkeypatch.setattr("scripts.sync_env.shutil.which", lambda name: None)
         o.check_prerequisites()  # bulk-export 無効なら未インストールでも通る
 
@@ -919,6 +931,69 @@ resource "google_storage_bucket" "b" {
         assert 'project = "dst-svc-1"' in out
         assert "src-svc-1" not in out
 
+    def test_gke_managed_resources_dropped_cluster_kept(self, temp_dir):
+        """GKE 派生リソースは active に出さず、クラスタ構成は残す。"""
+        o = self._setup(temp_dir)
+        raw = os.path.join(temp_dir, "raw")
+        active = os.path.join(temp_dir, "active")
+        os.makedirs(raw)
+        files = {
+            "gke_template.tf": '''
+resource "google_compute_instance_template" "t" {
+  name    = "gke-my-cluster-default-pool-1234abcd"
+  project = "src-svc-1"
+}
+''',
+            "user_template.tf": '''
+resource "google_compute_instance_template" "t" {
+  name    = "my-app-template"
+  project = "src-svc-1"
+}
+''',
+            "gke_fw.tf": '''
+resource "google_compute_firewall" "f" {
+  name    = "k8s-fw-a1b2c3d4e5"
+  project = "src-svc-1"
+}
+''',
+            "user_fw.tf": '''
+resource "google_compute_firewall" "f" {
+  name    = "allow-ssh"
+  project = "src-svc-1"
+}
+''',
+            "cluster.tf": '''
+resource "google_container_cluster" "c" {
+  name     = "my-cluster"
+  project  = "src-svc-1"
+  location = "asia-northeast1-a"
+}
+''',
+            "nodepool.tf": '''
+resource "google_container_node_pool" "np" {
+  name    = "default-pool"
+  cluster = "my-cluster"
+  project = "src-svc-1"
+}
+''',
+        }
+        for fn, body in files.items():
+            with open(os.path.join(raw, fn), "w", encoding="utf-8") as f:
+                f.write(body)
+        o.customize_hcl(raw, active)
+
+        # GKE / k8s 自動生成 → dst クラスタが再生成するのでスキップ
+        assert not os.path.exists(os.path.join(active, "gke_template.tf"))
+        assert not os.path.exists(os.path.join(active, "gke_fw.tf"))
+        # ユーザー作成の同型リソースは残す
+        assert os.path.exists(os.path.join(active, "user_template.tf"))
+        assert os.path.exists(os.path.join(active, "user_fw.tf"))
+        # GKE 構成そのもの（クラスタ / ノードプール）は複製対象
+        assert os.path.exists(os.path.join(active, "cluster.tf"))
+        assert os.path.exists(os.path.join(active, "nodepool.tf"))
+        with open(os.path.join(active, "cluster.tf"), encoding="utf-8") as f:
+            assert 'project  = "dst-svc-1"' in f.read()
+
     def test_project_id_word_boundary(self, temp_dir):
         """src ID が他の単語と prefix 重複した場合に誤置換しないこと。"""
         # config を src='proj' / dst='dest' に上書き
@@ -1038,9 +1113,30 @@ class TestAssetCoverage:
             "compute.googleapis.com/Subnetwork",
             "compute.googleapis.com/Router",
             "iam.googleapis.com/Role",
+            # GKE（構成のみ terraform で複製）とその派生 compute
+            "container.googleapis.com/Cluster",
+            "container.googleapis.com/NodePool",
+            "compute.googleapis.com/InstanceTemplate",
+            "compute.googleapis.com/InstanceGroupManager",
         ]
         for t in must_have:
             assert t in _ASSET_COVERAGE, f"{t} が _ASSET_COVERAGE に未登録"
+
+    def test_gke_cluster_is_terraform_owned(self):
+        # GKE はクラスタ構成のみ terraform (Step 3/4) で複製する
+        assert _ASSET_COVERAGE["container.googleapis.com/Cluster"] == "terraform_apply"
+        assert _ASSET_COVERAGE["container.googleapis.com/NodePool"] == "terraform_apply"
+
+    def test_diff_coverage_ignores_k8s_objects(self):
+        # クラスタ内 k8s オブジェクトは種類が無数にあり複製対象外。警告に出さない
+        observed = [
+            "k8s.io/Pod",
+            "apps.k8s.io/Deployment",
+            "rbac.authorization.k8s.io/ClusterRole",
+            "fake.googleapis.com/UnknownThing",
+        ]
+        uncovered, _ = diff_coverage(observed)
+        assert uncovered == ["fake.googleapis.com/UnknownThing"]
 
     def test_diff_coverage_detects_unknown(self):
         # 未登録 type は uncovered に出る、既知 type は出ない
@@ -1384,6 +1480,49 @@ class TestParseTfResources:
     def test_missing_dir_returns_empty(self, temp_dir):
         assert parse_tf_resources(os.path.join(temp_dir, "nope")) == {}
 
+    def test_scans_bulk_export_nested_tree(self, temp_dir):
+        """bulk-export の raw は深いツリー。フラット走査だと 0 件になる。"""
+        d = os.path.join(temp_dir, "raw", "my-argolis")
+        cluster_dir = os.path.join(
+            d, "projects", "my-argolis", "ContainerCluster", "asia-northeast1"
+        )
+        pool_dir = os.path.join(
+            cluster_dir, "my-ec-cluster", "ContainerNodePool", "asia-northeast1"
+        )
+        os.makedirs(pool_dir)
+        _write(
+            os.path.join(cluster_dir, "my-ec-cluster.tf"),
+            'resource "google_container_cluster" "my_ec_cluster" {\n'
+            '  name     = "my-ec-cluster"\n'
+            '  location = "asia-northeast1"\n'
+            '}\n',
+        )
+        _write(
+            os.path.join(pool_dir, "default-pool.tf"),
+            'resource "google_container_node_pool" "default_pool" {\n'
+            '  name = "default-pool"\n'
+            '}\n',
+        )
+        out = parse_tf_resources(d)
+        assert out["google_container_cluster"] == ["my-ec-cluster"]
+        assert out["google_container_node_pool"] == ["default-pool"]
+
+    def test_ignores_terraform_cache_dir(self, temp_dir):
+        """active/<src>/.terraform は provider / module キャッシュ。拾わない。"""
+        d = os.path.join(temp_dir, "active", "my-argolis")
+        cache = os.path.join(d, ".terraform", "modules", "vpc")
+        os.makedirs(cache)
+        _write(os.path.join(d, "google_storage_bucket.tf"), _TF_SAMPLE_BUCKET)
+        _write(
+            os.path.join(cache, "main.tf"),
+            'resource "google_compute_network" "cached" {\n'
+            '  name = "from-module-cache"\n'
+            '}\n',
+        )
+        out = parse_tf_resources(d)
+        assert "google_storage_bucket" in out
+        assert "google_compute_network" not in out
+
 
 class TestGcloudRecreateCommand:
     def test_subnet_command_includes_region_and_dst(self):
@@ -1469,6 +1608,26 @@ class TestAnalyzeCaiTfDiff:
         assert report["cai_total"] == 5
         assert report["covered"] == 2
         assert report["auto_handled"] == 2
+
+    def test_k8s_objects_are_not_reported(self, temp_dir):
+        # クラスタ内 k8s オブジェクトは差分に出さず auto_handled に数えるだけ
+        cai_path = os.path.join(temp_dir, "cai_k8s.txt")
+        _write(cai_path, (
+            "assetType: k8s.io/Pod\n"
+            "name: //container.googleapis.com/projects/p/zones/z/clusters/c/k8s/namespaces/default/pods/nginx\n"
+            "---\n"
+            "assetType: rbac.authorization.k8s.io/ClusterRole\n"
+            "name: //container.googleapis.com/projects/p/zones/z/clusters/c/k8s/rbac/clusterroles/admin\n"
+        ))
+        tf_dir = os.path.join(temp_dir, "tf_empty")
+        os.makedirs(tf_dir)
+        report = analyze_cai_tf_diff(
+            cai_path, [tf_dir],
+            src_project="src-host", dst_project="dst-host",
+        )
+        assert report["missing"] == []
+        assert report["auto_handled"] == 2
+        assert report["unknown_types"] == []
 
     def test_missing_entries_have_recreate_commands(self, temp_dir):
         cai_path, tf_dir = self._setup(temp_dir)
@@ -1664,6 +1823,36 @@ class TestClassifyMissingAsset:
             "iam.googleapis.com/Role", "migrationSrcReader",
             "//iam.googleapis.com/projects/src-svc/roles/migrationSrcReader"))
         assert tool_role["priority"] == 3
+
+    def test_gke_derived_instance_template_is_reference(self):
+        c = classify_missing_asset(self._item(
+            "compute.googleapis.com/InstanceTemplate",
+            "gke-my-cluster-default-pool-1234abcd"))
+        assert c["level"] == "reference"
+        assert c["priority"] == 3
+        assert "再生成" in c["why"]
+
+    def test_gke_derived_mig_and_neg_are_reference(self):
+        for atype, short in (
+            ("compute.googleapis.com/InstanceGroupManager", "gke-my-cluster-default-pool-1234abcd-grp"),
+            ("compute.googleapis.com/InstanceGroup", "gke-my-cluster-default-pool-1234abcd-grp"),
+            ("compute.googleapis.com/NetworkEndpointGroup", "k8s1-abcdef-default-svc-80"),
+        ):
+            c = classify_missing_asset(self._item(atype, short))
+            assert c["level"] == "reference", f"{atype} {short}"
+            assert c["priority"] == 3
+
+    def test_user_instance_template_is_action(self):
+        # GKE 命名でないテンプレートは従来どおり要対応（判定できないものは action）
+        c = classify_missing_asset(self._item(
+            "compute.googleapis.com/InstanceTemplate", "my-app-template"))
+        assert c["level"] == "action"
+
+    def test_gke_cluster_itself_is_action(self):
+        # クラスタ本体が terraform に出ていない = 複製漏れ。参考に落とさない
+        c = classify_missing_asset(self._item(
+            "container.googleapis.com/Cluster", "my-cluster"))
+        assert c["level"] == "action"
 
 
 class TestBoundCustomRoleIds:
@@ -2859,3 +3048,400 @@ class TestStepIamSync:
         })
         assert is_known_mock_command(cmd)
         assert not is_src_read_only(cmd)  # add は書き込み動詞 = src では必ず拒否される
+
+
+# ============================================================
+# GKE: 構成のみ複製 / ノード VM をコピー対象外にする
+# ============================================================
+class TestIsGkeNodeVm:
+    def test_label_only_is_node(self):
+        # GKE は全ノードに goog-gke-node ラベルを付ける（値は空文字）
+        assert is_gke_node_vm({"name": "gke-c1-default-pool-abc-x1",
+                               "labels": {"goog-gke-node": ""}})
+
+    def test_autopilot_node_by_label(self):
+        assert is_gke_node_vm({"name": "gk3-c1-nap-abc-x1",
+                               "labels": {"goog-gke-node": ""}})
+
+    def test_name_plus_kube_metadata_is_node(self):
+        # labels が取れない場合の保険（名前 + ノード固有 metadata）
+        assert is_gke_node_vm({
+            "name": "gke-c1-default-pool-abc-x1",
+            "metadata": {"items": [{"key": "kube-env", "value": "..."}]},
+        })
+
+    def test_name_only_is_not_node(self):
+        # 名前だけで除外すると gke- 始まりのユーザー VM を取りこぼす
+        assert not is_gke_node_vm({"name": "gke-like-user-vm"})
+
+    def test_plain_vm_is_not_node(self):
+        assert not is_gke_node_vm({"name": "web-01", "labels": {"env": "prod"}})
+
+    def test_missing_keys_are_safe(self):
+        assert not is_gke_node_vm({})
+        assert not is_gke_node_vm({"name": "gke-x", "labels": None, "metadata": None})
+
+    def test_unrelated_metadata_is_not_node(self):
+        assert not is_gke_node_vm({
+            "name": "gke-like-user-vm",
+            "metadata": {"items": [{"key": "startup-script", "value": "x"}]},
+        })
+
+
+class TestIsGkeManagedName:
+    def test_managed_prefixes(self):
+        for n in ("gke-c1-default-pool-abc-grp", "gk3-c1-nap-abc",
+                  "k8s-fw-a1b2c3", "k8s2-abcdef-default-svc",
+                  "k8s1-abcdef-default-svc-80", "gkegw1-l7-default"):
+            assert is_gke_managed_name(n), n
+
+    def test_user_names(self):
+        for n in ("allow-ssh", "my-template", "mygke-app", "web-01"):
+            assert not is_gke_managed_name(n), n
+
+    def test_empty_is_false(self):
+        assert not is_gke_managed_name(None)
+        assert not is_gke_managed_name("")
+
+
+class TestGkeNodeExcludedFromCopy:
+    """Step 2 / Step 5 が GKE ノード VM を対象外にすること。"""
+
+    _GKE_VM = {
+        "name": "gke-c1-default-pool-1234abcd-xyz1",
+        "zone": "projects/src-svc-1/zones/asia-northeast1-a",
+        "status": "RUNNING",
+        "labels": {"goog-gke-node": ""},
+        "disks": [{"boot": True,
+                   "source": "projects/src-svc-1/zones/asia-northeast1-a/disks/gke-c1-default-pool-1234abcd-xyz1"}],
+    }
+    _USER_VM = {
+        "name": "web-01",
+        "zone": "projects/src-svc-1/zones/asia-northeast1-a",
+        "status": "TERMINATED",
+        "disks": [{"boot": True,
+                   "source": "projects/src-svc-1/zones/asia-northeast1-a/disks/web-01"}],
+    }
+
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def _lister(self, vms):
+        """instances list / snapshots list に応答する run_command の代役。
+
+        スナップショットは常に空 = 「有効スナップショットが無い」状態。
+        """
+        def _run(cmd, **kwargs):
+            if cmd.startswith("gcloud compute instances list"):
+                return json.dumps(vms)
+            if cmd.startswith("gcloud compute snapshots list"):
+                return "[]"
+            return ""
+        return _run
+
+    def test_step2_gke_node_does_not_fail_run(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        # GKE ノードのみ: スナップショットが無くても検証は通る
+        with patch.object(o, "run_command", side_effect=self._lister([self._GKE_VM])):
+            o.step_gce_snapshot()  # SystemExit が出ないこと
+
+    def test_step2_normal_vm_without_snapshot_still_fails(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        with patch.object(o, "run_command",
+                          side_effect=self._lister([self._GKE_VM, self._USER_VM])):
+            with pytest.raises(SystemExit):
+                o.step_gce_snapshot()
+
+    def test_step5_gke_node_not_restored(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        restored, pending = [], []
+        with patch.object(o, "run_command",
+                          side_effect=self._lister([self._GKE_VM, self._USER_VM])), \
+             patch.object(o, "_replicate_host_networks"), \
+             patch.object(o, "_replicate_standalone_networks"), \
+             patch.object(o, "_restore_one_vm",
+                          side_effect=lambda vm, *a, **kw: restored.append(vm.get("name"))), \
+             patch.object(o, "_finalize_vm_power_states",
+                          side_effect=lambda p: pending.extend(p)):
+            o.step_gce_restore()
+        # 復元対象にも電源状態調整の対象にも GKE ノードは入らない
+        assert "gke-c1-default-pool-1234abcd-xyz1" not in restored
+        assert restored  # ユーザー VM は復元される
+        assert all(name != "gke-c1-default-pool-1234abcd-xyz1" for name, *_ in pending)
+        assert any(name == "web-01" for name, *_ in pending)
+
+
+class TestGkeFirewallRulesSkipped:
+    """Step 4.5: GKE/k8s 自動生成の classic FW ルールを dst に作らない。"""
+
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def test_gke_rules_are_not_created(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        rules = [
+            {"name": "gke-c1-1234abcd-vms", "network": "n/shared-vpc",
+             "direction": "INGRESS", "allowed": [{"IPProtocol": "tcp"}]},
+            {"name": "k8s-fw-a1b2c3", "network": "n/shared-vpc",
+             "direction": "INGRESS", "allowed": [{"IPProtocol": "tcp"}]},
+            {"name": "allow-ssh", "network": "n/shared-vpc",
+             "direction": "INGRESS", "allowed": [{"IPProtocol": "tcp", "ports": ["22"]}]},
+        ]
+        issued = []
+
+        def _run(cmd, **kwargs):
+            if cmd.startswith("gcloud compute firewall-rules list"):
+                return json.dumps(rules)
+            issued.append(cmd)
+            return ""
+
+        # dst network は存在する / dst FW rule は未存在（= create パスに入る）
+        def _exists(cmd, sa=None):
+            return cmd.startswith("gcloud compute networks describe")
+
+        with patch.object(o, "run_command", side_effect=_run), \
+             patch.object(o, "_gcloud_exists", side_effect=_exists):
+            o._sync_classic_firewall_rules("src-host", "dst-host", None, None)
+
+        created = [c for c in issued if c.startswith("gcloud compute firewall-rules create")]
+        assert len(created) == 1
+        assert "allow-ssh" in created[0]
+        assert not any("gke-c1-1234abcd-vms" in c or "k8s-fw-a1b2c3" in c for c in created)
+
+
+# ============================================================
+# Step 1.5: dst API 事前有効化
+# ============================================================
+class TestApiFromAssetType:
+    def test_service_part_is_returned(self):
+        assert api_from_asset_type(
+            "container.googleapis.com/Cluster") == "container.googleapis.com"
+        assert api_from_asset_type(
+            "compute.googleapis.com/Instance") == "compute.googleapis.com"
+
+    def test_k8s_objects_are_not_apis(self):
+        # クラスタ内 k8s オブジェクトは API ではない
+        assert api_from_asset_type("k8s.io/Pod") is None
+        assert api_from_asset_type("rbac.authorization.k8s.io/ClusterRole") is None
+
+    def test_garbage_is_none(self):
+        assert api_from_asset_type("") is None
+        assert api_from_asset_type("NotAnAssetType") is None
+
+
+class TestCaiApiHints:
+    def test_extracts_enabled_services_and_asset_types(self, temp_dir):
+        path = os.path.join(temp_dir, "cai.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                "---\n"
+                "assetType: serviceusage.googleapis.com/Service\n"
+                "name: //serviceusage.googleapis.com/projects/123/services/container.googleapis.com\n"
+                "---\n"
+                "assetType: container.googleapis.com/Cluster\n"
+                "name: //container.googleapis.com/projects/p/locations/l/clusters/c1\n"
+                "---\n"
+                "assetType: k8s.io/Pod\n"
+                "name: //k8s.io/pods/x\n"
+            )
+        services, atypes = cai_api_hints(path)
+        assert services == {"container.googleapis.com"}
+        assert "container.googleapis.com/Cluster" in atypes
+        assert "k8s.io/Pod" in atypes
+
+    def test_missing_file_is_empty(self, temp_dir):
+        services, atypes = cai_api_hints(os.path.join(temp_dir, "none.txt"))
+        assert services == set() and atypes == set()
+
+
+class TestBuildApiEnablePlan:
+    def test_src_enabled_apis_are_replicated(self):
+        plan = build_api_enable_plan(
+            ["container.googleapis.com", "dns.googleapis.com"], [], {},
+        )
+        assert "container.googleapis.com" in plan  # GKE が本ケースの主目的
+        assert "dns.googleapis.com" in plan
+
+    def test_base_apis_always_included(self):
+        plan = build_api_enable_plan([], [], {})
+        for api in ("cloudresourcemanager.googleapis.com", "serviceusage.googleapis.com",
+                    "iam.googleapis.com", "iamcredentials.googleapis.com"):
+            assert api in plan
+
+    def test_asset_types_imply_apis(self):
+        # services list が読めなくても CAI の assetType から API を補完できる
+        plan = build_api_enable_plan([], ["container.googleapis.com/Cluster", "k8s.io/Pod"], {})
+        assert "container.googleapis.com" in plan
+        assert not any(p.endswith("k8s.io") for p in plan)
+
+    def test_enabled_steps_add_their_apis(self):
+        steps = {
+            "data_sync": {"enabled": True},
+            "network_firewall": {"enabled": False},   # 既定 true なので明示 off
+            "iam_sync": {"enabled": False},
+        }
+        plan = build_api_enable_plan([], [], steps)
+        assert "bigquery.googleapis.com" in plan
+        assert "storage.googleapis.com" in plan
+        # compute を要求するステップ（gce_restore / network_firewall 等）が無ければ入らない
+        assert "compute.googleapis.com" not in plan
+
+    def test_default_enabled_steps_are_respected(self):
+        # network_firewall / iam_sync はキーが無くても既定 true
+        plan = build_api_enable_plan([], [], {})
+        assert "compute.googleapis.com" in plan
+
+    def test_skip_list_and_config_skip(self):
+        plan = build_api_enable_plan(
+            ["bigquery-json.googleapis.com", "dns.googleapis.com"], [], {},
+            skip_apis=["dns.googleapis.com"],
+        )
+        assert "bigquery-json.googleapis.com" not in plan   # 既定の除外（旧エイリアス）
+        assert "dns.googleapis.com" not in plan             # config の除外
+
+    def test_extra_apis_are_added(self):
+        plan = build_api_enable_plan([], [], {}, extra_apis=["notebooks.googleapis.com"])
+        assert "notebooks.googleapis.com" in plan
+
+    def test_invalid_names_are_dropped(self):
+        plan = build_api_enable_plan(["", "not-an-api", "UPPER.googleapis.com"], [], {})
+        assert "not-an-api" not in plan and "UPPER.googleapis.com" not in plan
+
+    def test_result_is_sorted_and_unique(self):
+        plan = build_api_enable_plan(
+            ["dns.googleapis.com", "dns.googleapis.com"], ["dns.googleapis.com/ManagedZone"], {},
+        )
+        assert plan == sorted(set(plan))
+
+    def test_skip_list_holds_only_non_enablable_apis(self):
+        # 契約/申請が要るだけの実 API は skip に入れない（黙って消さず WARNING で見せる）
+        assert "edgecache.googleapis.com" not in _DST_API_SKIP
+        assert "anthos.googleapis.com" not in _DST_API_SKIP
+
+
+class TestStepEnableApis:
+    """Step 1.5 本体: 差分だけ有効化する / 失敗しても run を落とさない。"""
+
+    def _orch(self, temp_dir, steps=None):
+        cfg = _full_config(temp_dir, steps=steps or {})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def test_only_missing_apis_are_enabled(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, steps={"gce_restore": {"enabled": True}})
+        issued = []
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            if cmd.startswith("gcloud services list"):
+                if "--project=src-" in cmd:
+                    return 0, "compute.googleapis.com\ncontainer.googleapis.com\n", ""
+                return 0, "compute.googleapis.com\n", ""   # dst は compute だけ有効
+            issued.append(cmd)
+            return 0, "", ""
+
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_wait_for_apis_enabled") as waiter:
+            o.step_enable_apis()
+
+        assert issued, "enable コマンドが発行されていない"
+        joined = " ".join(issued)
+        assert "container.googleapis.com" in joined       # src で有効 / dst で無効 → 追加
+        assert all(c.startswith("gcloud services enable ") for c in issued)
+        # 既に有効な compute は enable 対象に含めない
+        assert not any(" compute.googleapis.com" in c.split("--project")[0] for c in issued)
+        assert waiter.called
+
+    def test_batch_failure_falls_back_to_one_by_one(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        singles = []
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            if cmd.startswith("gcloud services list"):
+                return 0, "", ""
+            apis = cmd.split("enable ", 1)[1].split(" --project")[0].split()
+            if len(apis) > 1:
+                return 1, "", "ERROR: batch failed"
+            singles.append(apis[0])
+            return (1, "", "ERROR: not found") if apis[0].startswith("iam.") else (0, "", "")
+
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_wait_for_apis_enabled"):
+            o.step_enable_apis()
+
+        assert len(singles) > 1, "個別再試行が行われていない"
+
+    def test_enable_failure_does_not_fail_the_run(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            if cmd.startswith("gcloud services list"):
+                return 0, "", ""
+            return 1, "", "ERROR: PERMISSION_DENIED"
+
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_wait_for_apis_enabled"):
+            o.step_enable_apis()
+
+        # soft fail: stats.failed に積まない（= make run が exit 1 にならない）
+        assert o.stats.failed == 0
+
+    def test_src_list_failure_falls_back_to_step_apis(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, steps={"data_sync": {"enabled": True}})
+        issued = []
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            if cmd.startswith("gcloud services list"):
+                return 1, "", "ERROR: PERMISSION_DENIED"   # src も dst も読めない
+            issued.append(cmd)
+            return 0, "", ""
+
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_wait_for_apis_enabled"):
+            o.step_enable_apis()
+
+        joined = " ".join(issued)
+        assert "bigquery.googleapis.com" in joined     # 有効ステップの必須 API は必ず有効化
+        assert "cloudresourcemanager.googleapis.com" in joined
+
+
+class TestEnableApisSrcGuard:
+    def test_services_list_is_read_only(self):
+        assert is_src_read_only(
+            "gcloud services list --enabled --project=p --format='value(config.name)'")
+
+    def test_services_enable_is_rejected_on_src(self):
+        assert not is_src_read_only("gcloud services enable container.googleapis.com --project=p")
+
+    def test_services_list_is_mock_known(self):
+        assert is_known_mock_command(
+            "gcloud services list --enabled --project=p --format='value(config.name)'")

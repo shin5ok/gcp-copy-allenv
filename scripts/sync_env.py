@@ -26,7 +26,7 @@ import time
 import datetime
 import threading
 import concurrent.futures
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Iterable, List, Optional, Any, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # ORG 保護: src 側操作で許可するコマンドパターン
@@ -62,6 +62,7 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud compute networks subnets list",
     "gcloud compute networks subnets describe",
     "gcloud compute networks subnets create",
+    "gcloud services list",
     "gcloud storage buckets describe",
     "gcloud storage buckets create",
     "gcloud compute instances stop",
@@ -127,6 +128,18 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
     "compute.googleapis.com/InstanceSettings": None,                   # プロジェクト既定。複製不要
     "compute.googleapis.com/ResourcePolicy":  None,                    # ISSUE-08 未対応
     "compute.googleapis.com/Project":         None,                    # メタ情報。create_projects.py が担当
+    # --- compute (GKE 派生。gke-*/k8s-* は customize_hcl でドロップし dst クラスタが再生成) ---
+    "compute.googleapis.com/InstanceTemplate":     "terraform_apply",
+    "compute.googleapis.com/InstanceGroupManager": "terraform_apply",
+    "compute.googleapis.com/InstanceGroup":        "terraform_apply",
+    "compute.googleapis.com/NetworkEndpointGroup": "terraform_apply",
+    # --- container (GKE: クラスタ構成のみ複製。ノード VM は Step 2/5 で除外) ---
+    "container.googleapis.com/Cluster":       "terraform_apply",
+    "container.googleapis.com/NodePool":      "terraform_apply",
+    # --- gkehub (fleet 登録は dst で手動再登録。複製しない) ---
+    "gkehub.googleapis.com/Feature":          None,
+    "gkehub.googleapis.com/Fleet":            None,
+    "gkehub.googleapis.com/Membership":       None,
     # --- storage / bigquery ---
     "storage.googleapis.com/Bucket":          "data_sync",             # terraform で作成、data_sync で内容コピー
     "bigquery.googleapis.com/Dataset":        "data_sync",
@@ -142,7 +155,7 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
     "vmmigration.googleapis.com/ImageImport":  None,                   # 一過性。完了後は不要
     "vmmigration.googleapis.com/TargetProject": None,                  # vmware/scripts/vmdk_run.py が担当
     # --- service usage / project meta ---
-    "serviceusage.googleapis.com/Service":             None,           # create_projects.py / _ensure_dst_prereq_apis
+    "serviceusage.googleapis.com/Service":             "enable_apis",  # Step 1.5 が dst に有効化
     "cloudresourcemanager.googleapis.com/Project":     None,           # create_projects.py
     "cloudresourcemanager.googleapis.com/Lien":        None,           # 削除保護用メタ。複製不要
     "cloudbilling.googleapis.com/ProjectBillingInfo":  None,           # create_projects.py の billing link
@@ -153,7 +166,9 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
 
 # 専用ステップが dst へリソースを複製するため、bulk-export 出力に無くても想定内
 # （手動対応不要）。DIFF.md からは除外し件数だけ集計する。
-_AUTO_HANDLED_STEPS = frozenset({"gce_restore", "network_firewall", "data_sync"})
+_AUTO_HANDLED_STEPS = frozenset({
+    "gce_restore", "network_firewall", "data_sync", "enable_apis",
+})
 
 
 def _needs_manual_recreate(atype: str, coverage_step: Optional[str]) -> bool:
@@ -347,16 +362,33 @@ def _parse_gcloud_describe_json(raw: Optional[str]) -> Dict[str, Any]:
     return {}
 
 
+def _is_k8s_asset_type(atype: str) -> bool:
+    """CAI assetType が GKE クラスタ内の k8s オブジェクトなら True。
+
+    `k8s.io/Pod` / `apps.k8s.io/Deployment` / `rbac.authorization.k8s.io/Role` など
+    クラスタ内リソースは GCP リソースとしての複製対象外（dst にクラスタを作った後に
+    ワークロードを再デプロイする運用）。種類が無数にあるため個別列挙せず、
+    サービス名が `k8s.io` / `*.k8s.io` かで判定する。
+    """
+    svc = (atype or "").split("/", 1)[0]
+    return svc == "k8s.io" or svc.endswith(".k8s.io")
+
+
 def diff_coverage(asset_types: List[str]) -> Tuple[List[str], List[str]]:
     """(uncovered, covered_but_unimplemented) を返す。
 
-    - uncovered: _ASSET_COVERAGE に存在しない assetType（= 知識ベースに無い）
+    - uncovered: _ASSET_COVERAGE に存在しない assetType（= 知識ベースに無い）。
+      ただし GKE クラスタ内の k8s.io/* オブジェクトは複製対象外が自明なので除く
+      （種類が無数にあり、列挙しても警告ノイズにしかならない）。
     - covered_but_unimplemented: マップ上 None = 「意図的対象外」だが
       ISSUE 等で「将来対応予定」とコメントされたものを別途警告したい場合に使用。
       現状は None = 全て対象外扱いとし、空リストを返す（拡張余地）。
     """
     covered = set(_ASSET_COVERAGE.keys())
-    uncovered = sorted({t for t in asset_types if t and t not in covered})
+    uncovered = sorted({
+        t for t in asset_types
+        if t and t not in covered and not _is_k8s_asset_type(t)
+    })
     return uncovered, []
 
 
@@ -382,6 +414,13 @@ _CAI_TO_TF_RESOURCE: Dict[str, Tuple[str, ...]] = {
     "compute.googleapis.com/Snapshot":        ("google_compute_snapshot",),
     "compute.googleapis.com/Image":           ("google_compute_image",),
     "compute.googleapis.com/ResourcePolicy":  ("google_compute_resource_policy",),
+    "compute.googleapis.com/InstanceTemplate": ("google_compute_instance_template",),
+    "compute.googleapis.com/InstanceGroupManager": ("google_compute_instance_group_manager",
+                                                    "google_compute_region_instance_group_manager"),
+    "compute.googleapis.com/InstanceGroup":   ("google_compute_instance_group",),
+    "compute.googleapis.com/NetworkEndpointGroup": ("google_compute_network_endpoint_group",),
+    "container.googleapis.com/Cluster":       ("google_container_cluster",),
+    "container.googleapis.com/NodePool":      ("google_container_node_pool",),
     "storage.googleapis.com/Bucket":          ("google_storage_bucket",),
     "bigquery.googleapis.com/Dataset":        ("google_bigquery_dataset",),
     "bigquery.googleapis.com/Table":          ("google_bigquery_table",),
@@ -476,30 +515,38 @@ def parse_tf_resources(tf_dir: str) -> Dict[str, List[str]]:
 
     name 属性が無いリソースは Terraform ラベル（2 番目の `"..."`) をフォールバック。
     bulk-export の慣行に従い 1 ファイル 1 リソース型を前提とせず、すべての .tf を走査。
+
+    走査は再帰。bulk-export の raw は
+    `<src>/projects/<proj>/<Kind>/<location>/<name>.tf` の深いツリーで、
+    フラット走査だと raw から 1 件も拾えず DIFF が全リソースを
+    「bulk-export が出力しなかった」と誤検知する。
     """
     out: Dict[str, List[str]] = {}
     if not os.path.isdir(tf_dir):
         return out
-    for fn in sorted(os.listdir(tf_dir)):
-        if not fn.endswith(".tf"):
-            continue
-        path = os.path.join(tf_dir, fn)
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                text = f.read()
-        except OSError:
-            continue
-        # ブロック単位に走査: 各 `resource "T" "L" {` の次の `}` までを本体とみなす
-        for m in _TF_RESOURCE_RE.finditer(text):
-            rtype, label = m.group(1), m.group(2)
-            body_start = m.end()
-            # ざっくり `}` の最初の出現を本体終端とする（bulk-export の出力は
-            # ネスト浅く、name 属性は通常先頭近傍にあるため誤検出は限定的）
-            body_end = text.find("\nresource ", body_start)
-            body = text[body_start: body_end if body_end != -1 else len(text)]
-            nm = _TF_NAME_ATTR_RE.search(body)
-            name_val = nm.group(1) if nm else label
-            out.setdefault(rtype, []).append(name_val)
+    for root, dirs, files in os.walk(tf_dir):
+        # .terraform/ は provider / module キャッシュ。移行対象の定義ではない。
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fn in sorted(files):
+            if not fn.endswith(".tf"):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            # ブロック単位に走査: 各 `resource "T" "L" {` の次の `}` までを本体とみなす
+            for m in _TF_RESOURCE_RE.finditer(text):
+                rtype, label = m.group(1), m.group(2)
+                body_start = m.end()
+                # ざっくり `}` の最初の出現を本体終端とする（bulk-export の出力は
+                # ネスト浅く、name 属性は通常先頭近傍にあるため誤検出は限定的）
+                body_end = text.find("\nresource ", body_start)
+                body = text[body_start: body_end if body_end != -1 else len(text)]
+                nm = _TF_NAME_ATTR_RE.search(body)
+                name_val = nm.group(1) if nm else label
+                out.setdefault(rtype, []).append(name_val)
     return out
 
 
@@ -639,6 +686,87 @@ def gcloud_recreate_command(
     return [
         f"# {asset_type} は自動補完対象外。手動でドキュメント参照のうえ dst で再作成してください。",
     ]
+
+
+# ---------------------------------------------------------------------------
+# GKE 関連の判定（ノード VM 除外 / 自動生成リソース判定）
+# ---------------------------------------------------------------------------
+# GKE は「クラスタ / ノードプールの構成情報だけ」を terraform (Step 3/4) で複製する。
+# ノード VM とその派生リソース（instance template / MIG / FW rule 等）は dst に
+# クラスタを作れば GKE が自分で作り直すため、src からコピーしてはいけない
+# （二重化するうえ、src の ORG 固有 ID / クラスタハッシュを含み dst では無効）。
+#
+# ノード VM の名前接頭辞（standard: gke-、Autopilot: gk3-）。
+_GKE_NODE_NAME_PREFIXES = ("gke-", "gk3-")
+# ノードであることを示す metadata キー（labels が取得できない場合の補助判定）。
+_GKE_NODE_METADATA_KEYS = frozenset({"kube-labels", "kube-env", "cluster-name"})
+# GKE / k8s コントローラが自動生成するリソース名の接頭辞。
+#   gke- / gk3- : ノード関連（instance template / MIG / autoscaler / FW rule）
+#   k8s- / k8s2-: Service type=LoadBalancer が作る FW / forwarding rule 等
+#   k8s1-       : NEG、gkegw1-: Gateway controller
+_GKE_MANAGED_NAME_PREFIXES = ("gke-", "gk3-", "k8s-", "k8s1-", "k8s2-", "gkegw1-")
+
+# customize_hcl がドロップする GKE 派生 terraform リソース型
+# （name が gke-*/k8s-* のもののみドロップ。ユーザー作成の同型リソースは残す）。
+# google_container_cluster / google_container_node_pool はここに入れない
+# （＝ GKE 構成そのものは複製する。これが本機能の目的）。
+_GKE_MANAGED_TF_RESOURCE_TYPES = (
+    "google_compute_instance_template",
+    "google_compute_instance_group_manager",
+    "google_compute_region_instance_group_manager",
+    "google_compute_autoscaler",
+    "google_compute_region_autoscaler",
+    "google_compute_instance_group",
+    "google_compute_health_check",
+    "google_compute_http_health_check",
+    "google_compute_target_pool",
+    "google_compute_route",
+    "google_compute_firewall",
+)
+
+# CAI 上で GKE が自動生成する派生 compute アセット。名前が gke-*/k8s-* なら
+# DIFF.md では「参考」扱いにする（dst クラスタが再生成するため実害なし）。
+_GKE_DERIVED_ASSET_TYPES = frozenset({
+    "compute.googleapis.com/InstanceTemplate",
+    "compute.googleapis.com/InstanceGroupManager",
+    "compute.googleapis.com/InstanceGroup",
+    "compute.googleapis.com/NetworkEndpointGroup",
+})
+
+
+def is_gke_node_vm(vm: Dict[str, Any]) -> bool:
+    """VM が GKE のノード（standard / Autopilot）なら True。
+
+    判定順:
+      1. ラベル `goog-gke-node` を持つ（GKE が全ノードに付与する。値は空文字）
+      2. 名前が gke- / gk3- 始まり **かつ** ノード固有 metadata (kube-env 等) を持つ
+         … ラベルが取得できなかった場合の保険
+
+    名前の一致だけでは True にしない。ユーザーが `gke-` で始まる VM を作っている
+    ことがあり、誤除外すると「コピーしたはずの VM が dst に無い」事故になる。
+    """
+    if not isinstance(vm, dict):
+        return False
+    labels = vm.get('labels') or {}
+    if isinstance(labels, dict) and 'goog-gke-node' in labels:
+        return True
+    name = vm.get('name') or ''
+    if not name.startswith(_GKE_NODE_NAME_PREFIXES):
+        return False
+    items = (vm.get('metadata') or {}).get('items') or []
+    for it in items:
+        if isinstance(it, dict) and it.get('key') in _GKE_NODE_METADATA_KEYS:
+            return True
+    return False
+
+
+def is_gke_managed_name(name: Optional[str]) -> bool:
+    """リソース名が GKE / k8s の自動生成命名なら True。
+
+    接頭辞を足すと terraform ドロップ (`_skip_reason_for_file`) / classic FW ルール
+    スキップ / DIFF.md 分類の 3 箇所すべてに同時に効く点に注意。
+    """
+    return bool(name) and str(name).startswith(_GKE_MANAGED_NAME_PREFIXES)
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +929,14 @@ def classify_missing_asset(
             "--format='value(address,status,users)'` で用途を確認 → 必要なら下記の "
             "create コマンドで dst に予約（**IP 値は変わる**ので参照側の設定も更新）。")
 
+    if atype in _GKE_DERIVED_ASSET_TYPES and is_gke_managed_name(short):
+        return ref(
+            "GKE / k8s コントローラが自動生成するリソース。Step 4 terraform が "
+            "google_container_cluster / node_pool を apply すれば、dst クラスタが同等物を"
+            "自分で再生成する（src の名前にはクラスタ固有ハッシュが入るため同名複製は無意味）。",
+            "dst で `gcloud container clusters list` を実行しクラスタが作成されたことを確認。",
+            priority=3)
+
     if item.get("coverage_step") == "<unknown>":
         return act(
             "_ASSET_COVERAGE に未登録の assetType。どのステップも複製を担当しておらず、複製漏れ"
@@ -858,6 +994,11 @@ def analyze_cai_tf_diff(
 
     for r in cai_records:
         atype = r.get("asset_type", "")
+        # GKE クラスタ内の k8s オブジェクトは GCP リソースとしての複製対象外。
+        # 種類も件数も多く、DIFF.md に出すと本当に手を動かすものが埋もれる。
+        if _is_k8s_asset_type(atype):
+            auto_handled += 1
+            continue
         short = r.get("short_name", "")
         full = r.get("name", "")
         loc = r.get("location", "")
@@ -1035,6 +1176,7 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
     lines.append("")
     lines.append("- 専用ステップ（Step 4.5 network_firewall / Step 5 gce_restore / Step 6 data_sync）が複製。")
     lines.append("- `_ASSET_COVERAGE` で None 指定の意図的対象外（実害なし）。")
+    lines.append("- GKE クラスタ内の k8s.io/* オブジェクト（dst クラスタ作成後にワークロードを再デプロイ）。")
     lines.append("")
     lines.append("## プロジェクト別 詳細")
     lines.append("")
@@ -1234,6 +1376,126 @@ def is_known_mock_command(cmd: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# dst API 事前有効化 (Step 1.5) の純粋関数
+# ---------------------------------------------------------------------------
+# API サービス名の形式 (例: container.googleapis.com)。CAI assetType の先頭部や
+# `gcloud services list` の出力からサービス名だけを拾うのに使う。
+_API_SERVICE_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)*\.googleapis\.com$")
+
+# `gcloud services enable` の batch 上限（Service Usage の batchEnable は 20 件/回）。
+_API_ENABLE_BATCH = 20
+
+# ステップ構成に関わらず dst で必要な API。
+_BASE_DST_APIS = (
+    "cloudresourcemanager.googleapis.com",
+    "serviceusage.googleapis.com",
+    "iam.googleapis.com",
+    "iamcredentials.googleapis.com",
+)
+
+# 有効なステップが dst で必ず叩く API。src 側で無効でも dst には要る
+# （例: src が GCE を使っていなくても gce_restore が有効なら compute は要る）。
+_STEP_DST_APIS: Dict[str, Tuple[str, ...]] = {
+    "terraform_apply":  ("compute.googleapis.com", "storage.googleapis.com",
+                         "logging.googleapis.com"),
+    "network_firewall": ("compute.googleapis.com",),
+    "gce_restore":      ("compute.googleapis.com",),
+    "iam_sync":         ("iam.googleapis.com",),
+    "data_sync":        ("storage.googleapis.com", "bigquery.googleapis.com"),
+}
+
+# src で有効でも dst には複製しない API。追加は steps.enable_apis.skip_apis でも可能。
+# 対象は「単体で有効化できない（= enable が必ず失敗する）」ものだけに限る:
+#   - 廃止済み / 旧エイリアス
+#   - 親 API の有効化に伴って GCP が自動で有効化する内部サービス
+# 契約や申請が要るだけの実 API（edgecache 等）は**入れない**。落として黙って消すより、
+# 有効化を試して失敗を WARNING + 手動コマンドで見せる方が安全側。
+_DST_API_SKIP = frozenset({
+    # 廃止 / 旧エイリアス
+    "bigquery-json.googleapis.com",          # 旧エイリアス（bigquery.googleapis.com）
+    "clouddebugger.googleapis.com",          # 2023 年提供終了。新規有効化不可
+    # 親 API 有効化時に自動で付く内部サービス
+    "autoscaling.googleapis.com",            # compute (MIG) の内部
+    "containerfilesystem.googleapis.com",    # GKE image streaming の内部
+    "multiclustermetering.googleapis.com",   # GKE fleet の内部
+    "dataproc-control.googleapis.com",       # Dataproc の内部
+    "dataprocrm.googleapis.com",             # Dataproc の内部
+    "bigqueryunified.googleapis.com",        # BigQuery の内部
+    "telemetry.googleapis.com",              # Google 内部テレメトリ
+})
+
+
+def api_from_asset_type(asset_type: str) -> Optional[str]:
+    """CAI assetType のサービス部を API 名として返す。
+
+    'container.googleapis.com/Cluster' → 'container.googleapis.com'。
+    クラスタ内 k8s オブジェクト（'k8s.io/Pod' 等）は API ではないので None。
+    """
+    head = (asset_type or "").split("/", 1)[0].strip()
+    return head if _API_SERVICE_RE.match(head) else None
+
+
+def cai_api_hints(cai_path: str) -> Tuple[Set[str], Set[str]]:
+    """CAI 出力から (src で有効な API 名, 観測した assetType) を抽出する。
+
+    CAI は `serviceusage.googleapis.com/Service` として「src で有効な API」を
+    そのまま列挙してくれるので、追加の権限なしに有効 API 一覧が得られる
+    （`gcloud services list` が権限不足で読めない場合のフォールバックになる）。
+    """
+    services: Set[str] = set()
+    asset_types: Set[str] = set()
+    for rec in parse_cai_resources(cai_path):
+        atype = rec.get("asset_type", "")
+        if not atype:
+            continue
+        asset_types.add(atype)
+        if atype == "serviceusage.googleapis.com/Service":
+            short = (rec.get("short_name") or "").strip()
+            if short:
+                services.add(short)
+    return services, asset_types
+
+
+def build_api_enable_plan(
+    src_services: Iterable[str],
+    asset_types: Iterable[str],
+    steps: Dict[str, Any],
+    extra_apis: Iterable[str] = (),
+    skip_apis: Iterable[str] = (),
+) -> List[str]:
+    """dst で有効化すべき API 名のソート済みリストを返す（純粋関数）。
+
+    Args:
+        src_services: src で有効な API 名（`gcloud services list --enabled` / CAI）
+        asset_types:  src の CAI assetType。サービス部を API 名として拾い、
+                      「リソースはあるが services list が読めなかった」場合の保険にする
+        steps:        config の steps。有効ステップが dst で必ず使う API を足す
+        extra_apis:   config での明示追加（形式チェックせずそのまま採用）
+        skip_apis:    config での明示除外
+    """
+    want: Set[str] = set(_BASE_DST_APIS)
+    for step_name, apis in _STEP_DST_APIS.items():
+        if step_enabled(steps, step_name):
+            want.update(apis)
+    for name in list(src_services or []):
+        n = (name or "").strip()
+        if _API_SERVICE_RE.match(n):
+            want.add(n)
+    for atype in list(asset_types or []):
+        n = api_from_asset_type(atype)
+        if n:
+            want.add(n)
+    for name in list(extra_apis or []):
+        n = str(name or "").strip()
+        if n:
+            want.add(n)
+    skip = set(_DST_API_SKIP) | {
+        str(s or "").strip() for s in list(skip_apis or []) if str(s or "").strip()
+    }
+    return sorted(want - skip)
+
+
+# ---------------------------------------------------------------------------
 # ステップの enabled 既定値
 # ---------------------------------------------------------------------------
 # config.yaml に該当キーが無いときの enabled。既存 config に手を入れなくても
@@ -1243,6 +1505,9 @@ def is_known_mock_command(cmd: str) -> bool:
 _STEP_ENABLED_DEFAULTS: Dict[str, bool] = {
     "network_firewall": True,
     "iam_sync": True,
+    # dst の API 無効は Step 4 以降を軒並み 403 で落とす（GKE = container API が典型）。
+    # config を書き換えていない既存環境でも復旧できるよう既定 true。
+    "enable_apis": True,
 }
 
 
@@ -1708,6 +1973,30 @@ def validate_steps_config(config: Dict[str, Any]) -> List[str]:
                 f"GCS バケット名が src と同名になり衝突します。固定文字列か 'auto' を指定"
             )
 
+    # --- Step 1.5: enable_apis（既定 true なので step_enabled で解決する）---
+    if step_enabled(steps, 'enable_apis'):
+        ec = steps.get('enable_apis', {}) or {}
+        if not isinstance(ec, dict):
+            ec = {}
+        for key in ('extra_apis', 'skip_apis'):
+            val = ec.get(key)
+            if val is None:
+                continue
+            if not isinstance(val, list) or any(not str(v or '').strip() for v in val):
+                errors.append(
+                    f"steps.enable_apis.{key} は API 名の文字列リストにしてください"
+                    f"（例: ['container.googleapis.com']）"
+                )
+        wait = ec.get('wait_seconds', 120)
+        try:
+            ok = int(wait) >= 0
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            errors.append(
+                f"steps.enable_apis.wait_seconds='{wait}' は 0 以上の整数にしてください"
+            )
+
     # --- gce_snapshot.max_age_days ---
     if enabled('gce_snapshot'):
         mad = steps.get('gce_snapshot', {}).get('max_age_days', 30)
@@ -1834,7 +2123,8 @@ class MigrationOrchestrator:
         def enabled(name: str) -> bool:
             return step_enabled(steps, name)
 
-        gcloud_steps = ("cai_scan", "gce_snapshot", "bulk_export", "gce_restore", "data_sync", "vpc_sc")
+        gcloud_steps = ("cai_scan", "enable_apis", "gce_snapshot", "bulk_export",
+                        "gce_restore", "data_sync", "vpc_sc")
 
         # (ツール名, 必要か, 不足時の説明)
         required = [
@@ -2327,6 +2617,53 @@ class MigrationOrchestrator:
                     sys.exit(1)
                 return None
 
+    def _soft_run(
+        self,
+        cmd: str,
+        side: str,
+        logger: logging.Logger,
+        impersonate_sa: Optional[str] = None,
+        timeout: int = 300,
+        skip_on_dry_run: bool = True,
+    ) -> Tuple[int, str, str]:
+        """stats を汚さずコマンドを実行し (returncode, stdout, stderr) を返す。
+
+        `run_command` と違い失敗を `stats.failed` に積まないため、run 全体の
+        exit code に影響しない soft fail 用（`_try_dst_suspend` と同じ方針）。
+        「失敗しても後続ステップが本来のエラーで気付かせてくれる」補助的な操作に使う。
+        ORG 保護（src の書き込み動詞拒否）と mock の fail-closed 判定は
+        `run_command` と同じものを通す。
+        `skip_on_dry_run=False` の read コマンドは dry_run でも実行する
+        （`make plan` で「何を有効化する予定か」を正確に出すため）。
+        """
+        if side == "src" and not is_src_read_only(cmd):
+            logger.error(
+                f"[ORG 保護] src 操作で書き込み動詞が検出されたため拒否しました。"
+                f" コマンド: {cmd}"
+            )
+            sys.exit(1)
+        if self.mock:
+            if not is_known_mock_command(cmd):
+                logger.error(f"[Mock] 未対応コマンドのため安全のため停止します: {cmd}")
+                sys.exit(1)
+            out = self._simulate_command(cmd, logger, "")
+            self.stats.incr("mocked")
+            return 0, out or "", ""
+        if self.dry_run and side != "src" and skip_on_dry_run:
+            logger.info(f"    [DRY RUN] 予定: {cmd}")
+            return 0, "", ""
+        env = os.environ.copy()
+        if impersonate_sa:
+            env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = impersonate_sa
+        try:
+            res = subprocess.run(
+                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env, timeout=timeout,
+            )
+            return res.returncode, res.stdout or "", res.stderr or ""
+        except Exception as e:
+            return 1, "", str(e)
+
     # ----- Mock シミュレータ（fail-closed 化済み） -----
     def _simulate_command(self, cmd: str, logger: logging.Logger, tag: str) -> Optional[str]:
         from datetime import datetime, timezone
@@ -2346,6 +2683,15 @@ class MigrationOrchestrator:
                     "name": "org-svc1-deb-n2-std2-02",
                     "zone": f"projects/{proj_id}/zones/asia-northeast1-b",
                     "disks": [{"boot": True, "source": f"projects/{proj_id}/zones/asia-northeast1-b/disks/org-svc1-deb-n2-std2-02"}],
+                },
+                # GKE ノード。対応するスナップショットを意図的に用意していないので、
+                # 除外が壊れると Step 2 が「有効スナップショットがない」で exit 1 する
+                # （= make mock がそのまま回帰テストになる）。
+                {
+                    "name": "gke-mock-cluster-default-pool-1234abcd-xyz1",
+                    "zone": f"projects/{proj_id}/zones/asia-northeast1-a",
+                    "labels": {"goog-gke-node": ""},
+                    "disks": [{"boot": True, "source": f"projects/{proj_id}/zones/asia-northeast1-a/disks/gke-mock-cluster-default-pool-1234abcd-xyz1"}],
                 },
             ])
 
@@ -2432,6 +2778,26 @@ class MigrationOrchestrator:
                 "associations": [],
             })
 
+        if cmd.strip().startswith("gcloud services list"):
+            logger.info(f"{tag}[MOCK] 有効 API 一覧をシミュレート ({proj_id})")
+            # dst 側 (`*2026*` 等) は最小構成、src 側は GKE 等を使っている想定にして
+            # 「src で有効 / dst で無効」の差分が mock でも必ず出るようにする。
+            base = [
+                "cloudresourcemanager.googleapis.com",
+                "serviceusage.googleapis.com",
+                "iam.googleapis.com",
+                "iamcredentials.googleapis.com",
+                "compute.googleapis.com",
+            ]
+            if proj_id.startswith("dst") or "2026" in proj_id:
+                return "\n".join(base)
+            return "\n".join(base + [
+                "container.googleapis.com",
+                "storage.googleapis.com",
+                "bigquery.googleapis.com",
+                "bigquery-json.googleapis.com",   # skip 対象（旧エイリアス）
+            ])
+
         if cmd.strip().startswith("gcloud storage buckets list"):
             logger.info(f"{tag}[MOCK] バケット一覧をシミュレート ({proj_id})")
             return json.dumps([
@@ -2509,11 +2875,31 @@ resource "google_storage_bucket" "mock_bucket" {{
   location = "US"
 }}
 """
+        # GKE 派生の instance template は active に出ないこと、クラスタ本体は
+        # 出ることを make mock で確認できるようにする。
+        gke_template_hcl = f"""
+resource "google_compute_instance_template" "mock_gke_template" {{
+  name         = "gke-mock-cluster-default-pool-1234abcd"
+  project      = "{proj_id}"
+  machine_type = "e2-medium"
+}}
+"""
+        cluster_hcl = f"""
+resource "google_container_cluster" "mock_cluster" {{
+  name     = "mock-cluster"
+  project  = "{proj_id}"
+  location = "asia-northeast1-a"
+}}
+"""
         try:
             with open(os.path.join(proj_dir, "google_compute_instance.tf"), "w", encoding="utf-8") as f:
                 f.write(vm_hcl)
             with open(os.path.join(proj_dir, "google_storage_bucket.tf"), "w", encoding="utf-8") as f:
                 f.write(bucket_hcl)
+            with open(os.path.join(proj_dir, "google_compute_instance_template.tf"), "w", encoding="utf-8") as f:
+                f.write(gke_template_hcl)
+            with open(os.path.join(proj_dir, "google_container_cluster.tf"), "w", encoding="utf-8") as f:
+                f.write(cluster_hcl)
         except Exception as e:
             self.org_logger.error(f"  [MOCK] ダミー TF 書き出し失敗: {e}")
 
@@ -2542,6 +2928,12 @@ resource "google_storage_bucket" "mock_bucket" {{
         try:
             if step_enabled(steps, 'cai_scan'):
                 self.step_cai_scan()
+            # API 有効化は他の dst 書き込みより前に。dst で API が無効だと Step 4 の
+            # terraform apply（GKE = container.googleapis.com が典型）や Step 5/6 が
+            # 軒並み 403 で落ちる。CAI 直後なら「src で有効な API」が手元にあり、
+            # かつ Step 2/3（src 読み取り + export）の間に有効化の伝播時間も稼げる。
+            if step_enabled(steps, 'enable_apis'):
+                self.step_enable_apis()
             if step_enabled(steps, 'gce_snapshot'):
                 self.step_gce_snapshot()
             if step_enabled(steps, 'bulk_export'):
@@ -2826,6 +3218,7 @@ resource "google_storage_bucket" "mock_bucket" {{
         intentionally_skipped = [
             t for t in counts if t in _ASSET_COVERAGE and _ASSET_COVERAGE[t] is None
         ]
+        k8s_types = [t for t in counts if _is_k8s_asset_type(t)]
 
         self.org_logger.info(
             f"  [カバレッジ] CAI 検出 {len(counts)} 種 / 既知 "
@@ -2845,11 +3238,172 @@ resource "google_storage_bucket" "mock_bucket" {{
             for t in sorted(intentionally_skipped):
                 self.org_logger.info(f"      - {t} ×{counts[t]}")
 
+        if k8s_types:
+            total = sum(counts[t] for t in k8s_types)
+            self.org_logger.info(
+                f"  ℹ GKE クラスタ内の k8s オブジェクト（複製対象外）: "
+                f"{len(k8s_types)} 種 / {total} 件"
+            )
+
         if uncovered and fail_on_uncovered:
             self.org_logger.error(
                 f"  fail_on_uncovered=true のため未登録アセット {len(uncovered)} 種で停止"
             )
             sys.exit(1)
+
+    # ============================================================
+    # Step 1.5: dst API 事前有効化
+    # ============================================================
+    def step_enable_apis(self):
+        """src で有効な API を dst でも有効化する（冪等 / soft fail）。
+
+        dst で API が無効なままだと Step 4 の terraform apply が
+        「<API> has not been used in project ... before or it is disabled」の 403 で
+        止まる（GKE = container.googleapis.com が典型）。src 側の有効 API 一覧を
+        そのまま dst に反映し、有効ステップが必ず使う API を足して先回りで有効化する。
+
+        有効 API の取得元は 2 つ（片方が欠けても動く）:
+          1. `gcloud services list --enabled`（src read-only）
+          2. Step 1 の CAI 出力にある `serviceusage.googleapis.com/Service`
+        失敗は WARNING + 手動コマンド案内に留める（`stats.failed` に積まない）。
+        本当に必要な API なら、後続ステップが本来のエラーで止めてくれる。
+        """
+        pairs = list(self._iter_project_pairs())
+        log_stage_header(
+            self.dst_logger, 15, "dst API 事前有効化 (src で有効な API を dst に反映)",
+            len(pairs),
+        )
+        steps = self.config.get('steps', {})
+        cfg = steps.get('enable_apis', {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        extra = cfg.get('extra_apis') or []
+        skip = cfg.get('skip_apis') or []
+        wait_sec = int(cfg.get('wait_seconds', 120))
+        cai_dir = (steps.get('cai_scan', {}) or {}).get('output_dir', './cai_export')
+
+        def worker(item):
+            src_proj, dst_proj, src_sa, dst_sa = item
+            cai_services, asset_types = cai_api_hints(
+                os.path.join(cai_dir, f"cai_resources_{src_proj}.txt")
+            )
+            listed = self._list_enabled_services(src_proj, "src", src_sa)
+            if listed is None and not cai_services:
+                self.dst_logger.warning(
+                    f"  → {dst_proj}: src '{src_proj}' の有効 API を特定できませんでした"
+                    f"（serviceusage.services.list 権限 / CAI 出力を確認）。"
+                    f" 有効ステップの必須 API のみ有効化します"
+                )
+            src_services = (listed or set()) | cai_services
+            want = build_api_enable_plan(src_services, asset_types, steps, extra, skip)
+            # 除外した API は黙って消さずログに残す（skip 判断の誤りに気付けるように）。
+            dropped = sorted(
+                {a for a in src_services if _API_SERVICE_RE.match(a)} - set(want)
+            )
+            if dropped:
+                self.dst_logger.info(
+                    f"    dst で有効化しない API（自動管理 / 廃止 / skip_apis）"
+                    f" {len(dropped)} 件: {', '.join(dropped)}"
+                )
+            have = self._list_enabled_services(dst_proj, "dst", dst_sa) or set()
+            missing = [a for a in want if a not in have]
+            self.dst_logger.info(
+                f"  → {dst_proj} (src={src_proj}): 必要 {len(want)} 件 / "
+                f"有効済み {len(want) - len(missing)} 件 / 追加 {len(missing)} 件"
+            )
+            if not missing:
+                return
+            self.dst_logger.info(f"    有効化対象: {', '.join(missing)}")
+            failed = self._enable_apis_on_dst(dst_proj, dst_sa, missing)
+            enabled_now = [a for a in missing if a not in failed]
+            # 有効化直後は反映ラグがあり、すぐ terraform を回すと 403 になる。
+            if enabled_now and wait_sec > 0 and not self.dry_run and not self.mock:
+                self._wait_for_apis_enabled(
+                    dst_proj, dst_sa, enabled_now,
+                    timeout_sec=wait_sec, interval_sec=8,
+                )
+            if failed:
+                self.dst_logger.warning(
+                    f"    ⚠ {dst_proj} で有効化できなかった API {len(failed)} 件: "
+                    f"{', '.join(failed)}"
+                )
+                self.dst_logger.warning(
+                    f"      移行に必要なら手動で: "
+                    f"gcloud services enable {' '.join(failed)} --project={dst_proj}"
+                )
+                self.dst_logger.warning(
+                    f"      権限不足なら実行 SA に roles/serviceusage.serviceUsageAdmin"
+                    f"（serviceusage.services.enable）を付与。"
+                    f" dst で不要な API は steps.enable_apis.skip_apis に追加してください"
+                )
+
+        self._parallel_for_each(pairs, worker, "enable-apis")
+        self.dst_logger.info("  ✓ Step 1.5 完了")
+
+    def _list_enabled_services(
+        self, project: str, side: str, sa: Optional[str],
+    ) -> Optional[Set[str]]:
+        """プロジェクトで有効な API 名の集合を返す。取得できなければ None。"""
+        logger = self.org_logger if side == "src" else self.dst_logger
+        rc, out, err = self._soft_run(
+            f"gcloud services list --enabled --project={project} "
+            f"--format='value(config.name)'",
+            side, logger, impersonate_sa=sa, timeout=180, skip_on_dry_run=False,
+        )
+        if rc != 0:
+            logger.warning(
+                f"    有効 API 一覧を取得できませんでした ({project}): "
+                f"{_first_meaningful_line(err, out)}"
+            )
+            return None
+        return {ln.strip() for ln in (out or "").splitlines() if ln.strip()}
+
+    def _enable_apis_on_dst(
+        self, dst_proj: str, dst_sa: Optional[str], apis: List[str],
+    ) -> List[str]:
+        """API を batch 有効化し、最後まで失敗したものを返す。
+
+        batchEnable は 1 件でも不正 / 権限外だと chunk 全体が失敗するため、
+        chunk が失敗したら 1 件ずつやり直して「本当に有効化できない API」だけを残す。
+        """
+        failed: List[str] = []
+        # 実際に走ったときだけ書込成功にカウントする（mock は "mocked"、
+        # dry_run は未実行。run_command と同じ数え方に揃える）。
+        count_executed = not self.mock and not self.dry_run
+        for i in range(0, len(apis), _API_ENABLE_BATCH):
+            chunk = apis[i:i + _API_ENABLE_BATCH]
+            rc, out, err = self._soft_run(
+                f"gcloud services enable {' '.join(chunk)} --project={dst_proj}",
+                "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=900,
+            )
+            if rc == 0:
+                if count_executed:
+                    self.stats.incr("executed")
+                continue
+            if len(chunk) == 1:
+                failed.append(chunk[0])
+                self.dst_logger.warning(
+                    f"      ✗ {chunk[0]}: {_first_meaningful_line(err, out)}"
+                )
+                continue
+            self.dst_logger.warning(
+                f"    一括有効化に失敗したため 1 件ずつ再試行します "
+                f"({len(chunk)} 件): {_first_meaningful_line(err, out)}"
+            )
+            for api in chunk:
+                rc1, out1, err1 = self._soft_run(
+                    f"gcloud services enable {api} --project={dst_proj}",
+                    "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=300,
+                )
+                if rc1 == 0:
+                    if count_executed:
+                        self.stats.incr("executed")
+                else:
+                    failed.append(api)
+                    self.dst_logger.warning(
+                        f"      ✗ {api}: {_first_meaningful_line(err1, out1)}"
+                    )
+        return failed
 
     # ============================================================
     # Step 2: GCE Snapshot 検証
@@ -2898,8 +3452,18 @@ resource "google_storage_bucket" "mock_bucket" {{
                     errors.append(f"{proj_id}: snapshot JSON 解析失敗: {e}")
                 return
 
+            gke_excluded = 0
             for vm in vms:
                 vm_name = vm.get('name')
+                # GKE ノードは dst クラスタが作り直すためコピー対象外。
+                # スナップショット不在で run 全体を止めない（errors に入れない）。
+                if is_gke_node_vm(vm):
+                    gke_excluded += 1
+                    self.org_logger.info(
+                        f"    - {vm_name}: GKE ノード VM のためコピー対象外"
+                        f"（クラスタ構成は terraform で複製）"
+                    )
+                    continue
                 boot_disk = next((d for d in vm.get('disks', []) if d.get('boot')), None)
                 if not boot_disk:
                     self.org_logger.warning(f"  ! VM {vm_name} には boot disk がない → スキップ")
@@ -2913,6 +3477,11 @@ resource "google_storage_bucket" "mock_bucket" {{
                             f"{proj_id} VM {vm_name}(disk={disk_name}): "
                             f"直近 {max_age_days} 日以内の有効スナップショットがない"
                         )
+
+            if gke_excluded:
+                self.org_logger.info(
+                    f"    {proj_id}: GKE ノード VM {gke_excluded} 台を検証対象から除外"
+                )
 
         self._parallel_for_each(projects, worker, "snap-check")
 
@@ -3482,6 +4051,18 @@ resource "google_storage_bucket" "mock_bucket" {{
             sm = re.search(r'\bsubnetwork\s*=\s*"[^"]*projects/([^/"]+)/', content)
             if pm and sm and pm.group(1) != sm.group(1):
                 return f"クロスプロジェクト subnet 参照のアドレス（host={sm.group(1)}）は作成不可"
+
+        # GKE / k8s コントローラが自動生成する派生リソース（instance template / MIG /
+        # autoscaler / gke-*, k8s-* FW ルール等）。dst にクラスタを作れば GKE が同等物を
+        # 作り直すため複製不要。src の名前にはクラスタ固有ハッシュが入っており、
+        # dst に持ち込むと衝突 / 無効参照になる。
+        # google_container_cluster / node_pool は対象外（＝ GKE 構成そのものは複製する）。
+        for rtype in _GKE_MANAGED_TF_RESOURCE_TYPES:
+            if f'resource "{rtype}"' not in content:
+                continue
+            m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+            if m and is_gke_managed_name(m.group(1)):
+                return f"GKE 自動生成リソース（dst クラスタが再生成）: {m.group(1)}"
 
         # スナップショット / イメージは移行モデルでは terraform で作らない。
         # snapshot は dst に存在しないディスクを source にしており、image はその
@@ -4071,6 +4652,21 @@ resource "google_storage_bucket" "mock_bucket" {{
         except Exception:
             rules = []
 
+        # GKE / k8s が自動生成した FW ルールは複製しない。dst にクラスタを作れば
+        # GKE が同等ルールを作り直す。src のルールはクラスタ固有ハッシュを含む
+        # target tag を参照しており、dst に持ち込んでも効かない（＝ FW を緩めない）。
+        # pre-flight より前に落として、gke 専用 network の存在確認も省く。
+        gke_rules = [r for r in rules if is_gke_managed_name(r.get('name'))]
+        if gke_rules:
+            names = ", ".join(r.get('name', '?') for r in gke_rules)
+            self.dst_logger.warning(
+                f"  ⚠ [FW Rules] GKE/k8s 自動生成ルール {len(gke_rules)} 件をスキップ"
+                f"（dst クラスタ作成時に GKE が再生成）: {names}"
+            )
+            for _ in gke_rules:
+                self.stats.incr("skipped")
+            rules = [r for r in rules if not is_gke_managed_name(r.get('name'))]
+
         # Pre-flight: 参照される dst ネットワークが本当に存在するか一度だけ確認する。
         # _replicate_host_networks() は Step 4.5 冒頭で呼ばれているはずだが、何らかの
         # 理由 (権限不足 / 部分失敗 / config の host_project ミスマッチ) で未作成だと
@@ -4511,6 +5107,23 @@ resource "google_storage_bucket" "mock_bucket" {{
             except Exception as e:
                 self.dst_logger.error(f"    VM JSON 解析失敗 ({src_proj}): {e}")
                 return
+
+            # GKE ノードは dst クラスタ (Step 4 terraform) が自分で作り直すため復元しない。
+            # ここで 1 回落とせば、下の work unit 展開と電源状態の最終調整の両方に効く。
+            gke_nodes = [v for v in vms if is_gke_node_vm(v)]
+            if gke_nodes:
+                names = ", ".join(v.get('name', '?') for v in gke_nodes)
+                self.dst_logger.info(
+                    f"    {src_proj}: GKE ノード VM {len(gke_nodes)} 台を復元対象から除外"
+                    f"（クラスタ構成のみ terraform で複製）: {names}"
+                )
+                for _ in gke_nodes:
+                    self.stats.incr("skipped")
+                vms = [v for v in vms if not is_gke_node_vm(v)]
+            if not vms:
+                self.dst_logger.info(f"    {src_proj}: 復元対象の VM が無い")
+                return
+
             snap_json = self.run_command(
                 f"gcloud compute snapshots list --project={src_proj} --format=json",
                 side="src", logger=self.org_logger,

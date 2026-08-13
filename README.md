@@ -10,6 +10,12 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > コード側で「src 操作は read-only のみ・書き込み動詞は実行前に拒否」を強制しています。認証は、src を一切書き換えたくない場合は **ローカル認証（実行ユーザー本人）がおすすめ**で、SA の権限借用はオプションです（src 書込権を持っていれば実行前に警告 + 続行確認）。
 > 詳細は後述の [ORG プロジェクト保護](#-org-プロジェクト保護) を参照してください。
 
+> ☸️ **GKE はクラスタ構成のみをコピーします。** クラスタ / ノードプールの定義は Terraform
+> （Step 3 エクスポート → Step 4 適用）で複製し、**ノードの GCE VM はコピー対象外**です
+> （コピー先クラスタが自分でノードを作り直すため）。PersistentVolume のデータやクラスタ内の
+> k8s オブジェクト（Deployment 等）も対象外なので、コピー先クラスタ作成後にワークロードを
+> 再デプロイしてください。
+
 > 📚 **関連ドキュメント**: [PROCEDURE.md](./PROCEDURE.md)（推奨運用フロー）・[SPEC.md](./SPEC.md)（全体仕様）・[dst/SPEC.md](./dst/SPEC.md)（コピー先仕様）・[HISTORY.md](./HISTORY.md)（変更履歴）・[doc/outbound-quarantine-design.md](./doc/outbound-quarantine-design.md)（dst outbound 遮断（検疫）設計）
 
 ---
@@ -42,6 +48,8 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
       → 無いと Step 2 `gce_snapshot` がエラーで停止（`make plan` でも検出）
       → 手動作成: `gcloud compute disks snapshot <disk> --snapshot-names=<name> --zone=<zone> --project=<src>`
       → 期限は `config.yaml` の `steps.gce_snapshot.max_age_days` で変更可
+      → **GKE ノードの VM は検証・コピーの対象外**なのでスナップショットは不要です
+        （`goog-gke-node` ラベルで判定。コピー先クラスタがノードを作り直します）
 
 #### D. コピー先 (dst) 側
 - [ ] **組織 ID** (`organizations/<id>`) → `bootstrap.org_id`
@@ -161,7 +169,7 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 
 | 対象 | 付与するロール | 理由 |
 | :--- | :--- | :--- |
-| **src（全プロジェクト）** | `roles/viewer` | compute / GCS の read、`resourcemanager.projects.getIamPolicy`（Step 5.7）を含む |
+| **src（全プロジェクト）** | `roles/viewer` | compute / GCS の read、`resourcemanager.projects.getIamPolicy`（Step 5.7）、`serviceusage.services.list`（Step 1.5）を含む |
 | | `roles/cloudasset.viewer` | `cloudasset.assets.searchAllResources`（Step 1 `cai_scan` / Step 3 `bulk_export`）。**`roles/viewer` には含まれません** |
 | | `roles/bigquery.dataViewer` | BigQuery のデータ読み取り（Step 6 `data_sync`） |
 | | `migrationSrcReader`（カスタム） | `compute.snapshots.useReadOnly` など定義済みロールで賄えない read 権限。`scripts/bootstrap_cross_project.sh` が作成 |
@@ -209,10 +217,23 @@ cp dst/config.yaml.template dst/config.yaml
   （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に
   永続化され、`make plan` / `make run` / `skip_on_run` 間で同じ値が再利用されます
   （別名で作り直す場合はこのファイルを削除）。
-- **`steps`**: 各ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `iam_sync` / `data_sync` / `vpc_sc`) の有効/無効と個別設定（スナップショット期限など）。
+- **`steps`**: 各ステップ (`cai_scan` / `enable_apis` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `iam_sync` / `data_sync` / `vpc_sc`) の有効/無効と個別設定（スナップショット期限など）。
   `bulk_export.skip_on_run: true` にすると本番実行 (`make run`) では export/customize を
   スキップし、`make plan` で生成済みの `terraform/active/` を再利用して高速化します
   （`make plan` 自体は常に最新を取り直します）。
+  - **`enable_apis`** (Step 1.5): **src で有効な API を dst でも有効化**します。
+    **キー未指定でも有効**（設定不要で動きます）。無効にするときだけ `enabled: false`。
+    - dst で API が無効だと Step 4 の `terraform apply` が
+      `<API> has not been used in project ... before or it is disabled` の 403 で止まります
+      （**GKE = `container.googleapis.com`** が典型）。これを先回りで防ぐステップです。
+    - 有効 API の取得元は `gcloud services list --enabled`（src read-only）と Step 1 の CAI 出力
+      （`serviceusage.googleapis.com/Service`）の 2 系統。片方が読めなくても動きます。
+      加えて**有効ステップが必ず使う API**（compute / storage / bigquery / iam 等）も足します。
+    - dst で既に有効な API は呼ばず、**差分だけ** 20 件ずつまとめて有効化 → 伝播待ち
+      (`wait_seconds`、既定 120 秒) を行います。再実行時は差分ゼロで即完了します。
+    - 有効化に失敗した API は**エラーにせず** WARNING + 手動コマンドを案内します
+      （本当に必要な API なら後続ステップが本来のエラーで止めます）。
+      dst で不要な API は `skip_apis`、逆に足したい API は `extra_apis` に指定してください。
   - **`iam_sync`** (Step 5.7): src の SA に付いている IAM ロールを dst の同名 SA へ複製。
     **キー未指定でも有効**（設定不要で動きます）。無効にするときだけ `enabled: false`。
     - 対象は **src 各プロジェクトの project IAM ポリシー**のうち user-managed SA
@@ -308,7 +329,8 @@ make plan
 
 > 🔍 **ドライランで計画・検証される項目**
 > 1. **CAI 現状確認** (`cai_scan`): コピー元の有効なリソース一覧を探索。
-> 2. **GCE スナップショット検証** (`gce_snapshot`): 各 VM に期限内（既定 30 日）の有効なスナップショットがあるか確認。なければエラー。
+> 1.5. **dst API 事前有効化** (`enable_apis`): src で有効な API を dst にも反映（差分のみ）。dry-run では有効化予定の API 一覧を表示するだけで、実際の有効化は `make run` で行います。
+> 2. **GCE スナップショット検証** (`gce_snapshot`): 各 VM に期限内（既定 30 日）の有効なスナップショットがあるか確認。なければエラー（**GKE ノード VM は検証対象外**）。
 > 3. **Terraform コード生成** (`bulk_export`): Original リソースを HCL としてエクスポートし、プロジェクト ID 置換・GCS バケットのリネーム・同一プロジェクト内 network 参照の `self_link` 化・`boot_disk.source` 行の削除を実施。
 > 4. **インフラ再現** (`terraform_apply`): `terraform plan -out=tfplan` を生成（本番時のみ apply）。
 > 5. **FW ルール / ポリシー複製** (`network_firewall`): classic firewall と Network Firewall Policy を dst host VPC に複製する計画（`secure_tag_map` 未登録の tagValues 参照は skip + WARNING）。
@@ -317,11 +339,25 @@ make plan
 > 8. **VPC SC ペリメタ追加** (`vpc_sc`): 既存ペリメタへ dst プロジェクト（番号）を追記する計画。`billing_project` 未設定ならスキップ（後述）。
 >
 > 📝 **差分レポート (`DIFF.md`)**: 上記完了後に **`logs/<タイムスタンプ>/DIFF.md`** を出力し、リポジトリ直下の `DIFF.md` を最新版への相対 symlink に張り替えます（実体は日付付きで残るので過去実行とも比較可能）。
-> CAI が検出した src リソースのうち、
-> - **要手動**: `bulk_export` が出すはずで欠落したもの（dst 再現用の `gcloud` 作成系コマンドを併記）
-> - **自動処理・対象外**: 専用ステップ（`gce_restore` / `network_firewall` / `data_sync`）が複製、または `_ASSET_COVERAGE` で `None` 指定の意図的対象外（件数のみ集計し詳細は出力しない）
+> CAI が検出した src リソースのうち dst に無いものを、**実害の有無で 2 段階に分類**して出力します
+> （放置すると 50 件超になり、本当に手を動かすべき項目が埋もれるため）。
 >
-> をプロジェクトごとに分けて列挙します。`make plan` 直後に `cat DIFF.md`（= 最新実行）を眺めて、自動再現されない欠落だけ手当てする運用です。
+> | セクション | 内容 |
+> | :--- | :--- |
+> | **要対応**（先頭の WHAT / WHY / HOW テーブル） | **dst の動作に必要で、放置すると実害が出るものだけ**。dst 再現用の `gcloud` 作成系コマンドを併記します |
+> | **参考**（優先度テーブル → プロジェクト別詳細。**優先度の昇順**） | 実害が無いと言い切れるもの。`P1` = 確認推奨（別ステップが自動対応済みなので結果だけ確認）/ `P2` = 条件付き（src 側にカスタム・取り置きの意図がある場合のみ）/ `P3` = 対応不要 |
+>
+> 参考に落ちる代表例: user-managed SA は Step 5.7 (`iam_sync`) が dst に作成するので **P1**
+> （`iam_sync` を無効にしている場合は要対応）、Cloud NAT の自動 IP (`nat-auto-ip-*`) や
+> Google 管理 service agent・`_Default` / `_Required` ログシンクは **P3**、未使用の予約 IP
+> (`state=RESERVED`) や誰にも付与されていないカスタムロールは **P2**。
+>
+> - **判定材料が無いものは必ず「要対応」に倒します**（見落とすより過剰報告を優先する方針）。
+> - 専用ステップが複製するもの（`gce_restore` / `network_firewall` / `data_sync` / `enable_apis`）、
+>   `_ASSET_COVERAGE` で意図的に対象外としたもの、**GKE クラスタ内の k8s オブジェクト
+>   （`k8s.io/*`）** は差分から除外します（件数のみ集計）。
+>
+> `make plan` 直後に `cat DIFF.md`（= 最新実行）を眺めて、**まず「要対応」だけ手当てする**運用です。
 
 ### Step 2: Mock モードでのローカル試走（任意）
 実際の GCP 環境や有効な SA がなくても、`make run` 全体のフローをエラーなく試走できます。
@@ -338,6 +374,7 @@ make run
 ```
 
 > 🚀 **クローンのメカニズム**
+> 0. **Step 1.5 (`enable_apis`)** で、src で有効な API をコピー先で先に有効化（GKE の `container.googleapis.com` など。無効なままだと後続の `terraform apply` が 403 で止まる）。
 > 1. コピー先ホストプロジェクトに、Terraform で VPC・サブネット・Cloud Router・Cloud NAT 等のインフラを再現（bulk-export の HCL を `terraform apply`）。
 > 2. classic firewall ルールと Network Firewall Policy は **Step 4.5 (`network_firewall`)** で `gcloud` 経由で複製（dst host VPC が Step 1 で出来ている前提。`secure_tag_map` で別 ORG の tagValues 変換、未登録参照は skip + WARNING）。
 > 3. Original の有効なスナップショット（期限内）から、コピー先にディスクを復元。
@@ -458,6 +495,7 @@ make vmware-clean       # vmware/logs/ を削除
 
 - **日本語で記録**: 各操作の「実行内容」を日本語の補足説明付きで出力。
 - **ステップ単位でグループ化**: `━━━━` バーで `ステップ N: タイトル (対象 X 件)` を区切り表示。
+  小数のステップは**小数点を省いた番号**で出ます（Step 1.5 → `ステップ 15`、4.5 → `ステップ 45`、5.7 → `ステップ 57`、差分レポート → `ステップ 99`）。
 - **アクションの記号化**: `✓ スキップ / + 作成 / − 削除 / ✗ 失敗` で一目で判別。
 - **スレッドタグ**: 並列実行時、各ログ行に `[main]` / `[cai-scan_0]` 等のタグが自動付与され、`grep` で追跡可能。
 - **末尾サマリ**: 実行時間 / 読取成功 / 書込成功 / スキップ / 失敗 / Mock 実行 / ログパスを出力。

@@ -145,6 +145,22 @@ steps:
     # 既定 false: WARNING でログに残すのみ。CI で漏れゼロを強制したい場合は true。
     fail_on_uncovered: false
 
+  # [Step 1.5] dst プロジェクトの API 事前有効化
+  # src で有効な API（CAI の serviceusage / `gcloud services list --enabled`）を
+  # dst にも反映します。dst で API が無効だと Step 4 の terraform apply が
+  # 「<API> has not been used in project ... before or it is disabled」で止まります
+  # （GKE = container.googleapis.com が典型）。
+  # このキー自体が無い場合も既定で有効 (true) です。
+  enable_apis:
+    enabled: true
+    # src に無くても必ず有効化したい API
+    extra_apis: []
+    # src で有効でも dst では有効化しない API
+    # （廃止済み API / 旧エイリアスはコード側にも既定の除外リストあり）
+    skip_apis: []
+    # 有効化の伝播待ち秒数（0 で待たない）。直後に terraform を回すと 403 になるため既定 120。
+    wait_seconds: 120
+
   # [Step 2] GCE Snapshot の準備
   gce_snapshot:
     enabled: true

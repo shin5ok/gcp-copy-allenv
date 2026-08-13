@@ -55,6 +55,7 @@ make vmware-all # VMware → GCE フル処理
 | 0a create-projects (provision) | dst プロジェクト | `create_projects.py:_provision_one` を ThreadPoolExecutor で並列化。counter は `self._lock` 保護 |
 | 0b SA preflight (`check_service_accounts`) | (SA, project) | `make plan` / `make run` の最初に毎回走る。token 発行 + testIamPermissions を並列化 |
 | 1 cai_scan | プロジェクト | src read-only |
+| 1.5 enable_apis | (src, dst) ペア | プロジェクト内は chunk 直列（batchEnable が 20 件上限 + 失敗時は 1 件ずつ再試行） |
 | 2 gce_snapshot | プロジェクト | 既存 |
 | 3 bulk_export | プロジェクト | 既存 |
 | 4 terraform_apply (init / plan / apply) | プロジェクト (Terraform ルート) | 各 `terraform/active/<src>/` は state 分離済。`_terraform_one_project` を `_parallel_for_each` で並列化 |
@@ -93,6 +94,33 @@ make vmware-all # VMware → GCE フル処理
 - transient (`PROVISIONING / STAGING / STOPPING / REPAIRING / SUSPENDING`) と不明値は pending リストに入れず RUNNING のまま残す。
 - 新しい状態遷移コマンド（`suspend` / `resume` など）を増やす時は **`_WRITE_VERBS`（src 拒否リスト）と `_MOCK_KNOWN_PATTERNS`（mock 許容リスト）の両方** に追加。片方だけだと src で実行される / mock が fail-closed で止まる。
 - **user-managed SA は src email のまま dst VM にアタッチできない**（SA は project スコープ。cross-project attach は org policy `iam.disableCrossProjectServiceAccountUsage` 既定 enforced + actAs で "does not have access to service account" になる。regression: my-osaka）。`_resolve_dst_vm_service_account` が proj_map で `<id>@<dst_proj>.iam.gserviceaccount.com` に置換し、dst に無ければ**空 SA を冪等作成**（IAM ロールは複製せず WARNING で手動付与を案内）。proj_map 外プロジェクトの SA は dst 既定 SA に落として WARNING（secure_tag と同じ安全側パターン）。default compute SA（`<番号>-compute@`）は従来どおり除去。
+
+### GKE は構成のみコピー / ノード VM は除外（Step 2 / 3 / 4.5 / 5 / 99）
+
+- **方針**: クラスタ / ノードプールの構成は Terraform（Step 3 export → Step 4 apply）で複製し、**GKE が自分で作り直すもの（ノード VM・インスタンステンプレート・MIG・オートスケーラー・`gke-*` / `k8s-*` FW ルール）は一切コピーしない**。PV データとクラスタ内 k8s オブジェクトは対象外（利用者が再デプロイ）。config フラグは持たず常時この挙動。
+- **ノード判定は `is_gke_node_vm()` に集約。名前だけで判定しない**。第一判定は GKE が必ず付ける `goog-gke-node` ラベル。ラベルが無い場合のフォールバックは `gke-` / `gk3-` 接頭辞 **かつ** ノード metadata キー（`kube-labels` / `kube-env` / `cluster-name`）の AND。名前だけで切ると `gke-` で始まる**利用者 VM を誤って除外**する（コピー漏れ = 実害。安全側は「コピーする」方向）。
+- **Step 2 (`step_gce_snapshot`) は GKE ノードを検証対象から外す**。ノードには移行用スナップショットが存在しないため、除外しないと `errors` に積まれて `sys.exit(1)` し、**GKE がある src では `make plan` / `make run` が丸ごと止まる**（実際そうなっていた）。除外は INFO のみで `errors` に入れない。
+- **Step 5 (`step_gce_restore`) のフィルタは `list_worker` の 1 箇所だけ**。復元 unit 展開と `_finalize_vm_power_states` の pending は同じ `project_data["vms"]` を読むので、ここで落とせば両方に効く。除外数は `stats.incr("skipped")`。
+- **Step 3 の `.tf` 間引きは `_skip_reason_for_file`**。`_GKE_MANAGED_TF_RESOURCE_TYPES`（instance_template / (region_)instance_group_manager / (region_)autoscaler / instance_group / health_check / target_pool / route / firewall）に該当し、かつ `name = "..."` が `is_gke_managed_name()` を満たすファイルだけ落とす。**`google_container_cluster` / `google_container_node_pool` は絶対に落とさない**（これが複製本体）。
+- `_GKE_MANAGED_NAME_PREFIXES`（`gke-` / `gk3-` / `k8s-` / `k8s1-` / `k8s2-` / `gkegw1-`）に接頭辞を足すと **3 箇所（`_skip_reason_for_file` / `_sync_classic_firewall_rules` の skip / `classify_missing_asset`）に同時に効く**。追加時は 3 箇所すべての影響を確認すること。
+- Step 4.5 の GKE FW ルール除外は **dst network の pre-flight より前**に置く（存在しない dst network 参照で cryptic なエラーを出す前に落とす）。
+- **DIFF (Step 99)**: `k8s.io/*` / `*.k8s.io` の asset type（`_is_k8s_asset_type()`）は `diff_coverage` と `analyze_cai_tf_diff` の両方で差分から除外（クラスタ内オブジェクトは数百件出てノイズになる）。`_GKE_DERIVED_ASSET_TYPES`（InstanceTemplate / InstanceGroupManager / InstanceGroup / NetworkEndpointGroup）は名前が GKE 管理接頭辞なら **reference P3（対応不要）**、そうでなければ action のまま（利用者テンプレートを握り潰さない）。
+- 新しい gcloud コマンドは増やしていないので `_WRITE_VERBS` / `_MOCK_KNOWN_PATTERNS` は変更不要。mock には GKE ノード VM（`goog-gke-node` ラベル付き・スナップショット無し）と `gke-*` インスタンステンプレート `.tf` を仕込んであるので、除外が壊れると `make mock` が落ちる。
+
+### dst API 事前有効化（Step 1.5 / `step_enable_apis`）
+
+- **なぜ要るか**: dst で API が無効だと Step 4 の `terraform apply` が `<API> has not been used in project ... before or it is disabled` の 403 で止まる。**GKE (`container.googleapis.com`) が典型**（regression: GKE ありの src で `make run` が Step 4 で全滅）。`_ensure_dst_prereq_apis`（Step 4 冒頭）は CRM/ServiceUsage/IAM の 4 つだけなので足りない。
+- **既定で有効**（`steps.enable_apis` キーが無くても走る）。`_STEP_ENABLED_DEFAULTS` + `step_enabled()`。
+- **実行位置は `cai_scan` の直後**（`execute()` の 2 番目）。CAI 出力から「src で有効な API」が取れ、Step 2/3（src 読み取り + export）の間に**有効化の伝播時間を稼げる**。terraform より後ろに置くと意味が無い。
+- 有効 API の取得元は 2 系統で、片方が欠けても動く:
+  1. `gcloud services list --enabled`（src read-only。`serviceusage.services.list` が要る）
+  2. Step 1 の CAI 出力の `serviceusage.googleapis.com/Service`（`cai_api_hints()`。**追加権限なしで有効 API 一覧が取れる**のでフォールバックとして重要）
+  さらに `_STEP_DST_APIS`（有効ステップが dst で必ず叩く API）と `_BASE_DST_APIS` を必ず足す。
+- **soft fail に徹する**（`stats.failed` に積まない = `make run` の exit code を落とさない）。`run_command` ではなく `_soft_run()`（`_try_dst_suspend` と同じ方針）を使う。本当に必要な API なら後続ステップが本来のエラーで止めるので二重報告しない。
+- `gcloud services enable` は **20 件/回**（batchEnable の上限 = `_API_ENABLE_BATCH`）。**batch は 1 件でも不正だと chunk 全体が失敗する**ので、chunk 失敗時は 1 件ずつ再試行して「本当にダメな API」だけ WARNING + 手動コマンド案内に残す。
+- `_DST_API_SKIP` に入れてよいのは **単体では有効化できない API だけ**（廃止・旧エイリアス・親 API に伴って自動で付く内部サービス）。契約や申請が要るだけの実 API（`edgecache` 等）は入れない — 黙って消すより有効化を試して WARNING で見せる方が安全側。除外した API は必ず INFO でログに出す（skip 判断の誤りに気付けるように）。
+- 権限は **preflight（`_SRC_PERMS_BY_STEP` / `_DST_PERMS_BY_STEP`）に足さない**。`serviceusage.services.list`（src）も `serviceusage.services.enable`（dst、`roles/editor` に含む）も、無い環境で fail-fast にすると bootstrap 再実行まで移行全体が止まる。iam_sync の `setIamPolicy` と同じ扱いで「その場でスキップ + 案内」に倒す（`bootstrap_cross_project.sh` の `CUSTOM_PERMS` には追加済み）。
+- 純粋関数（`api_from_asset_type` / `cai_api_hints` / `build_api_enable_plan`）に分離してテストする。mock には src と dst で差が出る `gcloud services list` を仕込んであるので、差分計算が壊れると `make mock` の Step 1.5 で「追加 0 件」になる。
 
 ### Network Firewall Policy（Step 4.5）
 
@@ -146,6 +174,7 @@ make vmware-all # VMware → GCE フル処理
     - `state=RESERVED` … 未使用の取り置き。dst に無くても壊れない → P2
     - `state=IN_USE` の**内部** IP（RFC1918 判定）+ `gce_restore` 有効 … Step 5 が同じ IP を `mig-<vm>-<ip>` 名で dst に静的予約するため機能等価 → P1
     - `state` 不明 / 使用中の**外部** IP（nat-auto 以外）は action のまま
+- **TF 側の走査 (`parse_tf_resources`) は必ず再帰 (`os.walk`)**。`_emit_cai_tf_diff` は `terraform/raw/<src>` と `terraform/active/<src>` の両方を渡すが、**raw は `<src>/projects/<proj>/<Kind>/<location>/<name>.tf` の深いツリー**（フラットなのは customize 後の active だけ）。`os.listdir` でフラット走査していた頃は raw から 1 件も拾えず、`TF 0 件 / 要対応 278 件` のように **export 済みリソース（GKE クラスタ含む）まで「bulk-export が出力しなかった」と誤検知**していた（regression）。`.terraform/`（provider / module キャッシュ）は除外すること。
 - **判定材料が無い場合は必ず action に倒す**（`bound_custom_roles=None`、Address の `state` 欠落等）。見落とすより過剰報告を選ぶ。
 - カスタムロールの付与判定は `step_iam_sync` が取った src ポリシー（`self._src_iam_policies`）の再利用。iam_sync 無効時は取得されず `None` → 全カスタムロールが action になる（意図どおり）。
 - 分類は純粋関数なのでテストは直接叩く（`TestClassifyMissingAsset` / `TestBoundCustomRoleIds`）。**新しい「実は対応不要」パターンを見つけたら reference 条件に足す**。逆に判断が付かないものを reference に入れてはいけない。
@@ -173,6 +202,10 @@ make vmware-all # VMware → GCE フル処理
   - 勝手にコミットやプッシュしない
   - GitHub Flow に従う
   - branch は feat/branchname ではなく branchname で作る
+- 変更点については、branch ごとにまとめて、ユーザーが利用時に意識すべきもののもののみを簡潔に RELEASE_NOTE.md に記載する
+  - 変更した日付ごとまとめ、日付のヘッダをつける
+  - 新しいものを上に書く
+
 
 ## ツール
 以下のツールを積極的に使う
