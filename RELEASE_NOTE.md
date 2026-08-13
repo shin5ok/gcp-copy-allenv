@@ -5,6 +5,80 @@
 
 ---
 
+## 2026-08-13 — Terraform 適用の「Duplicate resource」と provider 非互換を修正
+
+### 修正
+- **同名リソースが複数リージョンにあると `terraform plan` が
+  `Duplicate resource ... configuration` で停止する問題を修正しました**
+  （例: Artifact Registry の `cloud-run-source-deploy` が asia-northeast1 と us-central1 の両方にある場合）。
+  衝突したリソース定義のラベルを `<名前>_<リージョン>` に自動リネームして回避します
+  （`terraform import` 用コメントも追従。ログに `重複ラベルを一意化:` として出力）。
+- **エクスポートされた HCL が最新の Terraform google provider で通らない問題を修正しました**。
+  適用前に以下を自動補正します（いずれもログに出力）:
+  - GKE クラスタの廃止済みブロック（`cluster_telemetry` / `pod_security_policy_config` /
+    `protect_config`）を除去
+  - `iap` ブロックに必須化された `enabled = true` を補完
+    （**IAP の認証壁を外さない安全側**。コピー先で IAP が不要なら適用後に手動で無効化してください）
+  - GKE の `ip_allocation_policy` で排他になった CIDR 直指定を除去
+    （Pod range は subnet 側に複製された secondary range を名前参照）
+
+### 仕様変更（要確認）
+- **自己管理 SSL 証明書（`google_compute_ssl_certificate`）はコピー対象外になりました**。
+  秘密鍵は API からエクスポートできないため、Terraform では作成不能です。
+  DIFF.md に**要対応**として出るので、鍵をお持ちの方がコピー先で手動作成してください。
+  作成するまで、その証明書を参照する HTTPS ロードバランサ（target proxy）の適用は失敗します。
+  （Google 管理証明書 `google_compute_managed_ssl_certificate` は従来どおりコピーされます）
+- **上記のような「手動対応・確認が必要な自動補正」は DIFF.md に必ず掲載されるようになりました**。
+  要対応テーブルの直後に「customize による補正・スキップ（手動対応・確認）」セクションが出ます。
+  - **要対応**: SSL 証明書の手動作成（作成用の `gcloud` コマンド付き）
+  - **確認**: IAP を `enabled = true` で複製した backend service
+    （不要なら無効化する `gcloud` コマンド付き）
+  - `bulk_export.skip_on_run: true` で export をスキップした `make run` でも、
+    前回 customize 時の注記がそのまま DIFF.md に出ます（`.tf` と同じライフサイクルで更新）。
+
+---
+
+## 2026-08-13 — `make mock` の生成物が `make run` に混ざる問題を修正 / API 有効化を apply 直前にも実施
+
+### 重要な修正（要確認）
+- **`make mock` が実運用の Terraform 作業ディレクトリ (`terraform/active/`) を上書きしていた問題を
+  修正しました**。修正前は `make mock` の直後に `make run`（`skip_on_run: true`）を実行すると、
+  mock のダミー定義（`mock-cluster` / `org-bucket-shared-data` など）が**コピー先に実際に
+  作成されて**いました。
+  - `Kubernetes Engine API has not been used in project ...` の 403 は、この
+    ダミー GKE クラスタ (`mock-cluster`) を作ろうとして出ていたケースがあります。
+    **API を有効化して解決すべきエラーではありません**（有効化するとダミーのクラスタが
+    本当に作られます）。
+  - 今後 `make mock` の出力先は `terraform/mock/` に分離され、`terraform/active/` には
+    一切書き込みません。
+- **すでに mock の残骸がある環境向けの安全装置**を入れました。`terraform/active/` に mock 由来の
+  `.tf` が残っていると、
+  - `make run` は既存 active を再利用せず、**bulk-export からやり直します**。
+  - それでも残っている場合は **apply せずエラー**にします（削除コマンドを案内）。
+
+#### 過去に `make mock` → `make run` を実行した場合の対応
+1. 残骸を削除して作り直してください（`terraform/raw` / `active` は再生成される派生物です）。
+   ```
+   rm -rf terraform/raw terraform/active
+   make plan
+   ```
+2. コピー先に作られてしまったダミーリソースを確認・削除してください（例）。
+   ```
+   gcloud storage ls --project=<dst プロジェクト> | grep org-bucket-shared-data
+   gcloud container clusters list --project=<dst プロジェクト>   # mock-cluster があれば削除
+   ```
+
+### 改善
+- **Terraform で適用する `.tf` から必要な API を判定し、`terraform apply` の直前にも
+  有効化する**ようにしました（Step 4）。Step 1.5（コピー元の有効 API を反映）で取りこぼしても、
+  実際に適用するリソース定義から引き直すため、`<API> has not been used in project ...` の
+  403 で止まりにくくなります。
+  - 例: `google_container_cluster` → `container.googleapis.com`、
+    `google_sql_database_instance` → `sqladmin.googleapis.com`。
+  - 有効化できなかった場合も**エラーにはせず**警告と手動コマンドの案内に留めます。
+
+---
+
 ## 2026-08-13 — コピー先の API を移行前に自動有効化（Step 1.5 追加）
 
 ### 新機能・仕様変更

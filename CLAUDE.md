@@ -122,6 +122,36 @@ make vmware-all # VMware → GCE フル処理
 - 権限は **preflight（`_SRC_PERMS_BY_STEP` / `_DST_PERMS_BY_STEP`）に足さない**。`serviceusage.services.list`（src）も `serviceusage.services.enable`（dst、`roles/editor` に含む）も、無い環境で fail-fast にすると bootstrap 再実行まで移行全体が止まる。iam_sync の `setIamPolicy` と同じ扱いで「その場でスキップ + 案内」に倒す（`bootstrap_cross_project.sh` の `CUSTOM_PERMS` には追加済み）。
 - 純粋関数（`api_from_asset_type` / `cai_api_hints` / `build_api_enable_plan`）に分離してテストする。mock には src と dst で差が出る `gcloud services list` を仕込んであるので、差分計算が壊れると `make mock` の Step 1.5 で「追加 0 件」になる。
 
+### mock 生成物と実行用 terraform ディレクトリの分離（Step 3 / 4）
+
+- **mock は `terraform/mock/{raw,active}` に出力する**（`_tf_base_dir()` が `self.mock` のとき `<output_dir>/mock` を返す）。同じ `terraform/active/` を使うと `make mock` のダミー `.tf` が残り、直後の `make run` が `skip_on_run: true` で「既存 active を再利用」して **dst にダミーリソースを本当に作る**（regression: mock 直後の run で `org-bucket-shared-data-*` バケットが 4 プロジェクトに作成され、`mock-cluster` は container API 無効の 403 で失敗した ＝ **403 は症状であって原因ではない**）。
+- `_tf_base_dir()` は **terraform 配下を参照する全箇所**（`step_bulk_export` / `step_terraform_apply` / `_emit_cai_tf_diff` / `_resolve_gcs_rename_value`）で使うこと。1 箇所でも config 直読みが残ると mock と実行が同じ dir を共有して元の事故に戻る。
+- 分離前に汚染された環境のため、**内容からも検出する**（`tf_dir_has_mock_artifacts()`）。判定は `_MOCK_TF_MARK`（`_write_dummy_tf_files` が各ダミー `.tf` の先頭に入れるコメント。customize の置換を通っても残る）と、マーク導入前の残骸用の `_LEGACY_MOCK_TF_LABELS`（`"mock_vm"` / `"mock_bucket"` / `"mock_cluster"` / `"mock_gke_template"`）。マーカーファイルではなく `.tf` の中身で判定するので、`.tf` を作り直せば自動的に解消する（マーカーの寿命管理が要らない）。
+- 検出時の挙動は 2 段:
+  - Step 3 の `skip_on_run` 再利用パス … active（と raw 再利用パスでは raw）に mock 生成物があれば再利用せず bulk-export からやり直す（自己修復）。
+  - Step 4 `_terraform_one_project` 冒頭 … それでも残っていれば **apply せず** `stats.add_failure` + 削除コマンド案内（最終防衛線。worker なので `sys.exit` しない）。
+- **mock に新しいダミー `.tf` を足すときは必ず `_MOCK_TF_MARK` 行を入れる**。入れ忘れると検出をすり抜けて dst に実リソースが作られる。
+
+### apply 直前の API 有効化（Step 4 / `_ensure_dst_prereq_apis`）
+
+- Step 1.5（src の有効 API を dst に反映）だけでは、src の `services list` が読めない / export された `.tf` の親 API が src で無効だった等で取りこぼし、`terraform apply` が 403 で止まる。**これから apply する `.tf` から必要 API を引き直す**のが最も確実。
+- `tf_type_to_api()` は `google_` を除いた型名の**前方一致**。`_TF_TYPE_API_PREFIX_MAP` はモジュールロード時に**長い順へソート**されるので dict の記述順は問わない（`container_registry` が `container` より先に当たる）。**未知の型は None＝何も有効化しない**（誤った API を有効化しない安全側）。
+- 走査は Terraform ルート直下の `.tf` のみ（`tf_required_apis()`）。terraform 自体がサブディレクトリを再帰しないので active/<src> は平坦。
+- `_ensure_dst_prereq_apis(dst_proj, dst_sa, proj_dir)` が `_BASE_DST_APIS` + TF 由来 API の差分だけ有効化し、`_wait_for_apis_enabled` で伝播を待つ。**soft fail**（`_enable_apis_on_dst` 経由で `stats.failed` に積まない）。Step 1.5 と同じ方針。
+- Step 1.5 でも active/<src> があれば TF 由来 API を `extra_apis` として足す（`make plan` 済みなら早い段階で有効化できる）。ただし mock 生成物のディレクトリは無視する。
+
+### flatten 時の resource ラベル重複と provider 非互換（Step 3 / customize_hcl）
+
+- **bulk-export はラベルをリソース名だけから作る**ため、同名リソースが複数 location にあると（例: Artifact Registry の `cloud-run-source-deploy` が asia-northeast1 と us-central1）、customize の平坦化で同一 Terraform ルートに同じ (type, label) が同居し `Duplicate resource ... configuration` で init/plan ごと落ちる（regression: my-argolis）。`dedupe_tf_resource_labels()`（純粋関数）が衝突ブロックだけ `<label>_<location>` に改名し、同一ファイル内の `# terraform import` コメントも追従させる。
+- **改名は走査順依存（先勝ちで元ラベル維持）なので walk は必ずソート**（`dirs.sort()` + `sorted(files)`）。順序が実行ごとに変わると前回 state のアドレスと食い違い destroy/create 差分が出る。dedupe の呼び出し位置は `_skip_reason_for_file` の**後**（skip されたファイルのラベルを登録しない）。
+- **provider 非互換の吸収は `_fix_provider_compat`**。bulk-export (config-connector) は古い provider スキーマ相当の HCL を出すため、現行 provider では落ちるものがある。provider の版固定ではなく customize で内容を直す（他リソースの新フィールドを巻き添えにしないため）。現在の補正:
+  - GKE 廃止ブロック除去: `_GKE_REMOVED_TF_BLOCKS`（`cluster_telemetry` / `pod_security_policy_config` / `protect_config`）。クラスタ .tf は複製本体なので**ファイルごと skip せず**ブロックだけ落とす（`strip_hcl_blocks()`）。
+  - 必須化された引数の補完（`ensure_hcl_block_arg()`）: `iap.enabled = true`（**false に倒すと dst で認証壁が外れて公開される**。「緩くならない方向」原則）/ `advanced_datapath_observability_config.enable_relay = false`（API 既定値）。
+  - GKE の排他引数: `cluster_ipv4_cidr` は `ip_allocation_policy` と排他 → 除去。`*_secondary_range_name` があれば `cluster_ipv4_cidr_block` / `services_ipv4_cidr_block` を除去（GKE が subnet に作った secondary range は **subnet の .tf ごと dst に複製される**ので range 名参照が正。CIDR 側を残すと同じ CIDR で range 二重作成になる）。
+- **self-managed SSL 証明書（`google_compute_ssl_certificate`）は `_skip_reason_for_file` でファイルごと skip**。秘密鍵は API から export 不能で provider 上 `private_key` 必須のため apply 不能。DIFF に要対応として出て、利用者が鍵を持って手動作成する（Google-managed の `google_compute_managed_ssl_certificate` は別型で対象外）。
+- 新しい非互換を見つけたら: ブロック廃止 → `_GKE_REMOVED_TF_BLOCKS` 等 + `strip_hcl_blocks`、引数必須化 → `ensure_hcl_block_arg`（補完値は「dst が緩くならない側」）、複製不能リソース → `_skip_reason_for_file`。検証は `terraform validate`（scratchpad に customize 出力を作って流すのが速い）。
+- **手動対応・確認が要る補正/スキップは DIFF.md に明記する（ルール）**。ログに流すだけだと埋もれるため、実装箇所で `self._add_customize_note(kind, content, rel)` を呼ぶ → customize_hcl 末尾が `active/<src>/.customize_notes.json` に永続化（**skip_on_run で customize を飛ばす run でも DIFF に出すため、メモリでなくファイルが正**。customize したプロジェクトだけ更新し、原因が消えたら注記も消える = .tf と同じライフサイクル）→ Step 99 が `load_customize_notes()` で読み、`format_diff_report(manual_notes=...)` が要対応テーブル直後の専用セクションに出す。行の整形は `customize_note_row()`（純粋関数）に kind ごとの (種別 要対応/確認, 対象, 理由, 対応コマンド) を追加する。未知 kind は握り潰さず「確認」で出る（登録漏れ検知）。現在の kind: `ssl_certificate`（要対応: dst で手動作成）/ `iap_enabled`（確認: 不要なら `--iap=disabled`）。
+
 ### Network Firewall Policy（Step 4.5）
 
 - **scope flag はサブコマンドごとに違う**。誤ると `unrecognized arguments`。

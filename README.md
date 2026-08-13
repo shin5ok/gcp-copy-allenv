@@ -290,6 +290,52 @@ cp dst/config.yaml.template dst/config.yaml
 > - lien (`compute.googleapis.com/projects-delete-prevented` 等) が付いていれば `gcloud alpha resource-manager liens delete` で先に解除してから `gcloud projects delete --quiet` を呼ぶ。
 > - 既定は `--dry-run`（make ターゲット側で `--no-dry-run` を付与）。並列度は `dst/config.yaml` の `global.parallel_jobs`（既定 8）に従う。
 
+### 🧹 いつ `clean`（state 削除）すべきか
+
+`terraform/active/<src>/terraform.tfstate` は**派生物ではなく「コピー先に何を作ったか」の記録**です。
+消すと terraform が作成済みリソースを見失う（＝管理外になる）ため、判断基準は 1 つだけです。
+
+> **コピー先のリソース実体を捨てた（or これから捨てて作り直す）ときだけ消す。**
+> それ以外は state を残したまま `.tf` を作り直す。
+
+```mermaid
+graph TD
+    A{"コピー先プロジェクトを<br/>削除・作り直した？"} -->|はい| B["make clean-project P=対象<br/>全プロジェクトなら make clean"]
+    A -->|いいえ| C{"何を直したい？"}
+    C -->|".tf を作り直したい"| D["skip_on_run: false にする<br/>（毎回 export → customize し直す。state は温存）"]
+    C -->|"terraform init / provider が壊れた"| E[".terraform と .terraform.lock.hcl だけ削除"]
+    C -->|"export をやり直したい"| F["何もしない<br/>（Step 3 が raw を毎回作り直す）"]
+    C -->|"それ以外"| G["state は触らない"]
+```
+
+#### 消す範囲は最小限に
+
+| 症状 / 目的 | 消すもの | 手段 |
+| :--- | :--- | :--- |
+| コピー元が変わったので export し直したい | `terraform/raw` のみ | 不要（Step 3 が毎回作り直す） |
+| `.tf` をきれいに作り直したい | `active/<src>/*.tf` のみ（state 温存） | `bulk_export.skip_on_run: false`（customize が毎回やる） |
+| `terraform init` / provider が壊れた | `.terraform` と `.terraform.lock.hcl` のみ | `find terraform -name '.terraform' -prune -exec rm -rf {} +` |
+| **コピー先プロジェクトを削除・作り直した** | **state まで** | `make clean-project P=<project_id>` / 全体は `make clean` |
+| **移行を最初からやり直す**（コピー先を空にして再現性確認） | state + logs + cai | `make clean-all` |
+| state ファイルが壊れて terraform が読めない | 最後の手段 | まず `terraform.tfstate.backup` からの復元を試す |
+
+#### やってはいけない使い方
+
+| やりがち | なぜダメか | 正しい手 |
+| :--- | :--- | :--- |
+| `already exists` (409) が出たから `clean` | 実体はコピー先に残り state だけ消えるので**次も 409**。悪化します | `terraform import` するか、コピー先の実体を削除 |
+| apply が失敗したから `clean` | 失敗原因（権限・API・依存）は state と無関係。作りかけのリソースが管理外に残るだけ | ログの 403 / 409 を直す |
+| `.tf` が古い気がするから `clean` | `.tf` は毎回作り直される派生物。state を巻き添えにする必要はありません | `skip_on_run: false` |
+| 不要なリソースを消したいから `clean` | state を残して `.tf` を作り直せば、**次の apply が自動で destroy** してくれます | `.tf` だけ再生成 |
+
+> ⚠️ **`make clean` は `terraform/.gcs_rename_value` も削除します。** `rename_rules.gcs.value: "auto"`
+> の場合、次回実行で**別の suffix が生成され、既存バケットを adopt できず新しい名前で作り直し**に
+> なります（旧バケットは残ります）。特定プロジェクトだけなら、`.gcs_rename_value` を温存する
+> `make clean-project P=<project_id>` を使ってください。
+
+> 💡 手打ちの `rm -rf terraform/...` は `.gcs_rename_value` や `.dst_project` マーカーの消し残り／
+> 消し過ぎが起きます。リセットは必ず `make clean` 系を使ってください。
+
 ---
 
 ## 💡 推奨運用フロー

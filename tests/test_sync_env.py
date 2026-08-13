@@ -37,6 +37,16 @@ from scripts.sync_env import (
     api_from_asset_type,
     cai_api_hints,
     build_api_enable_plan,
+    tf_type_to_api,
+    dedupe_tf_resource_labels,
+    strip_hcl_blocks,
+    customize_note_row,
+    load_customize_notes,
+    ensure_hcl_block_arg,
+    _GKE_REMOVED_TF_BLOCKS,
+    tf_required_apis,
+    tf_dir_has_mock_artifacts,
+    _MOCK_TF_MARK,
     _DST_API_SKIP,
 )
 
@@ -3445,3 +3455,563 @@ class TestEnableApisSrcGuard:
     def test_services_list_is_mock_known(self):
         assert is_known_mock_command(
             "gcloud services list --enabled --project=p --format='value(config.name)'")
+
+
+# ============================================================
+# Step 4 直前の API 有効化（.tf から必要 API を引く）
+# ============================================================
+class TestTfTypeToApi:
+    def test_container_resources_map_to_container_api(self):
+        assert tf_type_to_api("google_container_cluster") == "container.googleapis.com"
+        assert tf_type_to_api("google_container_node_pool") == "container.googleapis.com"
+
+    def test_longest_prefix_wins(self):
+        # "container" より "container_registry" / "container_analysis" が優先される
+        assert tf_type_to_api("google_container_registry") == "containerregistry.googleapis.com"
+        assert tf_type_to_api("google_container_analysis_note") == "containeranalysis.googleapis.com"
+        # "project" より "project_service"
+        assert tf_type_to_api("google_project_service") == "serviceusage.googleapis.com"
+        assert tf_type_to_api("google_project_iam_member") == "cloudresourcemanager.googleapis.com"
+
+    def test_common_types(self):
+        assert tf_type_to_api("google_compute_instance") == "compute.googleapis.com"
+        assert tf_type_to_api("google_storage_bucket") == "storage.googleapis.com"
+        assert tf_type_to_api("google_bigquery_dataset") == "bigquery.googleapis.com"
+        assert tf_type_to_api("google_sql_database_instance") == "sqladmin.googleapis.com"
+        assert tf_type_to_api("google_service_account") == "iam.googleapis.com"
+
+    def test_unknown_and_non_google_are_none(self):
+        # 未知の型で誤った API を有効化しない（安全側）
+        assert tf_type_to_api("google_totally_unknown_thing") is None
+        assert tf_type_to_api("aws_instance") is None
+        assert tf_type_to_api("") is None
+
+
+class TestTfRequiredApis:
+    def test_resource_and_data_blocks_are_scanned(self, temp_dir):
+        with open(os.path.join(temp_dir, "a.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_cluster" "c" {\n  name = "c1"\n}\n')
+        with open(os.path.join(temp_dir, "b.tf"), "w", encoding="utf-8") as f:
+            f.write('data "google_storage_bucket" "b" {\n  name = "b1"\n}\n')
+        assert tf_required_apis(temp_dir) == [
+            "container.googleapis.com", "storage.googleapis.com",
+        ]
+
+    def test_non_tf_files_and_missing_dir_are_ignored(self, temp_dir):
+        with open(os.path.join(temp_dir, "notes.txt"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_cluster" "c" {}\n')
+        assert tf_required_apis(temp_dir) == []
+        assert tf_required_apis(os.path.join(temp_dir, "nope")) == []
+
+
+class TestTfDirHasMockArtifacts:
+    def test_marked_file_is_detected(self, temp_dir):
+        with open(os.path.join(temp_dir, "x.tf"), "w", encoding="utf-8") as f:
+            f.write(f"# {_MOCK_TF_MARK}\nresource \"google_storage_bucket\" \"x\" {{}}\n")
+        assert tf_dir_has_mock_artifacts(temp_dir)
+
+    def test_legacy_mock_labels_are_detected(self, temp_dir):
+        # マーク行が無かった頃に生成された残骸も検出する
+        with open(os.path.join(temp_dir, "x.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_cluster" "mock_cluster" {\n}\n')
+        assert tf_dir_has_mock_artifacts(temp_dir)
+
+    def test_real_export_is_not_flagged(self, temp_dir):
+        with open(os.path.join(temp_dir, "x.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_cluster" "prod" {\n  name = "prod"\n}\n')
+        assert not tf_dir_has_mock_artifacts(temp_dir)
+
+
+class TestTfBaseDirIsolation:
+    def _orch(self, temp_dir, mock: bool):
+        cfg = _full_config(temp_dir, steps={"bulk_export": {"output_dir": "./terraform"}})
+        cfg["global"]["mock"] = mock
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path, mock_override=mock)
+        o.load_config()
+        return o
+
+    def test_mock_uses_separate_dir(self, temp_dir):
+        assert self._orch(temp_dir, mock=True)._tf_base_dir() == os.path.join(
+            "./terraform", "mock")
+
+    def test_real_run_uses_configured_dir(self, temp_dir):
+        assert self._orch(temp_dir, mock=False)._tf_base_dir() == "./terraform"
+
+
+class TestTerraformMockArtifactGuard:
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def test_mock_artifacts_are_not_applied(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        proj_dir = os.path.join(temp_dir, "active", "src-svc-1")
+        os.makedirs(proj_dir)
+        with open(os.path.join(proj_dir, "x.tf"), "w", encoding="utf-8") as f:
+            f.write(f"# {_MOCK_TF_MARK}\nresource \"google_container_cluster\" \"mock_cluster\" {{}}\n")
+
+        with patch.object(o, "run_command") as rc:
+            o._terraform_one_project(proj_dir, {"src-svc-1": "dst-svc-1"}, {})
+
+        assert rc.call_count == 0, "mock 生成物を apply しようとしている"
+        assert o.stats.failed == 1
+
+    def test_tf_derived_apis_are_enabled_before_apply(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        proj_dir = os.path.join(temp_dir, "active", "src-svc-1")
+        os.makedirs(proj_dir)
+        with open(os.path.join(proj_dir, "gke.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_cluster" "prod" {\n  name = "prod"\n}\n')
+        issued = []
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            if cmd.startswith("gcloud services list"):
+                return 0, "cloudresourcemanager.googleapis.com\n", ""
+            issued.append(cmd)
+            return 0, "", ""
+
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_wait_for_apis_enabled"), \
+             patch.object(o, "_write_provider_tf"), \
+             patch.object(o, "_terraform_import_existing"), \
+             patch.object(o, "run_command"):
+            o._terraform_one_project(proj_dir, {"src-svc-1": "dst-svc-1"}, {})
+
+        joined = " ".join(issued)
+        assert "container.googleapis.com" in joined
+        assert "--project=dst-svc-1" in joined
+
+    def test_api_enable_failure_does_not_fail_the_run(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        proj_dir = os.path.join(temp_dir, "active", "src-svc-1")
+        os.makedirs(proj_dir)
+        with open(os.path.join(proj_dir, "gke.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_cluster" "prod" {\n  name = "prod"\n}\n')
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            return 1, "", "ERROR: PERMISSION_DENIED"
+
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_wait_for_apis_enabled"), \
+             patch.object(o, "_write_provider_tf"), \
+             patch.object(o, "_terraform_import_existing"), \
+             patch.object(o, "run_command"):
+            o._terraform_one_project(proj_dir, {"src-svc-1": "dst-svc-1"}, {})
+
+        assert o.stats.failed == 0
+
+
+# ============================================================
+# flatten 時の resource ラベル重複解消
+# ============================================================
+class TestDedupeTfResourceLabels:
+    def test_first_occurrence_keeps_label(self):
+        seen = set()
+        c1, r1 = dedupe_tf_resource_labels(
+            'resource "google_artifact_registry_repository" "repo" {\n}\n',
+            "asia-northeast1", seen)
+        assert r1 == [] and '"repo"' in c1
+        assert ("google_artifact_registry_repository", "repo") in seen
+
+    def test_collision_gets_location_suffix_and_import_comment_follows(self):
+        seen = {("google_artifact_registry_repository", "repo")}
+        content = (
+            'resource "google_artifact_registry_repository" "repo" {\n'
+            '  location = "us-central1"\n'
+            '}\n'
+            '# terraform import google_artifact_registry_repository.repo projects/p/locations/us-central1/repositories/repo\n'
+        )
+        out, renames = dedupe_tf_resource_labels(content, "us-central1", seen)
+        assert renames == [("google_artifact_registry_repository", "repo", "repo_us_central1")]
+        assert 'resource "google_artifact_registry_repository" "repo_us_central1"' in out
+        assert "google_artifact_registry_repository.repo_us_central1 projects/p" in out
+        assert ("google_artifact_registry_repository", "repo_us_central1") in seen
+
+    def test_same_discriminator_falls_back_to_counter(self):
+        seen = {("t", "x"), ("t", "x_loc")}
+        out, renames = dedupe_tf_resource_labels('resource "t" "x" {}\n', "loc", seen)
+        assert renames == [("t", "x", "x_loc_2")]
+
+    def test_different_type_same_label_is_not_a_collision(self):
+        seen = {("google_storage_bucket", "repo")}
+        _out, renames = dedupe_tf_resource_labels(
+            'resource "google_artifact_registry_repository" "repo" {}\n', "loc", seen)
+        assert renames == []
+
+    def test_empty_discriminator_uses_dup(self):
+        seen = {("t", "x")}
+        _out, renames = dedupe_tf_resource_labels('resource "t" "x" {}\n', "", seen)
+        assert renames == [("t", "x", "x_dup")]
+
+
+class TestCustomizeHclDedupesFlattenedLabels:
+    """bulk-export の深いツリーを flatten した際の Duplicate resource 回避。"""
+
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def _write_repo_tf(self, base, location):
+        d = os.path.join(base, "projects", "src-svc-1", "ArtifactRegistryRepository", location)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "cloud-run-source-deploy.tf"), "w", encoding="utf-8") as f:
+            f.write(
+                'resource "google_artifact_registry_repository" "cloud_run_source_deploy" {\n'
+                f'  location      = "{location}"\n'
+                '  project       = "src-svc-1"\n'
+                '  repository_id = "cloud-run-source-deploy"\n'
+                '}\n'
+                '# terraform import google_artifact_registry_repository.cloud_run_source_deploy '
+                f'projects/src-svc-1/locations/{location}/repositories/cloud-run-source-deploy\n'
+            )
+
+    def test_same_label_in_two_locations_is_deduped(self, temp_dir):
+        o = self._setup(temp_dir)
+        raw = os.path.join(temp_dir, "raw", "src-svc-1")
+        active = os.path.join(temp_dir, "active")
+        self._write_repo_tf(raw, "asia-northeast1")
+        self._write_repo_tf(raw, "us-central1")
+        o.customize_hcl(os.path.join(temp_dir, "raw"), active)
+
+        proj_root = os.path.join(active, "src-svc-1")
+        contents = {}
+        for name in os.listdir(proj_root):
+            if name.endswith(".tf"):
+                with open(os.path.join(proj_root, name), encoding="utf-8") as f:
+                    contents[name] = f.read()
+        labels = []
+        for c in contents.values():
+            labels += [m[1] for m in
+                       __import__("re").findall(r'resource\s+"([^"]+)"\s+"([^"]+)"', c)]
+        # ラベルは一意（Duplicate resource が出ない）
+        assert len(labels) == 2 and len(set(labels)) == 2
+        # ソート走査で asia が先勝ち = 元ラベル維持、us が改名される（決定的）
+        assert "cloud_run_source_deploy" in labels
+        assert "cloud_run_source_deploy_us_central1" in labels
+        # 改名側の import コメントも追従している
+        renamed = [c for c in contents.values() if "cloud_run_source_deploy_us_central1" in c][0]
+        assert ("# terraform import google_artifact_registry_repository."
+                "cloud_run_source_deploy_us_central1 ") in renamed
+
+
+# ============================================================
+# provider 非互換の吸収（廃止ブロック除去 / 必須引数の補完）
+# ============================================================
+class TestStripHclBlocks:
+    SAMPLE = (
+        'resource "google_container_cluster" "c" {\n'
+        '  name = "c1"\n'
+        '\n'
+        '  cluster_telemetry {\n'
+        '    type = "ENABLED"\n'
+        '  }\n'
+        '\n'
+        '  protect_config {\n'
+        '    workload_config {\n'
+        '      audit_mode = "BASIC"\n'
+        '    }\n'
+        '    workload_vulnerability_mode = "BASIC"\n'
+        '  }\n'
+        '\n'
+        '  pod_security_policy_config {\n'
+        '    enabled = false\n'
+        '  }\n'
+        '}\n'
+    )
+
+    def test_removed_blocks_are_stripped_including_nested(self):
+        out, removed = strip_hcl_blocks(self.SAMPLE, _GKE_REMOVED_TF_BLOCKS)
+        assert sorted(removed) == [
+            "cluster_telemetry", "pod_security_policy_config", "protect_config"]
+        for word in ("cluster_telemetry", "protect_config", "workload_config",
+                     "pod_security_policy_config", "audit_mode"):
+            assert word not in out
+        # リソース本体と他の引数は残る
+        assert 'resource "google_container_cluster" "c"' in out
+        assert 'name = "c1"' in out
+        # brace が対応している（除去でブロックが壊れていない）
+        assert out.count("{") == out.count("}")
+
+    def test_unlisted_blocks_are_kept(self):
+        out, removed = strip_hcl_blocks(self.SAMPLE, ["nonexistent_block"])
+        assert removed == [] and out == self.SAMPLE
+
+
+class TestEnsureHclBlockArg:
+    def test_missing_arg_is_inserted_with_indent(self):
+        content = (
+            'resource "google_compute_backend_service" "b" {\n'
+            '  iap {\n'
+            '    oauth2_client_id = "xxx"\n'
+            '  }\n'
+            '}\n'
+        )
+        out, n = ensure_hcl_block_arg(content, "iap", "enabled = true")
+        assert n == 1
+        assert '  iap {\n    enabled = true\n    oauth2_client_id = "xxx"\n' in out
+
+    def test_existing_arg_is_untouched(self):
+        content = '  iap {\n    enabled = false\n  }\n'
+        out, n = ensure_hcl_block_arg(content, "iap", "enabled = true")
+        assert n == 0 and "enabled = false" in out and "enabled = true" not in out
+
+    def test_nested_block_target(self):
+        content = (
+            '  monitoring_config {\n'
+            '    advanced_datapath_observability_config {\n'
+            '      enable_metrics = false\n'
+            '    }\n'
+            '  }\n'
+        )
+        out, n = ensure_hcl_block_arg(
+            content, "advanced_datapath_observability_config", "enable_relay = false")
+        assert n == 1 and "enable_relay = false" in out
+
+    def test_multiple_blocks_each_get_the_arg(self):
+        content = '  iap {\n  }\n  iap {\n    enabled = true\n  }\n'
+        out, n = ensure_hcl_block_arg(content, "iap", "enabled = true")
+        assert n == 1
+
+
+class TestSslCertificateSkip:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_self_managed_cert_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        reason = o._skip_reason_for_file(
+            'resource "google_compute_ssl_certificate" "c" {\n  name = "c"\n}\n')
+        assert reason and "SSL" in reason
+
+    def test_managed_cert_is_not_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        assert o._skip_reason_for_file(
+            'resource "google_compute_managed_ssl_certificate" "c" {\n}\n') is None
+
+
+class TestFixProviderCompatGkeCidr:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        return o
+
+    def test_cluster_ipv4_cidr_dropped_when_vpc_native(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_container_cluster" "c" {\n'
+            '  cluster_ipv4_cidr = "10.4.0.0/17"\n'
+            '  ip_allocation_policy {\n'
+            '    cluster_ipv4_cidr_block      = "10.4.0.0/17"\n'
+            '    services_ipv4_cidr_block     = "10.4.128.0/22"\n'
+            '  }\n'
+            '}\n'
+        )
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "cluster_ipv4_cidr =" not in out
+        # block 内の cluster_ipv4_cidr_block は残す（こちらが正）
+        assert 'cluster_ipv4_cidr_block      = "10.4.0.0/17"' in out
+
+    def test_routes_based_cluster_keeps_cidr(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_container_cluster" "c" {\n'
+            '  cluster_ipv4_cidr = "10.4.0.0/17"\n'
+            '}\n'
+        )
+        out = o._fix_provider_compat(content, "x.tf")
+        assert 'cluster_ipv4_cidr = "10.4.0.0/17"' in out
+
+
+class TestFixProviderCompatIpAllocation:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        return o
+
+    def test_cidr_blocks_dropped_when_range_name_present(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_container_cluster" "c" {\n'
+            '  ip_allocation_policy {\n'
+            '    cluster_ipv4_cidr_block      = "10.14.0.0/17"\n'
+            '    cluster_secondary_range_name = "gke-c-pods-d5450142"\n'
+            '    services_ipv4_cidr_block = "34.118.224.0/20"\n'
+            '    stack_type               = "IPV4"\n'
+            '  }\n'
+            '}\n'
+        )
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "cluster_ipv4_cidr_block" not in out
+        assert "services_ipv4_cidr_block" not in out
+        # range 名参照（dst subnet に複製される実体）と他の引数は残す
+        assert 'cluster_secondary_range_name = "gke-c-pods-d5450142"' in out
+        assert 'stack_type               = "IPV4"' in out
+
+    def test_cidr_only_cluster_is_untouched(self, temp_dir):
+        # range 名を使わないクラスタ（CIDR 自動作成モード）はそのまま
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_container_cluster" "c" {\n'
+            '  ip_allocation_policy {\n'
+            '    cluster_ipv4_cidr_block  = "10.14.0.0/17"\n'
+            '    services_ipv4_cidr_block = "10.14.128.0/22"\n'
+            '  }\n'
+            '}\n'
+        )
+        out = o._fix_provider_compat(content, "x.tf")
+        assert 'cluster_ipv4_cidr_block  = "10.14.0.0/17"' in out
+        assert 'services_ipv4_cidr_block = "10.14.128.0/22"' in out
+
+
+# ============================================================
+# customize の手動対応・確認注記 → DIFF.md 掲載
+# ============================================================
+class TestCustomizeNotes:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def _write_raw(self, temp_dir):
+        raw = os.path.join(temp_dir, "raw", "src-svc-1")
+        os.makedirs(raw, exist_ok=True)
+        with open(os.path.join(raw, "cert.tf"), "w", encoding="utf-8") as f:
+            f.write(
+                'resource "google_compute_ssl_certificate" "c" {\n'
+                '  name    = "my-cert"\n'
+                '  project = "src-svc-1"\n'
+                '}\n'
+            )
+        with open(os.path.join(raw, "backend.tf"), "w", encoding="utf-8") as f:
+            f.write(
+                'resource "google_compute_backend_service" "b" {\n'
+                '  iap {\n'
+                '    oauth2_client_id = "xxx"\n'
+                '  }\n'
+                '  name    = "my-backend"\n'
+                '  project = "src-svc-1"\n'
+                '}\n'
+            )
+        return os.path.join(temp_dir, "raw")
+
+    def test_notes_are_persisted_per_project(self, temp_dir):
+        o = self._setup(temp_dir)
+        raw = self._write_raw(temp_dir)
+        active = os.path.join(temp_dir, "active")
+        o.customize_hcl(raw, active)
+
+        notes = load_customize_notes(active)
+        kinds = sorted(n["kind"] for n in notes)
+        assert kinds == ["iap_enabled", "ssl_certificate"]
+        # project は dst 側に置換済みの値で記録される
+        assert all(n["project"] == "dst-svc-1" for n in notes)
+        by_kind = {n["kind"]: n for n in notes}
+        assert by_kind["ssl_certificate"]["resource"] == "my-cert"
+        assert by_kind["iap_enabled"]["resource"] == "my-backend"
+
+    def test_notes_cleared_when_cause_disappears(self, temp_dir):
+        o = self._setup(temp_dir)
+        raw = self._write_raw(temp_dir)
+        active = os.path.join(temp_dir, "active")
+        o.customize_hcl(raw, active)
+        assert load_customize_notes(active)
+        # SSL 証明書と iap が raw から消えたら注記も消える（.tf と同じライフサイクル）
+        os.remove(os.path.join(raw, "src-svc-1", "cert.tf"))
+        os.remove(os.path.join(raw, "src-svc-1", "backend.tf"))
+        with open(os.path.join(raw, "src-svc-1", "bucket.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_storage_bucket" "b" {\n  name = "src-bucket-x"\n}\n')
+        o.customize_hcl(raw, active)
+        assert load_customize_notes(active) == []
+
+    def test_dry_run_does_not_write_notes(self, temp_dir):
+        o = self._setup(temp_dir)
+        o.dry_run = True
+        raw = self._write_raw(temp_dir)
+        active = os.path.join(temp_dir, "active")
+        o.customize_hcl(raw, active)
+        assert load_customize_notes(active) == []
+
+
+class TestCustomizeNoteRow:
+    def test_ssl_is_action_with_create_command(self):
+        kind, what, why, how = customize_note_row(
+            {"kind": "ssl_certificate", "resource": "my-cert", "project": "dst-p"})
+        assert kind == "要対応"
+        assert "my-cert" in what
+        assert "gcloud compute ssl-certificates create my-cert" in how
+        assert "--project=dst-p" in how
+
+    def test_iap_is_confirm_with_disable_command(self):
+        kind, what, why, how = customize_note_row(
+            {"kind": "iap_enabled", "resource": "my-backend", "project": "dst-p"})
+        assert kind == "確認"
+        assert "--iap=disabled" in how
+
+    def test_unknown_kind_is_not_swallowed(self):
+        kind, what, _why, _how = customize_note_row(
+            {"kind": "future_thing", "resource": "r", "project": "p"})
+        assert kind == "確認" and "future_thing" in what
+
+
+class TestDiffReportManualNotesSection:
+    def _report(self):
+        return {
+            "src_project": "s", "dst_project": "d", "cai_total": 0, "tf_total": 0,
+            "covered": 0, "missing": [], "unknown_types": [], "auto_handled": 0,
+            "action_total": 0,
+        }
+
+    def test_section_rendered_with_action_first(self):
+        md = format_diff_report([self._report()], manual_notes=[
+            {"kind": "iap_enabled", "resource": "b", "project": "d"},
+            {"kind": "ssl_certificate", "resource": "c", "project": "d"},
+        ])
+        assert "## customize による補正・スキップ（手動対応・確認）" in md
+        assert "customize 補正・スキップ: **2** 件" in md
+        # 要対応（SSL）が確認（IAP）より先
+        assert md.index("SSL 証明書 `c`") < md.index("backend service `b`")
+
+    def test_section_omitted_when_no_notes(self):
+        md = format_diff_report([self._report()], manual_notes=[])
+        assert "customize による補正・スキップ" not in md
+        md2 = format_diff_report([self._report()])
+        assert "customize による補正・スキップ" not in md2
