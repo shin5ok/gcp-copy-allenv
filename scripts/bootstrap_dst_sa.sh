@@ -12,6 +12,7 @@
 # 付与内容（各 dst プロジェクトごと）:
 #   - owner/editor SA を作成
 #   - roles/editor … VM/ディスク/GCS/BigQuery などの作成・編集を網羅
+#   - roles/resourcemanager.projectIamAdmin … Step 5.7 の IAM ロール複製に必須
 #   - 実行アカウントに roles/iam.serviceAccountTokenCreator（= SA 借用権限）
 #
 # 使い方:
@@ -30,7 +31,18 @@ IMPERSONATOR=""
 # 含まないため、Step 6（GCS/BQ 同期）用に storage.admin / bigquery.admin も付与する。
 # iam.roleAdmin は Terraform で google_project_iam_custom_role を作成するために必須
 # （editor には iam.roles.create が含まれない）。
-ROLES=("roles/editor" "roles/storage.admin" "roles/bigquery.admin" "roles/iam.roleAdmin")
+# resourcemanager.projectIamAdmin は Step 5.7（IAM ロール複製）で src SA の
+# ロールを dst SA へ付与するために必須（editor には setIamPolicy が含まれない）。
+# この SA が「任意の principal に任意のロールを配れる」= 実質 owner 相当の力を
+# 持つことになる点は認識した上で付与すること。IAM 複製が不要なら
+# config の steps.iam_sync.enabled=false にしてこのロールを外してよい。
+ROLES=(
+  "roles/editor"
+  "roles/storage.admin"
+  "roles/bigquery.admin"
+  "roles/iam.roleAdmin"
+  "roles/resourcemanager.projectIamAdmin"
+)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

@@ -37,7 +37,8 @@ make vmware-all # VMware → GCE フル処理
 - src プロジェクトへの書き込みは禁止（コード上も強制 = `is_src_read_only` ガード）。これは impersonate の有無に関わらず常時適用される最終防衛線。
 - SA impersonation は `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` 経由のみ（推奨だが必須ではない）。`config.yaml` の `*_impersonate_service_account` 未指定はエラーにせず、ローカル認証（gcloud のアクティブアカウント / ADC）にフォールバックする。
   - その認証主体が **src プロジェクトに書込相当の権限**（`_SRC_DANGEROUS_PERMS`）を持っていれば、`check_service_accounts` が事前に対象プロジェクトと付与権限を列挙して警告し、`[y/N]` で続行確認する。
-  - 非対話セッションは `COPY_ALL_ENV_AUTO_APPROVE=1` を明示指定したときのみ続行（デフォルトは abort）。
+  - 続行確認をスキップしたい場合は `--yes` / `-y`（`make plan YES=1` / `make run YES=1`）を**コマンドラインで明示指定**する。非対話セッションは `--yes` があるときのみ続行（デフォルトは abort）。
+  - **環境変数による自動承認は採用しない**（過去の `COPY_ALL_ENV_AUTO_APPROVE` は廃止）。export したまま忘れると「気付かないうちに毎回承認済み」になるため、承認は必ず起動コマンドに現れる形にする。同種の危険操作の承認フラグを増やすときもこの方針に従う（Makefile 側も `YES :=` で環境変数を無視し、コマンドライン指定のみ有効にしてある）。
 - `.env` / `*.key` / `*.json`（サービスアカウントキー）は絶対に編集・コミットしない
 
 ## 禁止事項
@@ -63,6 +64,8 @@ make vmware-all # VMware → GCE フル処理
 | 5 gce_restore (restore) | **VM** | flat (project, vm) units で並列 |
 | 5 secondary disks (create) | ディスク | attach は同一 VM 内で直列（409 回避） |
 | 5.5 power state (stop / suspend) | VM | `_finalize_vm_power_states` の pending を並列実行 |
+| 5.7 iam_sync (src policy 取得) | プロジェクト | src read-only |
+| 5.7 iam_sync (付与) | **dst プロジェクト** | プロジェクト内は直列（add-iam-policy-binding は read-modify-write で etag 競合する） |
 | 6 data_sync (GCS/BQ) | バケット / テーブル | 既存 |
 
 実装ルール:
@@ -111,6 +114,42 @@ make vmware-all # VMware → GCE フル処理
   - 追加の防御として `_sync_classic_firewall_rules` 冒頭で参照される dst network を一括 pre-flight チェックし、`_sync_fw_policy_associations` でも assoc 単位で existence チェックして、未存在なら skip + WARNING に倒す（cryptic な API エラー量産を防ぐ）。
   - Shared VPC ホスト化・サービスプロジェクト関連付け・networkUser 付与は別途 `bootstrap_shared_vpc.sh` の担当。VPC 自体は作らない点に注意。
 
+### IAM ロール複製（Step 5.7 / `step_iam_sync`）
+
+- **既定で有効**（`steps.iam_sync` キーが無くても走る）。`_STEP_ENABLED_DEFAULTS` + `step_enabled()` に集約。**`execute()` と `check_service_accounts()` の両方がこの関数を通ること** — 片方だけ既定が違うと「preflight は権限を要求しないのに本体は走る」不整合になる（network_firewall が実際にそうなっていた）。
+- 複製元は **src 各プロジェクトの project IAM ポリシーのみ**。バインディングは SA ではなくリソース側にあるので、バケット / データセット / SA 自身の IAM は対象外（対象にすると走査範囲が無限定になる）。
+- 変換は純粋関数に分離してテストする: `parse_user_managed_sa()` / `remap_sa_email()` / `remap_iam_role()` / `build_iam_replication_plan()`。
+- **別 ORG で ID が変わるものはスキップ + WARNING**（secure tag と同じパターン）:
+  - ORG カスタムロール `organizations/<id>/roles/<r>` … dst ORG に同 ID が無い
+  - project_mapping 外のプロジェクトのカスタムロール / SA
+  - 条件付きバインディング（条件式が src のリソース名を参照しうる）
+  - いずれも **dst の権限が src より緩くならない方向**にだけ倒すこと。
+- default compute (`<番号>-compute@developer`) / appspot / Google 管理 service agent (`service-<番号>@` / `gcp-sa-*`) は `parse_user_managed_sa()` の時点で弾く。dst に同等物が既定で存在するため複製してはいけない（warning も出さない。出すと大量ノイズになる）。
+- **`roles/owner` 等も src と同じなら複製する**（＝忠実再現が既定）。ただし `_IAM_HIGH_PRIVILEGE_ROLES` に載っているロールを付与したら `_warn_high_privilege_grants()` が実行ログ末尾に「何を・どこに・なぜ・取消コマンド」を WARNING でまとめて出す。高権限ロールを増やすときはこの集合に足す。
+- **`resourcemanager.projects.setIamPolicy` は `_DST_PERMS_BY_STEP` に入れない**。既存の dst SA（roles/editor 等）には無く、preflight で fail-fast にすると bootstrap 再実行まで移行全体が止まる。代わりに `_dst_can_set_iam_policy()` が dst プロジェクト単位で確認し、無ければ **スキップ + 手動 `add-iam-policy-binding` コマンド案内**（failed カウントしない）。判定不能（トークン不可・API 不通）は `None` を返して「あるものとして続行」。
+- 付与に必要なロールは `bootstrap_dst_sa.sh` の `ROLES` に `roles/resourcemanager.projectIamAdmin` として追加済み。src 側の read は `resourcemanager.projects.getIamPolicy`（`roles/viewer` に含まれる。絞ったカスタムロールを使う `bootstrap_cross_project.sh` には明示追加済み）。
+- 付与は **dst プロジェクト単位で並列 / プロジェクト内は直列**。`add-iam-policy-binding` は read-modify-write なので同一プロジェクトへ並列実行すると etag 競合（ABORTED）になる。
+- `--condition=None` を必ず付ける（既存ポリシーに条件付きバインディングがあると gcloud が対話プロンプトを出してハングする）。
+
+### DIFF.md の要対応 / 参考 分類（Step 99）
+
+- DIFF.md は放置すると 50 件超になり、**実際に手を動かす必要があるものが埋もれる**。`classify_missing_asset()` が欠落 1 件を `action` / `reference` に分け、`format_diff_report()` が先頭に **WHAT / WHY / HOW テーブル（action のみ）** → 参考テーブル → プロジェクト別詳細の順で出す。
+- **action は「dst の動作に必要で放置すると実害が出るもの」だけに絞る**。reference には優先度（`_DIFF_PRIORITY_LABELS`: 1=確認推奨〔別ステップが自動対応済み、結果確認のみ〕 / 2=条件付き〔src にカスタム・取り置きの意図がある場合のみ〕 / 3=対応不要）を付け、参考テーブルと詳細を**優先度昇順でソート**して出す。
+- reference に落とす条件（＝実害が無いと言い切れるものだけ）:
+  - user-managed SA … `iam_sync` 有効なら Step 5.7 が dst に作成 + ロール複製する（**無効なら action**）→ P1
+  - default compute / appspot / Google 管理 service agent … dst に dst 自身の番号を持つ同等物が既定で存在 → P3
+  - `_MANAGED_LOG_RESOURCE_NAMES`（`_Default` / `_Required`）… GCP 自動生成。create は「already exists」で失敗する → P2
+  - `_MIGRATION_TOOL_ROLE_IDS`（`migrationSrcReader`）… 移行ツール自身が src に作った借用 SA 用ロール → P3
+  - src の project IAM ポリシーで**誰にも付与されていない**カスタムロール（`bound_custom_role_ids()` で判定）→ P2
+  - Address（CAI の `state` と `additionalAttributes.address` を `parse_cai_resources()` が拾って判定）:
+    - `nat-auto-ip-*` … Cloud NAT の自動割当。手動作成は不可能かつ無意味 → P3
+    - `state=RESERVED` … 未使用の取り置き。dst に無くても壊れない → P2
+    - `state=IN_USE` の**内部** IP（RFC1918 判定）+ `gce_restore` 有効 … Step 5 が同じ IP を `mig-<vm>-<ip>` 名で dst に静的予約するため機能等価 → P1
+    - `state` 不明 / 使用中の**外部** IP（nat-auto 以外）は action のまま
+- **判定材料が無い場合は必ず action に倒す**（`bound_custom_roles=None`、Address の `state` 欠落等）。見落とすより過剰報告を選ぶ。
+- カスタムロールの付与判定は `step_iam_sync` が取った src ポリシー（`self._src_iam_policies`）の再利用。iam_sync 無効時は取得されず `None` → 全カスタムロールが action になる（意図どおり）。
+- 分類は純粋関数なのでテストは直接叩く（`TestClassifyMissingAsset` / `TestBoundCustomRoleIds`）。**新しい「実は対応不要」パターンを見つけたら reference 条件に足す**。逆に判断が付かないものを reference に入れてはいけない。
+
 ### VPC Service Controls の quota project（Step 7）
 
 - `gcloud access-context-manager perimeters describe/update` は **org/policy スコープのコマンドで `--project` を持たない**。quota/billing project を明示しないと gcloud が **ローカル `gcloud config` の `core/project`（移行と無関係なプロジェクト）** を quota に使い、そのプロジェクトで API 無効のまま `accesscontextmanager.googleapis.com ... SERVICE_DISABLED` / `(y/N)?` プロンプトで失敗する（regression）。
@@ -132,6 +171,8 @@ make vmware-all # VMware → GCE フル処理
   - `Co-Authored-By: Claude ...` 行を付けない
   - `🤖 Generated with Claude Code` などの行も付けない
   - 勝手にコミットやプッシュしない
+  - GitHub Flow に従う
+  - branch は feat/branchname ではなく branchname で作る
 
 ## ツール
 以下のツールを積極的に使う

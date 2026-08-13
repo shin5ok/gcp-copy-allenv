@@ -14,6 +14,7 @@ import argparse
 import sys
 import os
 import re
+import ipaddress
 import yaml
 import logging
 import subprocess
@@ -89,6 +90,8 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud access-context-manager perimeters describe",
     "gcloud access-context-manager perimeters update",
     "gcloud iam service-accounts create",
+    "gcloud projects get-iam-policy",
+    "gcloud projects add-iam-policy-binding",
     "gcloud services enable",
     "bq ls",
     "bq show",
@@ -404,8 +407,11 @@ def parse_cai_resources(path: str) -> List[Dict[str, str]]:
 
     各レコードは `---` で区切られ、`assetType:` `name:` 等のキーを 1 行に持つ。
     本パーサは PyYAML を使わず簡易行スキャンで対応する（CAI 出力は flat なため十分）。
+    `state`（RESERVED / IN_USE 等）と additionalAttributes 内の `address:`（IP 値）は
+    Address の要対応 / 参考分類に使うため拾う。
     Returns:
-        [{asset_type, name, short_name, location, project, display_name}, ...]
+        [{asset_type, name, short_name, location, project, display_name,
+          state?, ip_address?}, ...]
     """
     records: List[Dict[str, str]] = []
     if not os.path.isfile(path):
@@ -428,7 +434,14 @@ def parse_cai_resources(path: str) -> List[Dict[str, str]]:
             if s.strip() == "---":
                 _flush()
                 continue
-            if not s or s.startswith(" ") or s.startswith("\t") or s.startswith("-"):
+            if not s:
+                continue
+            if s.startswith(" ") or s.startswith("\t"):
+                ss = s.strip()
+                if ss.startswith("address:") and "ip_address" not in current:
+                    current["ip_address"] = ss.split(":", 1)[1].strip()
+                continue
+            if s.startswith("-"):
                 continue
             if ":" not in s:
                 continue
@@ -445,6 +458,8 @@ def parse_cai_resources(path: str) -> List[Dict[str, str]]:
                 current["project"] = v
             elif k == "displayName":
                 current["display_name"] = v
+            elif k == "state":
+                current["state"] = v
     _flush()
     return records
 
@@ -626,9 +641,184 @@ def gcloud_recreate_command(
     ]
 
 
+# ---------------------------------------------------------------------------
+# DIFF.md の「要対応 (action)」/「参考 (reference)」分類
+# ---------------------------------------------------------------------------
+# CAI ↔ TF の欠落は放置すると数十件になり、本当に手を動かす必要があるものが埋もれる。
+# 「dst に無いと実害があるか」で二分し、先頭の WHAT / WHY / HOW テーブルには action
+# だけを載せる。reference も消さずに残す（後から判断を追える形で記録する）。
+#
+# GCP が全プロジェクトに自動生成する logging リソース。dst にも既に存在し create 不可。
+_MANAGED_LOG_RESOURCE_NAMES = frozenset({"_Default", "_Required"})
+# 移行オーケストレータ自身が bootstrap_cross_project.sh で src に作る借用 SA 用ロール。
+# 移行後の dst 運用には不要なので複製しない。
+_MIGRATION_TOOL_ROLE_IDS = frozenset({"migrationSrcReader"})
+
+# DIFF.md「参考」の優先度。テーブル / 詳細はこの昇順でソートして出力する。
+# 1: 別ステップが自動対応済み → dst 側で結果を一度確認すると確実
+# 2: src 側にカスタム / 取り置きの意図がある場合のみ手動対応
+# 3: どの環境でも何もしなくてよい
+_DIFF_PRIORITY_LABELS = {1: "確認推奨", 2: "条件付き", 3: "対応不要"}
+
+
+def _is_private_ip(value: Optional[str]) -> bool:
+    """RFC1918 等のプライベート IP なら True。パース不能は False（安全側 = 判定不能扱い）。"""
+    try:
+        return ipaddress.ip_address(value or "").is_private
+    except ValueError:
+        return False
+
+
+def bound_custom_role_ids(src_policies: Dict[str, Dict[str, Any]]) -> set:
+    """src の project IAM ポリシーで実際に誰かへ付与されているカスタムロール ID の集合。
+
+    `projects/<p>/roles/<r>` / `organizations/<id>/roles/<r>` 形式のみ返す。
+    定義だけあってどこにも付与されていないカスタムロールを DIFF.md の
+    「参考」に落とすための判定材料。
+    """
+    out: set = set()
+    for policy in (src_policies or {}).values():
+        for b in ((policy or {}).get('bindings') or []):
+            if not isinstance(b, dict):
+                continue
+            role = b.get('role') or ''
+            if role.startswith("projects/") or role.startswith("organizations/"):
+                out.add(role)
+    return out
+
+
+def classify_missing_asset(
+    item: Dict[str, Any],
+    iam_sync_enabled: bool = True,
+    bound_custom_roles: Optional[set] = None,
+    gce_restore_enabled: bool = True,
+) -> Dict[str, Any]:
+    """欠落 1 件を action / reference に分類し、WHAT 用の種別と WHY / HOW を返す。
+
+    Args:
+        item: analyze_cai_tf_diff が組み立てる missing エントリ
+        iam_sync_enabled: Step 5.7 iam_sync が有効か（SA を dst に作る担当）
+        bound_custom_roles: src の project IAM ポリシーで付与済みのカスタムロール ID。
+                            None は「判定材料が無い」= 安全側で action に倒す。
+        gce_restore_enabled: Step 5 gce_restore が有効か（VM 内部 IP を dst に予約する担当）
+
+    Returns: `{'level': 'action'|'reference', 'kind': str, 'why': str, 'how': str,
+               'priority': int}`
+             priority は reference のみ意味を持つ（_DIFF_PRIORITY_LABELS。action は 0）。
+
+    判定できないものは必ず action 側に倒す（見落とすより過剰報告を選ぶ）。
+    reference に落とすのは「実害が無いと言い切れる」ものだけ。
+    """
+    atype = item.get("asset_type", "")
+    short = item.get("short_name", "")
+    full = item.get("full_name", "")
+    kind = atype.split("/", 1)[1] if "/" in atype else atype
+
+    def ref(why: str, how: str = "対応不要。", priority: int = 3) -> Dict[str, Any]:
+        return {"level": "reference", "kind": kind, "why": why, "how": how,
+                "priority": priority}
+
+    def act(why: str, how: str) -> Dict[str, Any]:
+        return {"level": "action", "kind": kind, "why": why, "how": how, "priority": 0}
+
+    if atype == "iam.googleapis.com/ServiceAccount":
+        if not parse_user_managed_sa(short):
+            return ref(
+                "default compute / appspot / Google 管理 service agent。dst には dst 自身の"
+                "プロジェクト番号を持つ同等 SA が既定で存在する（同名で作っても別物になる）。",
+                priority=3)
+        if iam_sync_enabled:
+            return ref(
+                "Step 5.7 iam_sync が dst に同名 SA を冪等作成し、src の project IAM ロールも"
+                "あわせて複製する。",
+                "dst.log の `[SA] ... を新規作成しました` を確認。無ければ `make run` を再実行。",
+                priority=1)
+        return act(
+            "steps.iam_sync.enabled=false のため、この SA を dst に作るステップが存在しない。",
+            "iam_sync を有効化して `make run` するか、下記の create コマンドを手動実行。")
+
+    if atype == "iam.googleapis.com/Role":
+        role_id = full.rsplit("/", 1)[-1] if full else short
+        if role_id in _MIGRATION_TOOL_ROLE_IDS:
+            return ref(
+                "移行ツール自身が bootstrap_cross_project.sh で src に作った借用 SA 用ロール。"
+                "移行後の dst 運用には不要。",
+                priority=3)
+        role_name = full.split("//iam.googleapis.com/", 1)[-1] if full else ""
+        if bound_custom_roles is not None and role_name and role_name not in bound_custom_roles:
+            return ref(
+                "src の project IAM ポリシーで誰にも付与されていない（定義だけが残っている）。"
+                "複製しなくても src と dst で実効権限は変わらない。",
+                "バケット / データセット等リソース単位で付与している場合のみ手動複製。",
+                priority=2)
+        return act(
+            "src で SA に付与されているカスタムロール。dst に定義が無いと Step 5.7 が付与を"
+            "スキップし、dst SA の権限が src より不足する。",
+            "`gcloud iam roles describe <ID> --project=<src> --format=json` で定義を取得 → "
+            "下記の create コマンドで dst に作成 → `make run` 再実行（Step 5.7 が付与）。")
+
+    if atype in ("logging.googleapis.com/LogBucket", "logging.googleapis.com/LogSink"):
+        if short in _MANAGED_LOG_RESOURCE_NAMES:
+            return ref(
+                "GCP が全プロジェクトに自動生成する既定リソース。dst にも既に存在し、create は"
+                "「already exists」で失敗する。",
+                "src で保持期間 / フィルタをカスタムしている場合のみ dst 側を "
+                "`gcloud logging buckets update` / `sinks update` で合わせる。",
+                priority=2)
+        return act(
+            "ユーザー定義のログルーティング設定。dst に無いとログの転送先 / 保持期間が src と"
+            "変わる。",
+            "src で `describe` した内容で下記の create コマンドを埋めて実行。")
+
+    if atype == "compute.googleapis.com/Address":
+        # CAI の state（RESERVED / IN_USE）と IP 値から「実害が無いと言い切れる」ものだけ
+        # reference に落とす。state 不明 / 使用中の外部 IP は従来どおり action。
+        state = (item.get("state") or "").upper()
+        if short.startswith("nat-auto-ip-"):
+            return ref(
+                "Cloud NAT が自動割当した外部 IP。dst で NAT を構成すれば自動採番される"
+                "（system 生成名のため同名の手動作成は不可能かつ無意味）。",
+                priority=3)
+        if state == "RESERVED":
+            return ref(
+                "どのリソースにも使われていない予約（取り置き）。dst に無くても何も壊れない。",
+                "IP の取り置きを dst でも維持したい場合のみ下記 create コマンドで予約"
+                "（内部 IP は同じ値で予約可。外部 IP は値が変わる）。",
+                priority=2)
+        if state == "IN_USE" and gce_restore_enabled and _is_private_ip(item.get("ip_address")):
+            return ref(
+                "VM にアタッチ中の内部 IP。Step 5 gce_restore が同じ IP 値を dst に "
+                "`mig-<vm>-<ip>` 名で静的予約してアタッチする（予約リソース名が src と"
+                "異なるだけで機能は等価）。",
+                "dst.log の `内部IP予約 mig-...` / `private-network-ip=` を確認。"
+                "VM 以外（内部 LB 等）が使用している IP の場合のみ下記 create コマンドで"
+                "手動予約。",
+                priority=1)
+        return act(
+            "使用中 (IN_USE) だが自動複製の担当が無い、または状態を判定できない予約 IP。"
+            "dst に同等の予約が無いと、参照しているリソースの静的 IP 前提が崩れる。",
+            "src で `gcloud compute addresses describe <名前> --project=<src> "
+            "--format='value(address,status,users)'` で用途を確認 → 必要なら下記の "
+            "create コマンドで dst に予約（**IP 値は変わる**ので参照側の設定も更新）。")
+
+    if item.get("coverage_step") == "<unknown>":
+        return act(
+            "_ASSET_COVERAGE に未登録の assetType。どのステップも複製を担当しておらず、複製漏れ"
+            "の可能性がある。",
+            "dst で必要か判断し、必要なら手動作成。恒久対応として scripts/sync_env.py の "
+            "_ASSET_COVERAGE に担当ステップ（不要なら None）を追記。")
+
+    return act(
+        item.get("reason") or "自動複製されていない。",
+        "下記詳細の推奨コマンドを確認し、必要なら dst で手動作成。")
+
+
 def analyze_cai_tf_diff(
     cai_path: str, tf_dirs: List[str],
     src_project: str, dst_project: str,
+    iam_sync_enabled: bool = True,
+    bound_custom_roles: Optional[set] = None,
+    gce_restore_enabled: bool = True,
 ) -> Dict[str, Any]:
     """CAI と terraform 出力を突合し、欠落リソースとリカバリコマンドを返す。
 
@@ -638,6 +828,8 @@ def analyze_cai_tf_diff(
                    先頭から順に資料を統合し、いずれかに resource が見つかれば「カバー済み」。
         src_project: src プロジェクト ID（ログ表示用）
         dst_project: dst プロジェクト ID（生成コマンドに埋め込む）
+        iam_sync_enabled / bound_custom_roles / gce_restore_enabled:
+                   classify_missing_asset に渡す判定材料
 
     Returns:
         {
@@ -647,7 +839,9 @@ def analyze_cai_tf_diff(
             'tf_total':    int,
             'covered':     int,
             'missing':     [ {asset_type, short_name, full_name, location,
-                              tf_resource_type, coverage_step, reason, commands}, ...],
+                              tf_resource_type, coverage_step, reason, commands,
+                              level, kind, why, how}, ...],
+            'action_total': int,   # level == 'action' の件数
             'unknown_types': [str, ...],
         }
     """
@@ -700,16 +894,24 @@ def analyze_cai_tf_diff(
             auto_handled += 1
             continue
 
-        missing.append({
+        entry = {
             "asset_type": atype,
             "short_name": short,
             "full_name": full,
             "location": loc,
+            "state": r.get("state", ""),
+            "ip_address": r.get("ip_address", ""),
             "tf_resource_type": "/".join(tf_types) if tf_types else None,
             "coverage_step": coverage_step,
             "reason": reason,
             "commands": gcloud_recreate_command(atype, short, loc, dst_project, full),
-        })
+        }
+        entry.update(classify_missing_asset(
+            entry, iam_sync_enabled=iam_sync_enabled,
+            bound_custom_roles=bound_custom_roles,
+            gce_restore_enabled=gce_restore_enabled,
+        ))
+        missing.append(entry)
 
     return {
         "src_project": src_project,
@@ -719,43 +921,138 @@ def analyze_cai_tf_diff(
         "covered": covered,
         "auto_handled": auto_handled,
         "missing": missing,
+        "action_total": sum(1 for m in missing if m["level"] == "action"),
         "unknown_types": sorted(unknown_types),
     }
+
+
+def _md_cell(text: str) -> str:
+    """Markdown テーブルのセルとして安全な 1 行文字列にする。"""
+    return (text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _diff_summary_rows(
+    reports: List[Dict[str, Any]], level: str,
+) -> List[Tuple[int, str, str, str]]:
+    """missing を (dst, kind, why) でまとめ、(priority, WHAT, WHY, HOW) の行に畳む。
+
+    同じ理由の欠落が 1 プロジェクトに何十件も出る（Address 等）ため、件数と代表名
+    だけをテーブルに載せ、個別の gcloud コマンドは詳細セクションへ譲る。
+    reference は priority 昇順（同順位は検出順を維持）でソートして返す。
+    """
+    groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    order: List[Tuple[str, str, str]] = []
+    for r in reports:
+        dst = r["dst_project"] or "<未設定>"
+        for m in r["missing"]:
+            if m["level"] != level:
+                continue
+            key = (dst, m["kind"], m["why"])
+            if key not in groups:
+                groups[key] = {"names": [], "how": m["how"],
+                               "priority": m.get("priority", 0)}
+                order.append(key)
+            groups[key]["names"].append(m["short_name"])
+
+    if level == "reference":
+        order.sort(key=lambda k: groups[k]["priority"])
+
+    rows: List[Tuple[int, str, str, str]] = []
+    for key in order:
+        dst, kind, why = key
+        names = groups[key]["names"]
+        shown = ", ".join(f"`{n}`" for n in names[:3])
+        if len(names) > 3:
+            shown += f" 他 {len(names) - 3} 件"
+        what = f"`{dst}` の **{kind}** {len(names)} 件<br>{shown}"
+        rows.append((groups[key]["priority"], _md_cell(what), _md_cell(why),
+                     _md_cell(groups[key]["how"])))
+    return rows
 
 
 def format_diff_report(reports: List[Dict[str, Any]]) -> str:
     """analyze_cai_tf_diff の結果群を Markdown レポートに整形する。
 
+    構成は「先頭に要対応の WHAT / WHY / HOW テーブル → 参考（対応不要と判定した
+    もの）→ プロジェクト別の詳細」。実際に手を動かす必要があるものが 50 件超の
+    一覧に埋もれないようにするのが目的。
+
     DIFF.md と stdout の両方で同じテキストを使い、ログには `\n`.split() で行ごと書く。
     """
+    action_rows = _diff_summary_rows(reports, "action")
+    ref_rows = _diff_summary_rows(reports, "reference")
+    action_total = sum(r.get("action_total", 0) for r in reports)
+    ref_total = sum(
+        len(r["missing"]) - r.get("action_total", 0) for r in reports
+    )
+
     lines: List[str] = []
     lines.append("# CAI ↔ Terraform bulk-export 差分レポート")
     lines.append("")
     lines.append("Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、")
-    lines.append("bulk-export / terraform で **自動再現されず、手動で dst 作成・調整が必要なもの** だけを")
-    lines.append("プロジェクトごとに列挙し、dst 側に再現するための gcloud コマンドを併記します。")
-    lines.append("（read 操作の describe / list は省き、作成系コマンドのみ掲載）")
+    lines.append("bulk-export / terraform で自動再現されなかったものを、")
+    lines.append("**要対応**（dst の動作に必要で、手動対応しないと実害が出るもの）と")
+    lines.append("**参考**（実害が無いと判定したもの。優先度順）に分けて記録します。")
     lines.append("")
-    lines.append("掲載対象（要手動対応）:")
-    lines.append("- 「未登録」: `_ASSET_COVERAGE` に無い assetType（複製漏れの可能性）。")
-    lines.append("- 「bulk-export が出力しなかった」: terraform_apply 担当のはずが TF 出力に無い。")
+    lines.append(
+        f"- 要対応: **{action_total}** 件 / 参考: **{ref_total}** 件"
+    )
     lines.append("")
-    lines.append("非掲載（自動処理 / 対象外。件数のみ集計）:")
+    lines.append("## 要対応")
+    lines.append("")
+    if not action_rows:
+        lines.append("要対応の欠落はありません。 ✓")
+        lines.append("")
+    else:
+        lines.append("| WHAT（何が dst に無いか） | WHY（なぜ対応が必要か） | HOW（どう対応するか） |")
+        lines.append("| --- | --- | --- |")
+        for _p, what, why, how in action_rows:
+            lines.append(f"| {what} | {why} | {how} |")
+        lines.append("")
+        lines.append("個別リソースの gcloud コマンドは「プロジェクト別 詳細」を参照してください。")
+        lines.append("")
+
+    lines.append("## 参考（実害なしと判定したもの / 優先度順）")
+    lines.append("")
+    lines.append("記録として残しますが、放置して問題ありません。優先度の意味:")
+    lines.append("")
+    lines.append("- **1: 確認推奨** … 別ステップが自動対応済み。dst 側で結果を一度確認すると確実")
+    lines.append("- **2: 条件付き** … src 側にカスタムや取り置きの意図がある場合のみ手動対応")
+    lines.append("- **3: 対応不要** … どの環境でも何もしなくてよい")
+    lines.append("")
+    if not ref_rows:
+        lines.append("該当なし。")
+        lines.append("")
+    else:
+        lines.append("| 優先度 | WHAT | 実害なしと判定した理由 | 補足 |")
+        lines.append("| --- | --- | --- | --- |")
+        for p, what, why, how in ref_rows:
+            label = _DIFF_PRIORITY_LABELS.get(p, "?")
+            lines.append(f"| {p}: {label} | {what} | {why} | {how} |")
+        lines.append("")
+
+    lines.append("なお、以下は差分としても数えていません（件数のみ集計）:")
+    lines.append("")
     lines.append("- 専用ステップ（Step 4.5 network_firewall / Step 5 gce_restore / Step 6 data_sync）が複製。")
     lines.append("- `_ASSET_COVERAGE` で None 指定の意図的対象外（実害なし）。")
+    lines.append("")
+    lines.append("## プロジェクト別 詳細")
+    lines.append("")
+    lines.append("（read 操作の describe / list は省き、作成系コマンドのみ掲載）")
     lines.append("")
 
     grand_total = 0
     for r in reports:
         sp = r["src_project"]
         dp = r["dst_project"] or "<未設定>"
-        lines.append(f"## プロジェクト: `{sp}` → `{dp}`")
+        lines.append(f"### プロジェクト: `{sp}` → `{dp}`")
         lines.append("")
         lines.append(
             f"- CAI 検出リソース: **{r['cai_total']}** 件"
             f" / TF 出力リソース: **{r['tf_total']}** 件"
             f" / 一致: **{r['covered']}** 件"
-            f" / 要手動対応: **{len(r['missing'])}** 件"
+            f" / 要対応: **{r.get('action_total', 0)}** 件"
+            f" / 参考: **{len(r['missing']) - r.get('action_total', 0)}** 件"
             f" / 自動処理・対象外: **{r.get('auto_handled', 0)}** 件"
         )
         if r["unknown_types"]:
@@ -764,39 +1061,66 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
             )
         lines.append("")
         if not r["missing"]:
-            lines.append("要手動対応の欠落なし。 ✓")
+            lines.append("欠落なし。 ✓")
             lines.append("")
             continue
 
-        # 種別ごとにグルーピングして読みやすくする
+        # 種別ごとにグルーピングし、要対応を先に並べる
         by_type: Dict[str, List[Dict[str, Any]]] = {}
         for m in r["missing"]:
             by_type.setdefault(m["asset_type"], []).append(m)
-        for atype in sorted(by_type.keys()):
-            items = by_type[atype]
-            lines.append(f"### `{atype}` （{len(items)} 件）")
+        for atype in sorted(
+            by_type, key=lambda t: (
+                all(x["level"] != "action" for x in by_type[t]), t,
+            )
+        ):
+            items = sorted(by_type[atype], key=lambda x: x["level"] != "action")
+            n_act = sum(1 for x in items if x["level"] == "action")
+            lines.append(
+                f"#### `{atype}` （{len(items)} 件 / うち要対応 {n_act} 件）"
+            )
             lines.append("")
+            # 同じ WHY / HOW を項目ごとに繰り返すと読めなくなるため、判定単位で
+            # 見出しにまとめ、項目にはリソース固有の情報だけを書く。
+            sub: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
             for m in items:
-                grand_total += 1
-                lines.append(
-                    f"#### `{m['short_name']}` "
-                    f"(location=`{m['location'] or 'global'}`)"
-                )
+                sub.setdefault((m["level"], m["why"], m["how"]), []).append(m)
+            for (level, why, how), group in sorted(
+                sub.items(),
+                key=lambda kv: (kv[0][0] != "action",
+                                kv[1][0].get("priority", 0)),
+            ):
+                if level == "action":
+                    badge = "要対応"
+                else:
+                    p = group[0].get("priority", 0)
+                    badge = f"参考 / 優先度 {p}: {_DIFF_PRIORITY_LABELS.get(p, '?')}"
+                lines.append(f"##### [{badge}] {len(group)} 件")
                 lines.append("")
-                lines.append(f"- full name: `{m['full_name']}`")
-                cov = m.get("coverage_step")
+                lines.append(f"- WHY: {why}")
+                lines.append(f"- HOW: {how}")
+                cov = group[0].get("coverage_step")
                 cov_disp = cov if cov is not None else "意図的対象外 (None)"
                 lines.append(f"- 担当ステップ: `{cov_disp}`")
-                lines.append(f"- 期待 TF 型: `{m['tf_resource_type'] or 'なし'}`")
-                lines.append(f"- 判定理由: {m['reason']}")
-                lines.append("- 推奨コマンド:")
-                lines.append("  ```bash")
-                for c in m["commands"]:
-                    lines.append(f"  {c}")
-                lines.append("  ```")
+                lines.append(f"- 期待 TF 型: `{group[0]['tf_resource_type'] or 'なし'}`")
+                lines.append(f"- 検出理由: {group[0]['reason']}")
                 lines.append("")
+                for m in group:
+                    grand_total += 1
+                    lines.append(
+                        f"`{m['short_name']}` (location=`{m['location'] or 'global'}`)"
+                        f" — `{m['full_name']}`"
+                    )
+                    lines.append("")
+                    lines.append("```bash")
+                    for c in m["commands"]:
+                        lines.append(c)
+                    lines.append("```")
+                    lines.append("")
     lines.append("---")
-    lines.append(f"合計（要手動対応）: **{grand_total}** 件")
+    lines.append(
+        f"合計: 要対応 **{action_total}** 件 / 参考 **{grand_total - action_total}** 件"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -815,6 +1139,10 @@ _SRC_PERMS_BY_STEP = {
     "network_firewall": ("compute.firewalls.list", "compute.networkFirewallPolicies.list"),
     "gce_restore":      ("compute.instances.list", "compute.snapshots.list"),
     "data_sync":        ("storage.buckets.list", "bigquery.datasets.get"),
+    # IAM ロール複製は src の project IAM ポリシーを読むだけ（read-only）。
+    # roles/viewer に含まれるが、bootstrap_cross_project.sh の絞ったカスタムロール
+    # (migrationSrcReader) を使う場合は明示付与が要るため preflight で検査する。
+    "iam_sync":         ("resourcemanager.projects.getIamPolicy",),
 }
 _DST_BASELINE_PERMS = ("resourcemanager.projects.get",)
 _DST_PERMS_BY_STEP = {
@@ -825,6 +1153,12 @@ _DST_PERMS_BY_STEP = {
                          "compute.instances.attachDisk", "compute.instances.detachDisk"),
     "data_sync":        ("storage.objects.create",
                          "bigquery.datasets.create", "bigquery.tables.create"),
+    # resourcemanager.projects.setIamPolicy は **あえてここに入れない**。
+    # 既存環境の dst SA (roles/editor 等) には無く、fail-fast にすると
+    # bootstrap_dst_sa.sh を再実行するまで移行全体が止まってしまう。
+    # 権限の有無は step_iam_sync が dst プロジェクト単位で確認し、
+    # 無ければ「スキップ + 手動コマンド案内」に倒す。
+    "iam_sync":         ("iam.serviceAccounts.create",),
 }
 
 # `*_impersonate_service_account` 未指定でローカル認証 (gcloud のアクティブ
@@ -897,6 +1231,215 @@ def is_known_mock_command(cmd: str) -> bool:
     tokens = [t for t in stripped.split() if not t.startswith("--")]
     normalized = " ".join(tokens)
     return any(normalized.startswith(p) for p in _MOCK_KNOWN_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# ステップの enabled 既定値
+# ---------------------------------------------------------------------------
+# config.yaml に該当キーが無いときの enabled。既存 config に手を入れなくても
+# 動いてほしいステップだけ True にする。execute() と check_service_accounts()
+# の両方がこの関数を経由すること（片方だけだと「preflight は権限を要求しないのに
+# 本体は走る」といった不整合になる）。
+_STEP_ENABLED_DEFAULTS: Dict[str, bool] = {
+    "network_firewall": True,
+    "iam_sync": True,
+}
+
+
+def step_enabled(steps: Dict[str, Any], name: str) -> bool:
+    """steps.<name>.enabled を既定値込みで解決する。"""
+    s = steps.get(name, {})
+    default = _STEP_ENABLED_DEFAULTS.get(name, False)
+    if not isinstance(s, dict):
+        return default
+    return bool(s.get('enabled', default))
+
+
+# ---------------------------------------------------------------------------
+# IAM ロール複製 (Step 5.7) の純粋関数
+# ---------------------------------------------------------------------------
+# user-managed SA の email 形式: <account-id>@<project-id>.iam.gserviceaccount.com
+# default compute (<番号>-compute@developer...) / appspot / Google 管理の service
+# agent (service-<番号>@gcp-sa-*) はこの形にマッチしないため自然に対象外になる。
+# これらは dst 側に同等の SA が既定で存在し、権限も Google 側が管理するため
+# 複製してはいけない。
+_USER_MANAGED_SA_RE = re.compile(
+    r'^([a-zA-Z0-9-]+)@([a-z][-a-z0-9]{4,28}[a-z0-9])\.iam\.gserviceaccount\.com$'
+)
+# Google 管理の service agent も `.iam.gserviceaccount.com` を使う。
+#   service-<プロジェクト番号>@gcp-sa-<api>.iam.gserviceaccount.com
+#   service-org-<ORG番号>@<...>.iam.gserviceaccount.com
+# これらは Google 側が権限を管理し dst にも自動生成されるため複製対象外。
+# 「project_mapping に無い」warning を量産しないよう、email 形式の時点で弾く。
+_GOOGLE_MANAGED_SA_ACCOUNT_RE = re.compile(r'^service-(org-)?\d+$')
+_PROJECT_ROLE_RE = re.compile(r'^projects/([^/]+)/roles/(.+)$')
+_ORG_ROLE_RE = re.compile(r'^organizations/([^/]+)/roles/(.+)$')
+
+# 複製自体は行うが、実行後に必ず一覧で WARNING を出す超高権限ロール。
+# いずれも「付与された SA が自分でさらに権限を配れる」= 権限昇格の起点になるため、
+# 移行後に人間がレビューできるようログの最後にまとめて出す。
+_IAM_HIGH_PRIVILEGE_ROLES = frozenset({
+    "roles/owner",
+    "roles/resourcemanager.organizationAdmin",
+    "roles/resourcemanager.projectIamAdmin",
+    "roles/iam.securityAdmin",
+})
+
+
+def parse_user_managed_sa(email: str) -> Optional[Tuple[str, str]]:
+    """user-managed SA の email を (account_id, project_id) に分解する。該当外は None。"""
+    m = _USER_MANAGED_SA_RE.match((email or "").strip())
+    if not m:
+        return None
+    account_id, project = m.group(1), m.group(2)
+    if project.startswith("gcp-sa-") or _GOOGLE_MANAGED_SA_ACCOUNT_RE.match(account_id):
+        return None
+    return account_id, project
+
+
+def remap_sa_email(email: str, proj_map: Dict[str, str]) -> Optional[str]:
+    """src SA email を dst プロジェクトの同名 SA email に読み替える。対象外は None。"""
+    parsed = parse_user_managed_sa(email)
+    if not parsed:
+        return None
+    account_id, proj = parsed
+    if proj not in proj_map:
+        return None
+    return f"{account_id}@{proj_map[proj]}.iam.gserviceaccount.com"
+
+
+def remap_iam_role(role: str, proj_map: Dict[str, str]) -> Tuple[Optional[str], str]:
+    """IAM ロール ID を dst 用に読み替える。`(dst_role, skip_reason)` を返す。
+
+    - 定義済みロール `roles/<name>` … ORG に依存しないためそのまま複製する。
+    - プロジェクトカスタムロール `projects/<p>/roles/<r>` … p が project_mapping に
+      あれば dst プロジェクトへ読み替える（ロール定義自体は Step 4 の
+      google_project_iam_custom_role が複製済みの想定）。無ければスキップ。
+    - ORG カスタムロール `organizations/<id>/roles/<r>` … 別 ORG には同じ ID が
+      存在しないためスキップ（secure tag と同じ「別 ORG では ID が変わる」問題）。
+    """
+    role = (role or "").strip()
+    if not role:
+        return None, "ロールが空です"
+    if role.startswith("roles/"):
+        return role, ""
+    m = _PROJECT_ROLE_RE.match(role)
+    if m:
+        src_proj, role_id = m.group(1), m.group(2)
+        if src_proj in proj_map:
+            return f"projects/{proj_map[src_proj]}/roles/{role_id}", ""
+        return None, (
+            f"カスタムロールの定義元プロジェクト '{src_proj}' が project_mapping に無い"
+        )
+    if _ORG_ROLE_RE.match(role):
+        return None, "ORG カスタムロールは dst ORG に同じ ID が存在しない"
+    return None, "解釈できないロール形式"
+
+
+def build_iam_replication_plan(
+    src_policies: Dict[str, Dict[str, Any]],
+    proj_map: Dict[str, str],
+    exclude_sa_emails: Optional[Any] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """src の project IAM ポリシー群から、dst へ付与すべきバインディングを組み立てる。
+
+    Args:
+        src_policies: {src_project_id: `gcloud projects get-iam-policy --format=json` の dict}
+        proj_map: src project id → dst project id
+        exclude_sa_emails: 複製対象から外す src SA email（移行用の借用 SA など）
+
+    Returns:
+        (grants, warnings)
+        grants: `{dst_project, dst_member, dst_role, src_project, src_member,
+                  src_role, high_privilege}` の list。
+                (dst_project, dst_member, dst_role) でユニーク化し、決定的に並べる。
+        warnings: 複製しなかったバインディングの理由（呼び出し側が WARNING 出力する）
+
+    スキップ方針（いずれも「dst の権限が src より緩くならない」側に倒す）:
+    - 条件付きバインディング … 条件式が src のリソース名を参照しうるため複製しない
+    - 読み替え不能なロール … remap_iam_role の理由を添えてスキップ
+    - project_mapping 外のプロジェクトに属する SA … 対応する dst SA が決まらない
+    """
+    exclude = {
+        str(e).strip().lower() for e in (exclude_sa_emails or ()) if e
+    }
+    grants: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    warnings: List[str] = []
+    seen: set = set()
+
+    def warn(msg: str):
+        if msg not in seen:
+            seen.add(msg)
+            warnings.append(msg)
+
+    for src_proj in sorted(src_policies):
+        policy = src_policies.get(src_proj) or {}
+        dst_proj = proj_map.get(src_proj)
+        if not dst_proj:
+            continue
+        for binding in (policy.get('bindings') or []):
+            if not isinstance(binding, dict):
+                continue
+            role = binding.get('role') or ''
+            sa_emails: List[str] = []
+            for member in (binding.get('members') or []):
+                if not isinstance(member, str) or not member.startswith('serviceAccount:'):
+                    continue
+                email = member.split(':', 1)[1].strip()
+                if email.lower() in exclude:
+                    continue
+                if not parse_user_managed_sa(email):
+                    # default compute / appspot / Google 管理 service agent。
+                    # dst 側に同等物が既定で存在するため複製しない（警告も不要）。
+                    continue
+                sa_emails.append(email)
+            if not sa_emails:
+                continue
+
+            if binding.get('condition'):
+                title = (binding.get('condition') or {}).get('title') or '(タイトル無し)'
+                warn(
+                    f"{src_proj}: 条件付きバインディング (role={role}, condition='{title}') は"
+                    f"条件式が src のリソース名を参照しうるため複製しません"
+                    f"（権限が緩む方向には作用しません）。対象 SA: "
+                    f"{', '.join(sorted(set(sa_emails)))}"
+                )
+                continue
+
+            dst_role, skip_reason = remap_iam_role(role, proj_map)
+            if not dst_role:
+                warn(
+                    f"{src_proj}: role '{role}' は複製できません（{skip_reason}）。"
+                    f"必要なら dst で手動付与してください。対象 SA: "
+                    f"{', '.join(sorted(set(sa_emails)))}"
+                )
+                continue
+
+            for email in sorted(set(sa_emails)):
+                dst_email = remap_sa_email(email, proj_map)
+                if not dst_email:
+                    _acc, sa_proj = parse_user_managed_sa(email)
+                    warn(
+                        f"{src_proj}: SA '{email}' のプロジェクト '{sa_proj}' は "
+                        f"project_mapping に無いため複製しません"
+                        f"（必要なら project_mapping に追加してください）"
+                    )
+                    continue
+                dst_member = f"serviceAccount:{dst_email}"
+                key = (dst_proj, dst_member, dst_role)
+                if key in grants:
+                    continue
+                grants[key] = {
+                    "dst_project": dst_proj,
+                    "dst_member": dst_member,
+                    "dst_role": dst_role,
+                    "src_project": src_proj,
+                    "src_member": f"serviceAccount:{email}",
+                    "src_role": role,
+                    "high_privilege": dst_role in _IAM_HIGH_PRIVILEGE_ROLES,
+                }
+
+    return [grants[k] for k in sorted(grants)], warnings
 
 
 # ---------------------------------------------------------------------------
@@ -1190,6 +1733,7 @@ class MigrationOrchestrator:
         dry_run_override: Optional[bool] = None,
         verbose_override: Optional[bool] = None,
         mock_override: Optional[bool] = None,
+        auto_approve: bool = False,
     ):
         self.config_path = config_path
         self.config: Dict[str, Any] = {}
@@ -1203,6 +1747,9 @@ class MigrationOrchestrator:
         self.dry_run_override = dry_run_override
         self.verbose_override = verbose_override
         self.mock_override = mock_override
+        # --yes / -y。続行確認 ([y/N]) を自動承認する。
+        # 環境変数では「いつ設定したか気付けない」ため、明示的な引数だけを承認手段とする。
+        self.auto_approve = auto_approve
         self.stats = StageStats()
         self.start_t = time.time()
         # src プロジェクト番号 → dst プロジェクト番号 の対応（customize で番号置換に使用）
@@ -1211,6 +1758,9 @@ class MigrationOrchestrator:
         # 並列 restore worker から同一 SA を二重作成しないよう lock で直列化する。
         self._vm_sa_resolved: Dict[str, Optional[str]] = {}
         self._vm_sa_lock = threading.Lock()
+        # Step 5.7 が取得した src の project IAM ポリシー。DIFF.md の分類
+        # （カスタムロールが実際に誰かへ付与されているか）で再利用する。
+        self._src_iam_policies: Dict[str, Dict[str, Any]] = {}
 
     # ----- 設定 -----
     def load_config(self):
@@ -1282,7 +1832,7 @@ class MigrationOrchestrator:
         steps = self.config.get('steps', {})
 
         def enabled(name: str) -> bool:
-            return steps.get(name, {}).get('enabled', False)
+            return step_enabled(steps, name)
 
         gcloud_steps = ("cai_scan", "gce_snapshot", "bulk_export", "gce_restore", "data_sync", "vpc_sc")
 
@@ -1409,8 +1959,9 @@ class MigrationOrchestrator:
         """ローカル認証が src に書込権を持つ場合の警告 + 続行確認。
 
         - warnings が空ならノーオペ。
-        - 環境変数 `COPY_ALL_ENV_AUTO_APPROVE=1` で確認スキップ（CI/非対話用）。
-        - 非対話セッション（stdin が tty でない）かつ AUTO_APPROVE 未指定ならエラー終了。
+        - `--yes` / `-y`（`make plan/run YES=1`）で確認スキップ（CI/非対話用）。
+          環境変数による承認は採用しない（設定済みであることに気付けず暗黙承認になるため）。
+        - 非対話セッション（stdin が tty でない）かつ `--yes` 未指定ならエラー終了。
         - 対話なら `[y/N]` を求め、y/yes 以外は中断。
         """
         if not warnings:
@@ -1441,16 +1992,16 @@ class MigrationOrchestrator:
         )
         print("=" * 60, file=sys.stderr)
 
-        if os.environ.get("COPY_ALL_ENV_AUTO_APPROVE") == "1":
+        if self.auto_approve:
             self.org_logger.warning(
-                "  [SA事前チェック] COPY_ALL_ENV_AUTO_APPROVE=1 により続行確認を自動承認"
+                "  [SA事前チェック] --yes により続行確認を自動承認"
             )
             return
 
         if not sys.stdin.isatty():
             print(
                 " 非対話セッションのため自動続行できません。"
-                " 続行する場合は環境変数 COPY_ALL_ENV_AUTO_APPROVE=1 を設定してください。",
+                " 続行する場合は --yes (make plan/run YES=1) を明示指定してください。",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -1491,7 +2042,7 @@ class MigrationOrchestrator:
         steps = self.config.get('steps', {})
 
         def enabled(name: str) -> bool:
-            return steps.get(name, {}).get('enabled', False)
+            return step_enabled(steps, name)
 
         def required_perms(perms_by_step: dict, baseline: tuple) -> set:
             perms = set(baseline)
@@ -1904,6 +2455,28 @@ class MigrationOrchestrator:
             logger.info(f"{tag}[MOCK] BigQuery show をシミュレート")
             return json.dumps({"location": "asia-northeast1"})
 
+        if cmd.strip().startswith("gcloud projects get-iam-policy"):
+            m = re.search(r'get-iam-policy\s+(\S+)', cmd)
+            pid = m.group(1) if m else proj_id
+            logger.info(f"{tag}[MOCK] IAM ポリシーをシミュレート ({pid})")
+            # 定義済みロール / owner / プロジェクトカスタムロール / 条件付き /
+            # Google 管理 SA を一通り含め、複製ロジックの各分岐を mock で通す。
+            sa = f"serviceAccount:editor@{pid}.iam.gserviceaccount.com"
+            return json.dumps({
+                "bindings": [
+                    {"role": "roles/storage.admin", "members": [sa]},
+                    {"role": "roles/owner", "members": [sa]},
+                    {"role": f"projects/{pid}/roles/customViewer",
+                     "members": [f"serviceAccount:app-sa@{pid}.iam.gserviceaccount.com"]},
+                    {"role": "roles/compute.admin",
+                     "members": ["serviceAccount:123456789-compute@developer.gserviceaccount.com"]},
+                    {"role": "roles/bigquery.dataViewer", "members": [sa],
+                     "condition": {"title": "expire", "expression": "request.time < timestamp('2030-01-01T00:00:00Z')"}},
+                ],
+                "etag": "BwXmock==",
+            })
+
+
         # 残りのパターン（_MOCK_KNOWN_PATTERNS に含まれるもの）はすべて成功扱い
         logger.info(f"{tag}[MOCK] コマンド成功をシミュレート: {cmd.split()[0]} {cmd.split()[1] if len(cmd.split()) > 1 else ''}")
         return "Success"
@@ -1967,19 +2540,23 @@ resource "google_storage_bucket" "mock_bucket" {{
 
         steps = self.config.get('steps', {})
         try:
-            if steps.get('cai_scan', {}).get('enabled', False):
+            if step_enabled(steps, 'cai_scan'):
                 self.step_cai_scan()
-            if steps.get('gce_snapshot', {}).get('enabled', False):
+            if step_enabled(steps, 'gce_snapshot'):
                 self.step_gce_snapshot()
-            if steps.get('bulk_export', {}).get('enabled', False):
+            if step_enabled(steps, 'bulk_export'):
                 self.step_bulk_export()
-            if steps.get('terraform_apply', {}).get('enabled', False):
+            if step_enabled(steps, 'terraform_apply'):
                 self.step_terraform_apply()
-            if steps.get('network_firewall', {}).get('enabled', True):
+            if step_enabled(steps, 'network_firewall'):
                 self.step_network_firewall()
-            if steps.get('gce_restore', {}).get('enabled', False):
+            if step_enabled(steps, 'gce_restore'):
                 self.step_gce_restore()
-            if steps.get('data_sync', {}).get('enabled', False):
+            # IAM は SA が dst に出来たあと（Step 4 の terraform / Step 5 の VM SA 作成後）
+            # に流す。data_sync は dst 借用 SA で動くのでこの位置で影響を受けない。
+            if step_enabled(steps, 'iam_sync'):
+                self.step_iam_sync()
+            if step_enabled(steps, 'data_sync'):
                 self.step_data_sync()
             # VPC SC は最後。先に dst をペリメタへ封じ込めると後続の
             # terraform/gce/gcs/bq 操作が境界で弾かれる恐れがあるため、
@@ -2014,6 +2591,15 @@ resource "google_storage_bucket" "mock_bucket" {{
         tf_base = bulk_cfg.get('output_dir', './terraform')
         proj_map = self._build_proj_id_map()
 
+        # 要対応 / 参考 の分類材料。Step 5.7 が取得済みの src ポリシーを再利用し、
+        # 未取得（iam_sync 無効 / 取得失敗）なら None を渡して安全側（要対応）に倒す。
+        iam_sync_enabled = step_enabled(self.config.get('steps', {}), 'iam_sync')
+        gce_restore_enabled = step_enabled(self.config.get('steps', {}), 'gce_restore')
+        bound_roles = (
+            bound_custom_role_ids(self._src_iam_policies)
+            if self._src_iam_policies else None
+        )
+
         reports: List[Dict[str, Any]] = []
         for src_proj, _sa in self._iter_src_projects():
             cai_path = os.path.join(cai_dir, f"cai_resources_{src_proj}.txt")
@@ -2032,12 +2618,16 @@ resource "google_storage_bucket" "mock_bucket" {{
                 tf_dirs=tf_dirs,
                 src_project=src_proj,
                 dst_project=proj_map.get(src_proj, ""),
+                iam_sync_enabled=iam_sync_enabled,
+                bound_custom_roles=bound_roles,
+                gce_restore_enabled=gce_restore_enabled,
             )
             reports.append(report)
             self.org_logger.info(
                 f"  {src_proj}: CAI {report['cai_total']} 件 / "
                 f"TF {report['tf_total']} 件 / 一致 {report['covered']} 件 / "
-                f"要手動 {len(report['missing'])} 件 / "
+                f"要対応 {report['action_total']} 件 / "
+                f"参考 {len(report['missing']) - report['action_total']} 件 / "
                 f"自動・対象外 {report.get('auto_handled', 0)} 件"
             )
 
@@ -4288,6 +4878,7 @@ resource "google_storage_bucket" "mock_bucket" {{
 
     def _resolve_dst_vm_service_account(
         self, sa_email: str, proj_map: Dict[str, str], dst_sa: Optional[str],
+        label: str = "VM SA",
     ) -> Optional[str]:
         """src VM の user-managed SA email を dst 側 SA email に解決する。
 
@@ -4312,12 +4903,12 @@ resource "google_storage_bucket" "mock_bucket" {{
             m = re.match(r'^([^@]+)@([^.]+)\.iam\.gserviceaccount\.com$', sa_email)
             if not m:
                 self.dst_logger.warning(
-                    f"  [VM SA] '{sa_email}' を解釈できないため複製せず、"
+                    f"  [{label}] '{sa_email}' を解釈できないため複製せず、"
                     f"dst の既定 SA で起動します"
                 )
             elif m.group(2) not in proj_map:
                 self.dst_logger.warning(
-                    f"  [VM SA] '{sa_email}' のプロジェクト '{m.group(2)}' は "
+                    f"  [{label}] '{sa_email}' のプロジェクト '{m.group(2)}' は "
                     f"project_mapping に無いため複製せず、dst の既定 SA で起動します"
                     f"（必要なら project_mapping への追加 or 手動で SA 作成 + 指定）"
                 )
@@ -4330,7 +4921,7 @@ resource "google_storage_bucket" "mock_bucket" {{
                     f"--project={dst_proj_for_sa} --format='value(email)'",
                     dst_sa,
                 ):
-                    self.dst_logger.info(f"  [VM SA] {dst_email} は dst に既存。再利用")
+                    self.dst_logger.info(f"  [{label}] {dst_email} は dst に既存。再利用")
                     result = dst_email
                 else:
                     out = self.run_command(
@@ -4339,16 +4930,13 @@ resource "google_storage_bucket" "mock_bucket" {{
                         f"--display-name={shlex.quote(account_id)} --quiet",
                         side="dst", logger=self.dst_logger,
                         desc=f"Create SA {account_id}",
-                        explanation=(
-                            f"dst {dst_proj_for_sa} に VM 用 SA {dst_email} を作成"
-                            f"（IAM ロールは複製しない）"
-                        ),
+                        explanation=f"dst {dst_proj_for_sa} に SA {dst_email} を作成",
                         impersonate_sa=dst_sa, allow_fail=True,
                     )
                     if out is None and not (self.dry_run or self.mock):
                         # 作成失敗（権限不足等）。既定 SA で起動にフォールバック
                         self.dst_logger.warning(
-                            f"  [VM SA] {dst_email} を作成できませんでした。"
+                            f"  [{label}] {dst_email} を作成できませんでした。"
                             f"dst の既定 SA で起動します"
                         )
                     else:
@@ -4363,11 +4951,19 @@ resource "google_storage_bucket" "mock_bucket" {{
                                 ):
                                     break
                                 time.sleep(5)
-                        self.dst_logger.warning(
-                            f"  [VM SA] {dst_email} を新規作成しました。"
-                            f"src SA '{sa_email}' の IAM ロールは複製していません。"
-                            f"必要な権限は dst で手動付与してください"
-                        )
+                        # ロール複製の担当は Step 5.7 (step_iam_sync)。無効なら
+                        # 空 SA のままになるので手動付与を案内する。
+                        if step_enabled(self.config.get('steps', {}), 'iam_sync'):
+                            self.dst_logger.info(
+                                f"  [{label}] {dst_email} を新規作成しました。"
+                                f"IAM ロールは Step 5.7 で src SA '{sa_email}' から複製します"
+                            )
+                        else:
+                            self.dst_logger.warning(
+                                f"  [{label}] {dst_email} を新規作成しました。"
+                                f"steps.iam_sync.enabled=false のため src SA '{sa_email}' の "
+                                f"IAM ロールは複製していません。必要な権限は dst で手動付与してください"
+                            )
                         result = dst_email
 
             self._vm_sa_resolved[sa_email] = result
@@ -4615,6 +5211,301 @@ resource "google_storage_bucket" "mock_bucket" {{
             explanation=f"service project {svc_proj} に静的内部IP {ip_addr} を予約 (共有 VPC subnet={subnet_uri})",
             impersonate_sa=svc_sa, allow_fail=True,
         )
+
+    # ==========================================================
+    # Step 5.7: IAM ロール複製 (src SA → dst SA)
+    # ==========================================================
+    def _iam_excluded_sa_emails(self) -> set:
+        """複製対象から外す SA（移行オーケストレータ自身が使う借用 SA）。
+
+        bootstrap_src_sa.sh / bootstrap_dst_sa.sh が作る移行専用 SA は
+        移行対象のワークロードではないため、dst に複製しない。
+        """
+        out = set()
+        for _src, _dst, src_sa, dst_sa in self._iter_project_pairs(include_skipped=True):
+            for sa in (src_sa, dst_sa):
+                if sa:
+                    out.add(str(sa).strip().lower())
+        return out
+
+    def _fetch_src_iam_policies(self) -> Dict[str, Dict[str, Any]]:
+        """src 各プロジェクトの IAM ポリシーを並列取得する（read-only）。"""
+        policies: Dict[str, Dict[str, Any]] = {}
+        lock = threading.Lock()
+        targets = list(self._iter_src_projects())
+
+        def worker(item):
+            src_proj, src_sa = item
+            raw = self.run_command(
+                f"gcloud projects get-iam-policy {src_proj} --format=json",
+                side="src", logger=self.org_logger,
+                desc=f"IAM policy {src_proj}",
+                explanation=f"src {src_proj} の IAM ポリシーを取得（read-only）",
+                impersonate_sa=src_sa, allow_fail=True,
+            )
+            obj = _parse_gcloud_describe_json(raw)
+            if not obj:
+                self.org_logger.warning(
+                    f"  [IAM] {src_proj}: IAM ポリシーを取得できませんでした。"
+                    f"このプロジェクトのロール複製はスキップされます"
+                )
+            with lock:
+                policies[src_proj] = obj
+
+        self._parallel_for_each(targets, worker, "iam-scan")
+        # DIFF.md の分類（カスタムロールが実際に付与されているか）で再利用する。
+        self._src_iam_policies = policies
+        return policies
+
+    def _gcloud_json(self, cmd: str, impersonate_sa: Optional[str]) -> Optional[Any]:
+        """read-only な JSON 取得（stats を汚さない）。失敗 / mock / dry-run は None。
+
+        _gcloud_exists と同じ理由で subprocess を直接叩く（存在確認や差分取得の
+        失敗を run 全体の失敗として数えたくない）。
+        """
+        if self.mock or self.dry_run:
+            return None
+        env = os.environ.copy()
+        if impersonate_sa:
+            env['CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT'] = impersonate_sa
+        try:
+            res = subprocess.run(
+                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env, timeout=120,
+            )
+            if res.returncode != 0 or not res.stdout.strip():
+                return None
+            return json.loads(res.stdout)
+        except Exception:
+            return None
+
+    def _access_token_for(self, impersonate_sa: Optional[str]) -> Optional[str]:
+        """権限確認用のアクセストークンを取得する（read-only / stats を汚さない）。"""
+        if not impersonate_sa:
+            return self._local_access_token()
+        rc, out, _err = self._sa_preflight_run(
+            f"gcloud auth print-access-token --impersonate-service-account={impersonate_sa}"
+        )
+        return out.strip() if rc == 0 and out.strip() else None
+
+    def _dst_can_set_iam_policy(
+        self, dst_proj: str, dst_sa: Optional[str],
+    ) -> Optional[bool]:
+        """dst プロジェクトへ setIamPolicy できるかを事前確認する。
+
+        True/False の他に **None（判定不能）** を返す。mock / dry-run、トークン取得
+        失敗、testIamPermissions 不通はいずれも None で、呼び出し側は「あるものとして
+        続行」する（判定できないことを理由に移行を止めない）。
+        """
+        if self.mock or self.dry_run:
+            return None
+        token = self._access_token_for(dst_sa)
+        if not token:
+            return None
+        perm = "resourcemanager.projects.setIamPolicy"
+        granted = self._test_iam_permissions(token, dst_proj, {perm})
+        if granted is None:
+            return None
+        return perm in granted
+
+    def _dst_existing_bindings(
+        self, dst_proj: str, dst_sa: Optional[str],
+    ) -> Optional[set]:
+        """dst の現行ポリシーから (member, role) の集合を返す。取得不能なら None。"""
+        obj = self._gcloud_json(
+            f"gcloud projects get-iam-policy {dst_proj} --format=json", dst_sa)
+        if not isinstance(obj, dict):
+            return None
+        out = set()
+        for b in (obj.get('bindings') or []):
+            if not isinstance(b, dict) or b.get('condition'):
+                continue
+            role = b.get('role') or ''
+            for m in (b.get('members') or []):
+                out.add((m, role))
+        return out
+
+    @staticmethod
+    def _iam_grant_command(g: Dict[str, Any]) -> str:
+        """付与コマンド。手動案内にもそのまま流用できる形にしておく。"""
+        return (
+            f"gcloud projects add-iam-policy-binding {g['dst_project']} "
+            f"--member={shlex.quote(g['dst_member'])} "
+            f"--role={shlex.quote(g['dst_role'])} "
+            f"--condition=None --quiet --format=none"
+        )
+
+    def step_iam_sync(self):
+        """Step 5.7: src の SA に付いている IAM ロールを dst の同名 SA へ複製する。
+
+        設定不要で動く（`steps.iam_sync.enabled` 未指定なら有効）。手順:
+
+        1. src 各プロジェクトの project IAM ポリシーを read-only で取得
+        2. build_iam_replication_plan() で dst 用のバインディング一覧に変換
+           （ロール ID / SA email を proj_map で読み替え、読み替え不能なものは
+             スキップ + WARNING に倒す）
+        3. 付与先の dst SA が無ければ空 SA を冪等作成
+        4. dst プロジェクト単位で付与
+
+        意図的に対象外にしているもの:
+        - 条件付きバインディング（条件式が src のリソース名を参照しうる）
+        - ORG カスタムロール / project_mapping 外のプロジェクトのカスタムロール
+        - default compute / appspot / Google 管理 service agent（dst に同等物がある）
+        - SA リソース自身の IAM ポリシー（= 誰がその SA を借用できるか）
+        - プロジェクト以外のリソース（バケット / データセット等）のバインディング
+
+        並列化: src ポリシー取得はプロジェクト単位で並列。付与は **dst プロジェクト
+        単位で並列 + プロジェクト内は直列**。同一プロジェクトへの
+        add-iam-policy-binding は read-modify-write なので並列化すると etag 競合
+        （ABORTED）になる。
+        """
+        log_stage_header(self.dst_logger, 57, "IAM ロール複製 (src SA → dst SA)")
+        proj_map = self._build_proj_id_map()
+        if not proj_map:
+            self.dst_logger.warning("  対象プロジェクトがありません。スキップします")
+            return
+
+        src_policies = self._fetch_src_iam_policies()
+        grants, warnings = build_iam_replication_plan(
+            src_policies, proj_map, self._iam_excluded_sa_emails())
+        for w in warnings:
+            self.dst_logger.warning(f"  [IAM] {w}")
+        if not grants:
+            self.dst_logger.info("  複製対象の IAM バインディングはありません")
+            return
+
+        src_members = sorted({g['src_member'] for g in grants})
+        self.dst_logger.info(
+            f"  複製候補: {len(grants)} バインディング / SA {len(src_members)} 件"
+        )
+
+        # --- 付与先の dst SA を用意（無ければ空 SA を冪等作成）---
+        # _resolve_dst_vm_service_account は内部で SA 単位のロックとキャッシュを持つ。
+        # Step 5 で VM 用に作成済みの SA はここで再利用される。
+        dst_sa_by_src = self._build_dst_sa_map()
+        usable: Dict[str, bool] = {}
+        for src_member in src_members:
+            src_email = src_member.split(':', 1)[1]
+            parsed = parse_user_managed_sa(src_email)
+            sa_proj = parsed[1] if parsed else ''
+            resolved = self._resolve_dst_vm_service_account(
+                src_email, proj_map, dst_sa_by_src.get(sa_proj), label="SA")
+            usable[src_member] = bool(resolved)
+            if not resolved:
+                self.dst_logger.warning(
+                    f"  [IAM] {src_member} に対応する dst SA を用意できなかったため、"
+                    f"この SA のロール複製をスキップします"
+                )
+        grants = [g for g in grants if usable.get(g['src_member'])]
+        if not grants:
+            self.dst_logger.warning("  付与可能なバインディングが残りませんでした")
+            return
+
+        by_project: Dict[str, List[Dict[str, Any]]] = {}
+        for g in grants:
+            by_project.setdefault(g['dst_project'], []).append(g)
+        dst_sa_by_dst = {dst: dst_sa_by_src.get(src) for src, dst in proj_map.items()}
+
+        applied: List[Dict[str, Any]] = []
+        applied_lock = threading.Lock()
+
+        def worker(dst_proj: str):
+            items = by_project[dst_proj]
+            dst_sa = dst_sa_by_dst.get(dst_proj)
+
+            # setIamPolicy が無いと全件失敗するため、プロジェクト単位で先に確認する。
+            # 無い場合はエラーにせず、手動付与コマンドを案内してスキップに倒す。
+            if self._dst_can_set_iam_policy(dst_proj, dst_sa) is False:
+                self.dst_logger.warning(
+                    f"  [IAM] {dst_proj}: 実行主体に resourcemanager.projects.setIamPolicy が"
+                    f"ないため {len(items)} 件の付与をスキップします。"
+                    f"`scripts/bootstrap_dst_sa.sh --apply` を再実行して "
+                    f"roles/resourcemanager.projectIamAdmin を付与するか、"
+                    f"以下を手動実行してください:"
+                )
+                for g in items:
+                    self.dst_logger.warning(f"      {self._iam_grant_command(g)}")
+                    self.stats.incr("skipped")
+                return
+
+            existing = self._dst_existing_bindings(dst_proj, dst_sa)
+            for g in items:
+                if existing is not None and (g['dst_member'], g['dst_role']) in existing:
+                    self.dst_logger.info(
+                        f"  [IAM] {dst_proj}: {g['dst_role']} は {g['dst_member']} に"
+                        f"付与済み。スキップ"
+                    )
+                    self.stats.incr("skipped")
+                    continue
+                # カスタムロールは Step 4 の terraform が dst に作る想定。無いまま
+                # 付与すると cryptic な API エラーになるので存在確認してから付与する。
+                if g['dst_role'].startswith("projects/") and not (self.dry_run or self.mock):
+                    role_id = g['dst_role'].rsplit('/', 1)[1]
+                    if not self._gcloud_exists(
+                        f"gcloud iam roles describe {role_id} "
+                        f"--project={dst_proj} --format='value(name)'", dst_sa,
+                    ):
+                        self.dst_logger.warning(
+                            f"  [IAM] {dst_proj}: カスタムロール {g['dst_role']} が dst に"
+                            f"存在しないため {g['dst_member']} への付与をスキップします"
+                            f"（Step 4 terraform_apply で複製されたか確認してください）"
+                        )
+                        self.stats.incr("skipped")
+                        continue
+                out = self.run_command(
+                    self._iam_grant_command(g),
+                    side="dst", logger=self.dst_logger,
+                    desc=f"IAM grant {g['dst_role']}",
+                    explanation=(
+                        f"dst {dst_proj} の {g['dst_member']} に {g['dst_role']} を付与"
+                        f"（src {g['src_project']} の {g['src_member']} が持つ "
+                        f"{g['src_role']} を複製）"
+                    ),
+                    impersonate_sa=dst_sa, allow_fail=True, retries=2,
+                )
+                if out is None:
+                    continue
+                with applied_lock:
+                    applied.append(g)
+
+        self._parallel_for_each(sorted(by_project), worker, "iam-grant")
+
+        self.dst_logger.info(
+            f"  IAM 複製: 付与 {len(applied)} 件 / 候補 {len(grants)} 件"
+        )
+        self._warn_high_privilege_grants(applied)
+
+    def _warn_high_privilege_grants(self, applied: List[Dict[str, Any]]):
+        """owner 等の超高権限ロールを付与した場合、最後にまとめて警告する。
+
+        src と同じ権限を再現した結果であっても、別 ORG に owner 相当の SA が
+        無審査で生えるのは事故のもと。ログの最後で人間がレビューできるように
+        「何を・どこに・なぜ」付与したかと取り消しコマンドを併記する。
+        """
+        high = [g for g in applied if g.get('high_privilege')]
+        if not high:
+            return
+        bar = "!" * 56
+        self.dst_logger.warning("")
+        self.dst_logger.warning(f"  {bar}")
+        self.dst_logger.warning(
+            f"  [IAM] 超高権限ロールを {len(high)} 件付与しました。"
+            f"src と同じ権限を再現した結果です。dst で本当に必要かレビューしてください:"
+        )
+        for g in high:
+            self.dst_logger.warning(
+                f"    - {g['dst_role']} → {g['dst_member']} (project {g['dst_project']})"
+            )
+            self.dst_logger.warning(
+                f"        理由: src {g['src_project']} の {g['src_member']} に "
+                f"{g['src_role']} が付与されていたため"
+            )
+            self.dst_logger.warning(
+                f"        取消: gcloud projects remove-iam-policy-binding {g['dst_project']} "
+                f"--member={shlex.quote(g['dst_member'])} "
+                f"--role={shlex.quote(g['dst_role'])} --condition=None"
+            )
+        self.dst_logger.warning(f"  {bar}")
 
     def step_vpc_sc(self):
         """Step 7: dst で作成したプロジェクトを既存の VPC Service Controls ペリメタに追加。
@@ -5196,6 +6087,10 @@ def main():
     parser.add_argument("--mock", action="store_true", default=None, help="Mock モードを有効化")
     parser.add_argument("--no-mock", action="store_false", dest="mock", help="Mock モードを無効化")
     parser.add_argument(
+        "-y", "--yes", action="store_true", default=False,
+        help="SA 事前チェックの続行確認 ([y/N]) を自動承認する（非対話 / CI 用）",
+    )
+    parser.add_argument(
         "--clean-state", action="append", metavar="PROJECT_ID",
         help="指定プロジェクトの terraform 生成物 (active/raw) と state だけ削除して終了。"
              "src / dst どちらの ID でも可。複数指定可",
@@ -5210,6 +6105,7 @@ def main():
         dry_run_override=args.dry_run,
         verbose_override=args.verbose,
         mock_override=args.mock,
+        auto_approve=args.yes,
     )
     orchestrator.execute()
     if orchestrator.stats.failed > 0:

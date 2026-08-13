@@ -27,7 +27,12 @@ CONFIG="dst/config.yaml"
 APPLY=false
 CUSTOM_ROLE_ID="migrationSrcReader"
 # read-only 権限のみ（ORG を変更しない）。
-CUSTOM_PERMS="storage.buckets.get,storage.buckets.list,storage.objects.get,storage.objects.list,compute.snapshots.useReadOnly,compute.snapshots.get,compute.snapshots.list,compute.disks.get,compute.disks.list"
+# resourcemanager.projects.getIamPolicy は Step 5.7（IAM ロール複製）で src の
+# バインディングを読むために必要。読み取りのみで src は変更しない。
+# compute.firewalls.list / compute.networkFirewallPolicies.list は Step 4.5
+# （既定で有効）の src 側読み取りに必要。preflight (check_service_accounts) が
+# 有効ステップ分の権限を検査するため、ここに無いと fail-fast で止まる。
+CUSTOM_PERMS="storage.buckets.get,storage.buckets.list,storage.objects.get,storage.objects.list,compute.snapshots.useReadOnly,compute.snapshots.get,compute.snapshots.list,compute.disks.get,compute.disks.list,compute.firewalls.list,compute.networkFirewallPolicies.list,resourcemanager.projects.getIamPolicy"
 PREDEFINED_ROLES=("roles/bigquery.dataViewer")
 
 while [[ $# -gt 0 ]]; do

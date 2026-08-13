@@ -34,7 +34,9 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 #### C. コピー元 (src) 側
 - [ ] 各 src プロジェクトの **プロジェクト ID** を把握している
       （`config.yaml` の `project_mapping.host_project.src` / `service_projects[].src` に記入）
-- [ ] 各 src プロジェクトに実行ユーザーの**読み取り権限**（`roles/viewer` 相当）を付与済み（ローカル認証）
+- [ ] 各 src プロジェクトに実行ユーザーの**読み取り権限**を付与済み（ローカル認証）
+      → `roles/viewer` だけでは不足します。必要なロール一覧は
+      [推奨構成: 最小権限の principal を 1 つ用意する](#推奨構成-最小権限の-principal-を-1-つ用意する) を参照
       → Impersonation を使う場合は `scripts/bootstrap_src_sa.sh --apply` で read-only SA を一括投入（`roles/viewer` + `roles/cloudasset.viewer` + 実行ユーザーへ `roles/iam.serviceAccountTokenCreator`）
 - [ ] 移行対象の **全 GCE VM に期限内スナップショット**（既定 30 日以内）が存在
       → 無いと Step 2 `gce_snapshot` がエラーで停止（`make plan` でも検出）
@@ -83,7 +85,7 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > - **SA 事前チェック**: 借用 SA の実在・借用可否と代表権限（src=読取 / dst=書込）。代表値の検証で、全リソース種は網羅しません。
 >
 > 💡 ローカル認証（`*_impersonate_service_account` が空）では SA チェックが ADC 経路に切り替わり、
-> src 書込権を検出すると警告 + 続行確認します（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1`）。詳細は §2 を参照。
+> src 書込権を検出すると警告 + 続行確認します（自動承認は `make plan YES=1` / `make run YES=1`）。詳細は §2 を参照。
 
 ### 2. GCP 認証
 サービスアカウントキー (JSON) は使用しません。認証方法は 2 つあります。
@@ -145,12 +147,37 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > make bootstrap-shared-vpc             # host を Shared VPC 化、svc をアタッチ、networkUser 付与
 > ```
 > 中身（呼び出されるスクリプト）:
-> - `scripts/bootstrap_dst_sa.sh` … dst SA を各 dst プロジェクトに作成し、`roles/editor`・`roles/storage.admin`・`roles/bigquery.admin` と、実行アカウントへの `roles/iam.serviceAccountTokenCreator` を付与。
+> - `scripts/bootstrap_dst_sa.sh` … dst SA を各 dst プロジェクトに作成し、`roles/editor`・`roles/storage.admin`・`roles/bigquery.admin`・`roles/iam.roleAdmin`・`roles/resourcemanager.projectIamAdmin` と、実行アカウントへの `roles/iam.serviceAccountTokenCreator` を付与。
+>   `projectIamAdmin` は Step 5.7 (`iam_sync`) で src SA のロールを dst SA へ付与するために必要です（`roles/editor` に `setIamPolicy` は含まれません）。この SA が「任意の principal に任意のロールを配れる」力を持つ点は理解した上で運用してください。IAM 複製が不要なら `steps.iam_sync.enabled: false` にしてこのロールを外せます。**既存環境では再実行が必要です。**
 > - `scripts/bootstrap_cross_project.sh` … 各 src プロジェクトに read-only カスタムロール `migrationSrcReader` を作成し、対応する dst SA に付与（さらに `roles/bigquery.dataViewer`）。**src(ORG) への read-only IAM 付与**を伴うため、`sync_env.py` の ORG 保護から意図的に分離されています。
 > - `scripts/bootstrap_shared_vpc.sh` … dst host を Shared VPC ホストにし、dst svc プロジェクトをアタッチ、各 svc の cloudservices/compute SA と svc 借用 SA に `roles/compute.networkUser` を付与。
 >
 > SA 事前チェックで dst SA の借用に失敗した場合、`make plan` / `make run` の停止メッセージに
 > 上記コマンドが自動表示されます。
+
+#### 推奨構成: 最小権限の principal を 1 つ用意する
+
+**移行実行専用の principal（ユーザーアカウントまたは SA）を 1 つ用意し、src には読み取りのみ・dst には書き込みを付ける**のが、いま取れる最も安全な構成です。
+
+| 対象 | 付与するロール | 理由 |
+| :--- | :--- | :--- |
+| **src（全プロジェクト）** | `roles/viewer` | compute / GCS の read、`resourcemanager.projects.getIamPolicy`（Step 5.7）を含む |
+| | `roles/cloudasset.viewer` | `cloudasset.assets.searchAllResources`（Step 1 `cai_scan` / Step 3 `bulk_export`）。**`roles/viewer` には含まれません** |
+| | `roles/bigquery.dataViewer` | BigQuery のデータ読み取り（Step 6 `data_sync`） |
+| | `migrationSrcReader`（カスタム） | `compute.snapshots.useReadOnly` など定義済みロールで賄えない read 権限。`scripts/bootstrap_cross_project.sh` が作成 |
+| **dst（全プロジェクト）** | `bootstrap_dst_sa.sh` の `ROLES` 相当 | `roles/editor` + `storage.admin` + `bigquery.admin` + `iam.roleAdmin` + `resourcemanager.projectIamAdmin`。dst では事実上 owner 相当の権限が必要です |
+
+> ⚠️ **`roles/viewer` だけでは足りません。** 上表の 4 つを揃えないと Step 1 / 3 / 5 / 6 が権限不足で失敗します。
+
+**なぜ安全か**: src 側に書き込み権限が無ければ、コードのバグや将来の改修があっても API が 403 で弾きます。
+これは `is_src_read_only` ガード（コードレベル）の**外側**にある保証で、多層防御になります。
+さらに SA 事前チェックが src の代表的な書込権を実測するため、**`[y/N]` の続行確認が一度も出なければ「書込権を持っていない」ことの実行時証拠**になります（出た場合は最小権限になっていないシグナル）。
+
+**ADC 直接指定と Impersonation のどちらでも使えます**が、`src_impersonate_service_account` に指定する方がわずかに優れます（src 読み取りに使う資格情報を実行ユーザー本人と明示的に分離でき、監査ログでも区別できるため）。
+
+> 📌 **注意**: `bootstrap_src_sa.sh` / `bootstrap_cross_project.sh` は **src(ORG) に IAM を書き込みます**。
+> read-only の principal では実行できないので、これらは別の管理者アカウントで先に済ませてから、
+> 移行本体を最小権限 principal で回してください。
 
 ### 3. 設定ファイル (config.yaml) の準備
 テンプレートからコピーして、環境に合わせて編集します。
@@ -182,10 +209,23 @@ cp dst/config.yaml.template dst/config.yaml
   （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に
   永続化され、`make plan` / `make run` / `skip_on_run` 間で同じ値が再利用されます
   （別名で作り直す場合はこのファイルを削除）。
-- **`steps`**: 各ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `data_sync` / `vpc_sc`) の有効/無効と個別設定（スナップショット期限など）。
+- **`steps`**: 各ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `iam_sync` / `data_sync` / `vpc_sc`) の有効/無効と個別設定（スナップショット期限など）。
   `bulk_export.skip_on_run: true` にすると本番実行 (`make run`) では export/customize を
   スキップし、`make plan` で生成済みの `terraform/active/` を再利用して高速化します
   （`make plan` 自体は常に最新を取り直します）。
+  - **`iam_sync`** (Step 5.7): src の SA に付いている IAM ロールを dst の同名 SA へ複製。
+    **キー未指定でも有効**（設定不要で動きます）。無効にするときだけ `enabled: false`。
+    - 対象は **src 各プロジェクトの project IAM ポリシー**のうち user-managed SA
+      (`<id>@<project>.iam.gserviceaccount.com`) 宛のバインディング。ロール ID と SA email を
+      `project_mapping` で dst 側に読み替えて付与し、dst に SA が無ければ空 SA を冪等作成します。
+    - **複製しないもの**（いずれも dst の権限が緩む方向には作用しません。理由付きで WARNING）:
+      条件付きバインディング / ORG カスタムロール / `project_mapping` 外のプロジェクトの SA・
+      カスタムロール / default compute・appspot・Google 管理 service agent /
+      SA 自身の IAM ポリシー（誰が借用できるか）/ バケット・データセット等のリソース単位バインディング。
+    - **`roles/owner` 等の超高権限ロールも src と同じなら複製します**。付与した場合は実行ログの
+      最後に「何を・どこに・なぜ・取消コマンド」を WARNING でまとめて出すので必ずレビューしてください。
+    - dst 側に `roles/resourcemanager.projectIamAdmin` が必要（`bootstrap_dst_sa.sh` が付与）。
+      権限が無い場合は**エラーにせず**スキップし、手動用の `add-iam-policy-binding` コマンドを案内します。
   - **`vpc_sc`** (Step 7): 既存の VPC Service Controls ペリメタへ dst プロジェクトを追加。
     `access_policy` / `perimeter` に加え **`billing_project` が必須**（access-context-manager は
     `--project` を持たず、未指定だとローカル `gcloud config` の無関係なプロジェクトを quota に
@@ -302,9 +342,10 @@ make run
 > 2. classic firewall ルールと Network Firewall Policy は **Step 4.5 (`network_firewall`)** で `gcloud` 経由で複製（dst host VPC が Step 1 で出来ている前提。`secure_tag_map` で別 ORG の tagValues 変換、未登録参照は skip + WARNING）。
 > 3. Original の有効なスナップショット（期限内）から、コピー先にディスクを復元。
 > 4. 復元したブートディスクを VM に差し替えて起動（OS 状態・データごと完全復元）。電源状態（RUNNING / TERMINATED / SUSPENDED）は Step 5 最終フェーズでまとめて反映。
-> 5. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
-> 6. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
-> 7. 全移行の最後に、dst プロジェクトを既存の VPC Service Controls ペリメタへ追加（`vpc_sc.billing_project` が必須。未設定ならスキップ）。
+> 5. src の SA に付いていた IAM ロールを **Step 5.7 (`iam_sync`)** で dst の同名 SA へ複製（別 ORG で ID が変わるロールはスキップ + WARNING。`roles/owner` を付与した場合は末尾に警告）。
+> 6. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
+> 7. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
+> 8. 全移行の最後に、dst プロジェクトを既存の VPC Service Controls ペリメタへ追加（`vpc_sc.billing_project` が必須。未設定ならスキップ）。
 
 > ♻️ **Terraform 適用の冪等性 / state 管理**（再実行しても 409/404 で落ちないための仕組み）
 > - **`make plan` は state を消さない**（`clean` 依存を撤去済み）。同一 dst project id なら前回の
@@ -401,7 +442,7 @@ make vmware-clean       # vmware/logs/ を削除
 | :--- | :--- |
 | **side による操作分類** | すべての外部コマンドは `side="src" / "dst" / "local"` のいずれかで実行されます。 |
 | **src は read-only 強制** | `side="src"` のコマンドに書き込み動詞（`create / delete / update / stop / start / attach / detach / mk / cp / rsync / apply` 等）が含まれていたら、**実行前に拒否**して停止します。 |
-| **ローカル認証 / 借用 SA（src を変えないならローカル認証がおすすめ）** | `impersonate_sa` 未指定の場合はローカル認証（gcloud のアクティブアカウント / ADC）で動作します。**src 書込権を持っていれば**事前チェックで警告 + 続行確認（非対話は `COPY_ALL_ENV_AUTO_APPROVE=1` で許可）。`side="src"` のコマンドそのものに対する書込動詞拒否ガード (`is_src_read_only`) は impersonate の有無にかかわらず常時有効です。 |
+| **ローカル認証 / 借用 SA（src を変えないならローカル認証がおすすめ）** | `impersonate_sa` 未指定の場合はローカル認証（gcloud のアクティブアカウント / ADC）で動作します。**src 書込権を持っていれば**事前チェックで警告 + 続行確認（自動承認は `--yes` / `-y` = `make plan YES=1` / `make run YES=1`。環境変数での自動承認は「設定したまま忘れる」事故防止のため提供しません）。`side="src"` のコマンドそのものに対する書込動詞拒否ガード (`is_src_read_only`) は impersonate の有無にかかわらず常時有効です。 |
 | **設定バリデーション** | `src == dst`、dst が他の src と衝突、`service_projects` が空 等を検出すると、処理を何もせずに停止します。 |
 | **SA 事前チェック** | 実行前に借用 SA の**実在・借用可否・代表権限**（src=読取 / dst=書込）を検証し、不足を検出したら全件列挙して停止します。借用 SA 未指定のプロジェクトはローカル認証の **src 書込権チェック + 続行確認** に切り替わります（`make plan` でも実行、Mock はスキップ）。 |
 | **Mock は fail-closed** | Mock モードで未対応のコマンドが来たら、本物実行に進ませず即停止します。 |
