@@ -14,6 +14,7 @@ import argparse
 import sys
 import os
 import re
+import ipaddress
 import yaml
 import logging
 import subprocess
@@ -406,8 +407,11 @@ def parse_cai_resources(path: str) -> List[Dict[str, str]]:
 
     各レコードは `---` で区切られ、`assetType:` `name:` 等のキーを 1 行に持つ。
     本パーサは PyYAML を使わず簡易行スキャンで対応する（CAI 出力は flat なため十分）。
+    `state`（RESERVED / IN_USE 等）と additionalAttributes 内の `address:`（IP 値）は
+    Address の要対応 / 参考分類に使うため拾う。
     Returns:
-        [{asset_type, name, short_name, location, project, display_name}, ...]
+        [{asset_type, name, short_name, location, project, display_name,
+          state?, ip_address?}, ...]
     """
     records: List[Dict[str, str]] = []
     if not os.path.isfile(path):
@@ -430,7 +434,14 @@ def parse_cai_resources(path: str) -> List[Dict[str, str]]:
             if s.strip() == "---":
                 _flush()
                 continue
-            if not s or s.startswith(" ") or s.startswith("\t") or s.startswith("-"):
+            if not s:
+                continue
+            if s.startswith(" ") or s.startswith("\t"):
+                ss = s.strip()
+                if ss.startswith("address:") and "ip_address" not in current:
+                    current["ip_address"] = ss.split(":", 1)[1].strip()
+                continue
+            if s.startswith("-"):
                 continue
             if ":" not in s:
                 continue
@@ -447,6 +458,8 @@ def parse_cai_resources(path: str) -> List[Dict[str, str]]:
                 current["project"] = v
             elif k == "displayName":
                 current["display_name"] = v
+            elif k == "state":
+                current["state"] = v
     _flush()
     return records
 
@@ -641,6 +654,20 @@ _MANAGED_LOG_RESOURCE_NAMES = frozenset({"_Default", "_Required"})
 # 移行後の dst 運用には不要なので複製しない。
 _MIGRATION_TOOL_ROLE_IDS = frozenset({"migrationSrcReader"})
 
+# DIFF.md「参考」の優先度。テーブル / 詳細はこの昇順でソートして出力する。
+# 1: 別ステップが自動対応済み → dst 側で結果を一度確認すると確実
+# 2: src 側にカスタム / 取り置きの意図がある場合のみ手動対応
+# 3: どの環境でも何もしなくてよい
+_DIFF_PRIORITY_LABELS = {1: "確認推奨", 2: "条件付き", 3: "対応不要"}
+
+
+def _is_private_ip(value: Optional[str]) -> bool:
+    """RFC1918 等のプライベート IP なら True。パース不能は False（安全側 = 判定不能扱い）。"""
+    try:
+        return ipaddress.ip_address(value or "").is_private
+    except ValueError:
+        return False
+
 
 def bound_custom_role_ids(src_policies: Dict[str, Dict[str, Any]]) -> set:
     """src の project IAM ポリシーで実際に誰かへ付与されているカスタムロール ID の集合。
@@ -664,7 +691,8 @@ def classify_missing_asset(
     item: Dict[str, Any],
     iam_sync_enabled: bool = True,
     bound_custom_roles: Optional[set] = None,
-) -> Dict[str, str]:
+    gce_restore_enabled: bool = True,
+) -> Dict[str, Any]:
     """欠落 1 件を action / reference に分類し、WHAT 用の種別と WHY / HOW を返す。
 
     Args:
@@ -672,32 +700,39 @@ def classify_missing_asset(
         iam_sync_enabled: Step 5.7 iam_sync が有効か（SA を dst に作る担当）
         bound_custom_roles: src の project IAM ポリシーで付与済みのカスタムロール ID。
                             None は「判定材料が無い」= 安全側で action に倒す。
+        gce_restore_enabled: Step 5 gce_restore が有効か（VM 内部 IP を dst に予約する担当）
 
-    Returns: `{'level': 'action'|'reference', 'kind': str, 'why': str, 'how': str}`
+    Returns: `{'level': 'action'|'reference', 'kind': str, 'why': str, 'how': str,
+               'priority': int}`
+             priority は reference のみ意味を持つ（_DIFF_PRIORITY_LABELS。action は 0）。
 
     判定できないものは必ず action 側に倒す（見落とすより過剰報告を選ぶ）。
+    reference に落とすのは「実害が無いと言い切れる」ものだけ。
     """
     atype = item.get("asset_type", "")
     short = item.get("short_name", "")
     full = item.get("full_name", "")
     kind = atype.split("/", 1)[1] if "/" in atype else atype
 
-    def ref(why: str, how: str = "対応不要。") -> Dict[str, str]:
-        return {"level": "reference", "kind": kind, "why": why, "how": how}
+    def ref(why: str, how: str = "対応不要。", priority: int = 3) -> Dict[str, Any]:
+        return {"level": "reference", "kind": kind, "why": why, "how": how,
+                "priority": priority}
 
-    def act(why: str, how: str) -> Dict[str, str]:
-        return {"level": "action", "kind": kind, "why": why, "how": how}
+    def act(why: str, how: str) -> Dict[str, Any]:
+        return {"level": "action", "kind": kind, "why": why, "how": how, "priority": 0}
 
     if atype == "iam.googleapis.com/ServiceAccount":
         if not parse_user_managed_sa(short):
             return ref(
                 "default compute / appspot / Google 管理 service agent。dst には dst 自身の"
-                "プロジェクト番号を持つ同等 SA が既定で存在する（同名で作っても別物になる）。")
+                "プロジェクト番号を持つ同等 SA が既定で存在する（同名で作っても別物になる）。",
+                priority=3)
         if iam_sync_enabled:
             return ref(
                 "Step 5.7 iam_sync が dst に同名 SA を冪等作成し、src の project IAM ロールも"
                 "あわせて複製する。",
-                "dst.log の `[SA] ... を新規作成しました` を確認。無ければ `make run` を再実行。")
+                "dst.log の `[SA] ... を新規作成しました` を確認。無ければ `make run` を再実行。",
+                priority=1)
         return act(
             "steps.iam_sync.enabled=false のため、この SA を dst に作るステップが存在しない。",
             "iam_sync を有効化して `make run` するか、下記の create コマンドを手動実行。")
@@ -707,13 +742,15 @@ def classify_missing_asset(
         if role_id in _MIGRATION_TOOL_ROLE_IDS:
             return ref(
                 "移行ツール自身が bootstrap_cross_project.sh で src に作った借用 SA 用ロール。"
-                "移行後の dst 運用には不要。")
+                "移行後の dst 運用には不要。",
+                priority=3)
         role_name = full.split("//iam.googleapis.com/", 1)[-1] if full else ""
         if bound_custom_roles is not None and role_name and role_name not in bound_custom_roles:
             return ref(
                 "src の project IAM ポリシーで誰にも付与されていない（定義だけが残っている）。"
                 "複製しなくても src と dst で実効権限は変わらない。",
-                "バケット / データセット等リソース単位で付与している場合のみ手動複製。")
+                "バケット / データセット等リソース単位で付与している場合のみ手動複製。",
+                priority=2)
         return act(
             "src で SA に付与されているカスタムロール。dst に定義が無いと Step 5.7 が付与を"
             "スキップし、dst SA の権限が src より不足する。",
@@ -726,18 +763,42 @@ def classify_missing_asset(
                 "GCP が全プロジェクトに自動生成する既定リソース。dst にも既に存在し、create は"
                 "「already exists」で失敗する。",
                 "src で保持期間 / フィルタをカスタムしている場合のみ dst 側を "
-                "`gcloud logging buckets update` / `sinks update` で合わせる。")
+                "`gcloud logging buckets update` / `sinks update` で合わせる。",
+                priority=2)
         return act(
             "ユーザー定義のログルーティング設定。dst に無いとログの転送先 / 保持期間が src と"
             "変わる。",
             "src で `describe` した内容で下記の create コマンドを埋めて実行。")
 
     if atype == "compute.googleapis.com/Address":
+        # CAI の state（RESERVED / IN_USE）と IP 値から「実害が無いと言い切れる」ものだけ
+        # reference に落とす。state 不明 / 使用中の外部 IP は従来どおり action。
+        state = (item.get("state") or "").upper()
+        if short.startswith("nat-auto-ip-"):
+            return ref(
+                "Cloud NAT が自動割当した外部 IP。dst で NAT を構成すれば自動採番される"
+                "（system 生成名のため同名の手動作成は不可能かつ無意味）。",
+                priority=3)
+        if state == "RESERVED":
+            return ref(
+                "どのリソースにも使われていない予約（取り置き）。dst に無くても何も壊れない。",
+                "IP の取り置きを dst でも維持したい場合のみ下記 create コマンドで予約"
+                "（内部 IP は同じ値で予約可。外部 IP は値が変わる）。",
+                priority=2)
+        if state == "IN_USE" and gce_restore_enabled and _is_private_ip(item.get("ip_address")):
+            return ref(
+                "VM にアタッチ中の内部 IP。Step 5 gce_restore が同じ IP 値を dst に "
+                "`mig-<vm>-<ip>` 名で静的予約してアタッチする（予約リソース名が src と"
+                "異なるだけで機能は等価）。",
+                "dst.log の `内部IP予約 mig-...` / `private-network-ip=` を確認。"
+                "VM 以外（内部 LB 等）が使用している IP の場合のみ下記 create コマンドで"
+                "手動予約。",
+                priority=1)
         return act(
-            "bulk-export が Address を出力しないため dst に予約されない。src で使用中の"
-            "予約 IP は dst に存在せず、参照している VM / LB / DNS が壊れる。",
+            "使用中 (IN_USE) だが自動複製の担当が無い、または状態を判定できない予約 IP。"
+            "dst に同等の予約が無いと、参照しているリソースの静的 IP 前提が崩れる。",
             "src で `gcloud compute addresses describe <名前> --project=<src> "
-            "--format='value(address,status,users)'` を実行 → users が空でなければ下記の "
+            "--format='value(address,status,users)'` で用途を確認 → 必要なら下記の "
             "create コマンドで dst に予約（**IP 値は変わる**ので参照側の設定も更新）。")
 
     if item.get("coverage_step") == "<unknown>":
@@ -757,6 +818,7 @@ def analyze_cai_tf_diff(
     src_project: str, dst_project: str,
     iam_sync_enabled: bool = True,
     bound_custom_roles: Optional[set] = None,
+    gce_restore_enabled: bool = True,
 ) -> Dict[str, Any]:
     """CAI と terraform 出力を突合し、欠落リソースとリカバリコマンドを返す。
 
@@ -766,7 +828,8 @@ def analyze_cai_tf_diff(
                    先頭から順に資料を統合し、いずれかに resource が見つかれば「カバー済み」。
         src_project: src プロジェクト ID（ログ表示用）
         dst_project: dst プロジェクト ID（生成コマンドに埋め込む）
-        iam_sync_enabled / bound_custom_roles: classify_missing_asset に渡す判定材料
+        iam_sync_enabled / bound_custom_roles / gce_restore_enabled:
+                   classify_missing_asset に渡す判定材料
 
     Returns:
         {
@@ -836,6 +899,8 @@ def analyze_cai_tf_diff(
             "short_name": short,
             "full_name": full,
             "location": loc,
+            "state": r.get("state", ""),
+            "ip_address": r.get("ip_address", ""),
             "tf_resource_type": "/".join(tf_types) if tf_types else None,
             "coverage_step": coverage_step,
             "reason": reason,
@@ -844,6 +909,7 @@ def analyze_cai_tf_diff(
         entry.update(classify_missing_asset(
             entry, iam_sync_enabled=iam_sync_enabled,
             bound_custom_roles=bound_custom_roles,
+            gce_restore_enabled=gce_restore_enabled,
         ))
         missing.append(entry)
 
@@ -867,11 +933,12 @@ def _md_cell(text: str) -> str:
 
 def _diff_summary_rows(
     reports: List[Dict[str, Any]], level: str,
-) -> List[Tuple[str, str, str]]:
-    """missing を (dst, kind, why) でまとめ、(WHAT, WHY, HOW) の行に畳む。
+) -> List[Tuple[int, str, str, str]]:
+    """missing を (dst, kind, why) でまとめ、(priority, WHAT, WHY, HOW) の行に畳む。
 
     同じ理由の欠落が 1 プロジェクトに何十件も出る（Address 等）ため、件数と代表名
     だけをテーブルに載せ、個別の gcloud コマンドは詳細セクションへ譲る。
+    reference は priority 昇順（同順位は検出順を維持）でソートして返す。
     """
     groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     order: List[Tuple[str, str, str]] = []
@@ -882,11 +949,15 @@ def _diff_summary_rows(
                 continue
             key = (dst, m["kind"], m["why"])
             if key not in groups:
-                groups[key] = {"names": [], "how": m["how"]}
+                groups[key] = {"names": [], "how": m["how"],
+                               "priority": m.get("priority", 0)}
                 order.append(key)
             groups[key]["names"].append(m["short_name"])
 
-    rows: List[Tuple[str, str, str]] = []
+    if level == "reference":
+        order.sort(key=lambda k: groups[k]["priority"])
+
+    rows: List[Tuple[int, str, str, str]] = []
     for key in order:
         dst, kind, why = key
         names = groups[key]["names"]
@@ -894,7 +965,8 @@ def _diff_summary_rows(
         if len(names) > 3:
             shown += f" 他 {len(names) - 3} 件"
         what = f"`{dst}` の **{kind}** {len(names)} 件<br>{shown}"
-        rows.append((_md_cell(what), _md_cell(why), _md_cell(groups[key]["how"])))
+        rows.append((groups[key]["priority"], _md_cell(what), _md_cell(why),
+                     _md_cell(groups[key]["how"])))
     return rows
 
 
@@ -919,8 +991,8 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
     lines.append("")
     lines.append("Cloud Asset Inventory（CAI）が観測した src 側リソースのうち、")
     lines.append("bulk-export / terraform で自動再現されなかったものを、")
-    lines.append("**要対応**（dst に無いと実害があるもの）と **参考**（別ステップが処理済み /")
-    lines.append("dst に既定で存在する等、対応不要と判定したもの）に分けて記録します。")
+    lines.append("**要対応**（dst の動作に必要で、手動対応しないと実害が出るもの）と")
+    lines.append("**参考**（実害が無いと判定したもの。優先度順）に分けて記録します。")
     lines.append("")
     lines.append(
         f"- 要対応: **{action_total}** 件 / 参考: **{ref_total}** 件"
@@ -934,25 +1006,29 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
     else:
         lines.append("| WHAT（何が dst に無いか） | WHY（なぜ対応が必要か） | HOW（どう対応するか） |")
         lines.append("| --- | --- | --- |")
-        for what, why, how in action_rows:
+        for _p, what, why, how in action_rows:
             lines.append(f"| {what} | {why} | {how} |")
         lines.append("")
         lines.append("個別リソースの gcloud コマンドは「プロジェクト別 詳細」を参照してください。")
         lines.append("")
 
-    lines.append("## 参考（対応不要と判定したもの）")
+    lines.append("## 参考（実害なしと判定したもの / 優先度順）")
     lines.append("")
-    lines.append("記録として残しますが、放置して問題ありません。")
-    lines.append("判定が環境に合わない場合のみ、詳細のコマンドを使って手動対応してください。")
+    lines.append("記録として残しますが、放置して問題ありません。優先度の意味:")
+    lines.append("")
+    lines.append("- **1: 確認推奨** … 別ステップが自動対応済み。dst 側で結果を一度確認すると確実")
+    lines.append("- **2: 条件付き** … src 側にカスタムや取り置きの意図がある場合のみ手動対応")
+    lines.append("- **3: 対応不要** … どの環境でも何もしなくてよい")
     lines.append("")
     if not ref_rows:
         lines.append("該当なし。")
         lines.append("")
     else:
-        lines.append("| WHAT | 対応不要と判定した理由 | 補足 |")
-        lines.append("| --- | --- | --- |")
-        for what, why, how in ref_rows:
-            lines.append(f"| {what} | {why} | {how} |")
+        lines.append("| 優先度 | WHAT | 実害なしと判定した理由 | 補足 |")
+        lines.append("| --- | --- | --- | --- |")
+        for p, what, why, how in ref_rows:
+            label = _DIFF_PRIORITY_LABELS.get(p, "?")
+            lines.append(f"| {p}: {label} | {what} | {why} | {how} |")
         lines.append("")
 
     lines.append("なお、以下は差分としても数えていません（件数のみ集計）:")
@@ -1009,8 +1085,16 @@ def format_diff_report(reports: List[Dict[str, Any]]) -> str:
             sub: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
             for m in items:
                 sub.setdefault((m["level"], m["why"], m["how"]), []).append(m)
-            for (level, why, how), group in sub.items():
-                badge = "要対応" if level == "action" else "参考"
+            for (level, why, how), group in sorted(
+                sub.items(),
+                key=lambda kv: (kv[0][0] != "action",
+                                kv[1][0].get("priority", 0)),
+            ):
+                if level == "action":
+                    badge = "要対応"
+                else:
+                    p = group[0].get("priority", 0)
+                    badge = f"参考 / 優先度 {p}: {_DIFF_PRIORITY_LABELS.get(p, '?')}"
                 lines.append(f"##### [{badge}] {len(group)} 件")
                 lines.append("")
                 lines.append(f"- WHY: {why}")
@@ -2510,6 +2594,7 @@ resource "google_storage_bucket" "mock_bucket" {{
         # 要対応 / 参考 の分類材料。Step 5.7 が取得済みの src ポリシーを再利用し、
         # 未取得（iam_sync 無効 / 取得失敗）なら None を渡して安全側（要対応）に倒す。
         iam_sync_enabled = step_enabled(self.config.get('steps', {}), 'iam_sync')
+        gce_restore_enabled = step_enabled(self.config.get('steps', {}), 'gce_restore')
         bound_roles = (
             bound_custom_role_ids(self._src_iam_policies)
             if self._src_iam_policies else None
@@ -2535,6 +2620,7 @@ resource "google_storage_bucket" "mock_bucket" {{
                 dst_project=proj_map.get(src_proj, ""),
                 iam_sync_enabled=iam_sync_enabled,
                 bound_custom_roles=bound_roles,
+                gce_restore_enabled=gce_restore_enabled,
             )
             reports.append(report)
             self.org_logger.info(

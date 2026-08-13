@@ -134,13 +134,19 @@ make vmware-all # VMware → GCE フル処理
 ### DIFF.md の要対応 / 参考 分類（Step 99）
 
 - DIFF.md は放置すると 50 件超になり、**実際に手を動かす必要があるものが埋もれる**。`classify_missing_asset()` が欠落 1 件を `action` / `reference` に分け、`format_diff_report()` が先頭に **WHAT / WHY / HOW テーブル（action のみ）** → 参考テーブル → プロジェクト別詳細の順で出す。
+- **action は「dst の動作に必要で放置すると実害が出るもの」だけに絞る**。reference には優先度（`_DIFF_PRIORITY_LABELS`: 1=確認推奨〔別ステップが自動対応済み、結果確認のみ〕 / 2=条件付き〔src にカスタム・取り置きの意図がある場合のみ〕 / 3=対応不要）を付け、参考テーブルと詳細を**優先度昇順でソート**して出す。
 - reference に落とす条件（＝実害が無いと言い切れるものだけ）:
-  - user-managed SA … `iam_sync` 有効なら Step 5.7 が dst に作成 + ロール複製する（**無効なら action**）
-  - default compute / appspot / Google 管理 service agent … dst に dst 自身の番号を持つ同等物が既定で存在
-  - `_MANAGED_LOG_RESOURCE_NAMES`（`_Default` / `_Required`）… GCP 自動生成。create は「already exists」で失敗する
-  - `_MIGRATION_TOOL_ROLE_IDS`（`migrationSrcReader`）… 移行ツール自身が src に作った借用 SA 用ロール
-  - src の project IAM ポリシーで**誰にも付与されていない**カスタムロール（`bound_custom_role_ids()` で判定）
-- **判定材料が無い場合は必ず action に倒す**（`bound_custom_roles=None` 等）。見落とすより過剰報告を選ぶ。
+  - user-managed SA … `iam_sync` 有効なら Step 5.7 が dst に作成 + ロール複製する（**無効なら action**）→ P1
+  - default compute / appspot / Google 管理 service agent … dst に dst 自身の番号を持つ同等物が既定で存在 → P3
+  - `_MANAGED_LOG_RESOURCE_NAMES`（`_Default` / `_Required`）… GCP 自動生成。create は「already exists」で失敗する → P2
+  - `_MIGRATION_TOOL_ROLE_IDS`（`migrationSrcReader`）… 移行ツール自身が src に作った借用 SA 用ロール → P3
+  - src の project IAM ポリシーで**誰にも付与されていない**カスタムロール（`bound_custom_role_ids()` で判定）→ P2
+  - Address（CAI の `state` と `additionalAttributes.address` を `parse_cai_resources()` が拾って判定）:
+    - `nat-auto-ip-*` … Cloud NAT の自動割当。手動作成は不可能かつ無意味 → P3
+    - `state=RESERVED` … 未使用の取り置き。dst に無くても壊れない → P2
+    - `state=IN_USE` の**内部** IP（RFC1918 判定）+ `gce_restore` 有効 … Step 5 が同じ IP を `mig-<vm>-<ip>` 名で dst に静的予約するため機能等価 → P1
+    - `state` 不明 / 使用中の**外部** IP（nat-auto 以外）は action のまま
+- **判定材料が無い場合は必ず action に倒す**（`bound_custom_roles=None`、Address の `state` 欠落等）。見落とすより過剰報告を選ぶ。
 - カスタムロールの付与判定は `step_iam_sync` が取った src ポリシー（`self._src_iam_policies`）の再利用。iam_sync 無効時は取得されず `None` → 全カスタムロールが action になる（意図どおり）。
 - 分類は純粋関数なのでテストは直接叩く（`TestClassifyMissingAsset` / `TestBoundCustomRoleIds`）。**新しい「実は対応不要」パターンを見つけたら reference 条件に足す**。逆に判断が付かないものを reference に入れてはいけない。
 

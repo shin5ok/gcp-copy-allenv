@@ -1348,6 +1348,26 @@ class TestParseCaiResources:
     def test_missing_file_returns_empty(self, temp_dir):
         assert parse_cai_resources(os.path.join(temp_dir, "nope.txt")) == []
 
+    def test_captures_state_and_ip_address(self, temp_dir):
+        sample = (
+            "---\n"
+            "additionalAttributes:\n"
+            "  address: 10.100.1.203\n"
+            "assetType: compute.googleapis.com/Address\n"
+            "location: asia-northeast1\n"
+            "name: //compute.googleapis.com/projects/src-host/regions/"
+            "asia-northeast1/addresses/svc1-fix1\n"
+            "project: projects/100\n"
+            "state: RESERVED\n"
+        )
+        path = os.path.join(temp_dir, "cai_addr.txt")
+        _write(path, sample)
+        rs = parse_cai_resources(path)
+        assert len(rs) == 1
+        assert rs[0]["short_name"] == "svc1-fix1"
+        assert rs[0]["state"] == "RESERVED"
+        assert rs[0]["ip_address"] == "10.100.1.203"
+
 
 class TestParseTfResources:
     def test_parses_resource_blocks(self, temp_dir):
@@ -1478,15 +1498,49 @@ class TestAnalyzeCaiTfDiff:
         assert "## 要対応" in md
         assert "| WHAT（何が dst に無いか） | WHY（なぜ対応が必要か） | HOW（どう対応するか） |" in md
         assert md.index("## 要対応") < md.index("## プロジェクト別 詳細")
-        assert "## 参考（対応不要と判定したもの）" in md
+        assert "## 参考（実害なしと判定したもの / 優先度順）" in md
+
+
+class TestDiffReferencePrioritySort:
+    def _entry(self, kind, name, priority, why):
+        return {
+            "asset_type": f"x.googleapis.com/{kind}", "short_name": name,
+            "full_name": f"//x/{name}", "location": "global",
+            "state": "", "ip_address": "",
+            "tf_resource_type": None, "coverage_step": "terraform_apply",
+            "reason": "r", "commands": ["echo x"],
+            "level": "reference", "kind": kind, "why": why, "how": "h",
+            "priority": priority,
+        }
+
+    def test_reference_rows_sorted_by_priority(self):
+        report = {
+            "src_project": "s", "dst_project": "d",
+            "cai_total": 3, "tf_total": 0, "covered": 0, "auto_handled": 0,
+            "missing": [
+                self._entry("KindC", "c1", 3, "why-p3"),
+                self._entry("KindA", "a1", 1, "why-p1"),
+                self._entry("KindB", "b1", 2, "why-p2"),
+            ],
+            "action_total": 0, "unknown_types": [],
+        }
+        md = format_diff_report([report])
+        assert "| 優先度 | WHAT |" in md
+        # 検出順 (3,1,2) ではなく優先度昇順 (1,2,3) で並ぶ
+        assert md.index("why-p1") < md.index("why-p2") < md.index("why-p3")
+        assert "1: 確認推奨" in md
+        assert "2: 条件付き" in md
+        assert "3: 対応不要" in md
 
 
 class TestClassifyMissingAsset:
-    def _item(self, atype, short, full="", coverage_step="terraform_apply"):
+    def _item(self, atype, short, full="", coverage_step="terraform_apply",
+              state="", ip_address=""):
         return {
             "asset_type": atype, "short_name": short,
             "full_name": full or f"//x/{short}", "location": "global",
             "coverage_step": coverage_step, "reason": "bulk-export が出力しなかった",
+            "state": state, "ip_address": ip_address,
         }
 
     def test_user_managed_sa_is_reference_when_iam_sync_enabled(self):
@@ -1546,12 +1600,70 @@ class TestClassifyMissingAsset:
         assert classify_missing_asset(self._item(
             "logging.googleapis.com/LogSink", "audit-to-bq"))["level"] == "action"
 
-    def test_address_and_unknown_type_are_action(self):
+    def test_address_without_state_and_unknown_type_are_action(self):
+        # state 不明の Address は判定材料なし → 安全側 (action)
         assert classify_missing_asset(self._item(
             "compute.googleapis.com/Address", "svc1-ip"))["level"] == "action"
         assert classify_missing_asset(self._item(
             "fake.googleapis.com/Unknown", "x",
             coverage_step="<unknown>"))["level"] == "action"
+
+    def test_nat_auto_ip_address_is_reference(self):
+        c = classify_missing_asset(self._item(
+            "compute.googleapis.com/Address", "nat-auto-ip-10281266-0-178655",
+            state="IN_USE", ip_address="34.84.246.19"))
+        assert c["level"] == "reference"
+        assert c["priority"] == 3
+
+    def test_reserved_address_is_reference(self):
+        # 内部 / 外部どちらも RESERVED（未使用の取り置き）なら実害なし
+        for ip in ("10.100.1.203", "34.84.204.112"):
+            c = classify_missing_asset(self._item(
+                "compute.googleapis.com/Address", "parked", state="RESERVED",
+                ip_address=ip))
+            assert c["level"] == "reference"
+            assert c["priority"] == 2
+
+    def test_in_use_internal_address_follows_gce_restore(self):
+        item = self._item("compute.googleapis.com/Address", "vm1-ip",
+                          state="IN_USE", ip_address="10.100.1.11")
+        c = classify_missing_asset(item, gce_restore_enabled=True)
+        assert c["level"] == "reference"
+        assert c["priority"] == 1
+        assert "mig-" in c["why"]
+        # gce_restore 無効なら内部 IP を予約するステップが無い → action
+        assert classify_missing_asset(
+            item, gce_restore_enabled=False)["level"] == "action"
+
+    def test_in_use_external_address_is_action(self):
+        # 使用中の外部 IP（nat-auto 以外）は静的 IP 前提が崩れるので action のまま
+        c = classify_missing_asset(self._item(
+            "compute.googleapis.com/Address", "lb-ip",
+            state="IN_USE", ip_address="34.84.204.112"))
+        assert c["level"] == "action"
+
+    def test_reference_priorities_of_existing_branches(self):
+        # iam_sync が対応する SA = 1 / 既定ログリソース・未付与ロール = 2 / 完全不要 = 3
+        sa = classify_missing_asset(self._item(
+            "iam.googleapis.com/ServiceAccount",
+            "editor@src-svc.iam.gserviceaccount.com"), iam_sync_enabled=True)
+        assert sa["priority"] == 1
+        log = classify_missing_asset(self._item(
+            "logging.googleapis.com/LogBucket", "_Default"))
+        assert log["priority"] == 2
+        unbound = classify_missing_asset(self._item(
+            "iam.googleapis.com/Role", "incre2",
+            "//iam.googleapis.com/projects/src-svc/roles/incre2"),
+            bound_custom_roles={"projects/src-svc/roles/Other"})
+        assert unbound["priority"] == 2
+        default_sa = classify_missing_asset(self._item(
+            "iam.googleapis.com/ServiceAccount",
+            "1234567890-compute@developer.gserviceaccount.com"))
+        assert default_sa["priority"] == 3
+        tool_role = classify_missing_asset(self._item(
+            "iam.googleapis.com/Role", "migrationSrcReader",
+            "//iam.googleapis.com/projects/src-svc/roles/migrationSrcReader"))
+        assert tool_role["priority"] == 3
 
 
 class TestBoundCustomRoleIds:
