@@ -1,5 +1,6 @@
 import pytest
 import os
+import re
 import json
 import tempfile
 import shutil
@@ -34,10 +35,29 @@ from scripts.sync_env import (
     build_iam_replication_plan,
     is_gke_node_vm,
     is_gke_managed_name,
+    is_gke_managed_fw_rule,
+    has_k8s_owner_marker,
+    is_k8s_lb_resource_name,
+    import_error_kind,
+    coerce_nonneg_int,
+    is_api_disabled_error,
+    parse_run_services_list,
+    run_service_public_invoker_members,
+    tf_type_kept,
+    resource_type_filter_reason,
+    cai_in_use_internal_addresses,
+    parse_krm_kinds,
+    _first_meaningful_line,
+    _CAI_TO_TF_RESOURCE,
+    _BASE_DST_APIS,
     api_from_asset_type,
     cai_api_hints,
     build_api_enable_plan,
     tf_type_to_api,
+    tf_blocks_of_type,
+    ensure_tf_resource_arg,
+    parse_ar_repositories,
+    build_ar_image_copy_plan,
     dedupe_tf_resource_labels,
     strip_hcl_blocks,
     customize_note_row,
@@ -3623,10 +3643,10 @@ class TestDedupeTfResourceLabels:
             'resource "google_artifact_registry_repository" "repo" {\n}\n',
             "asia-northeast1", seen)
         assert r1 == [] and '"repo"' in c1
-        assert ("google_artifact_registry_repository", "repo") in seen
+        assert ("resource", "google_artifact_registry_repository", "repo") in seen
 
     def test_collision_gets_location_suffix_and_import_comment_follows(self):
-        seen = {("google_artifact_registry_repository", "repo")}
+        seen = {("resource", "google_artifact_registry_repository", "repo")}
         content = (
             'resource "google_artifact_registry_repository" "repo" {\n'
             '  location = "us-central1"\n'
@@ -3637,21 +3657,21 @@ class TestDedupeTfResourceLabels:
         assert renames == [("google_artifact_registry_repository", "repo", "repo_us_central1")]
         assert 'resource "google_artifact_registry_repository" "repo_us_central1"' in out
         assert "google_artifact_registry_repository.repo_us_central1 projects/p" in out
-        assert ("google_artifact_registry_repository", "repo_us_central1") in seen
+        assert ("resource", "google_artifact_registry_repository", "repo_us_central1") in seen
 
     def test_same_discriminator_falls_back_to_counter(self):
-        seen = {("t", "x"), ("t", "x_loc")}
+        seen = {("resource", "t", "x"), ("resource", "t", "x_loc")}
         out, renames = dedupe_tf_resource_labels('resource "t" "x" {}\n', "loc", seen)
         assert renames == [("t", "x", "x_loc_2")]
 
     def test_different_type_same_label_is_not_a_collision(self):
-        seen = {("google_storage_bucket", "repo")}
+        seen = {("resource", "google_storage_bucket", "repo")}
         _out, renames = dedupe_tf_resource_labels(
             'resource "google_artifact_registry_repository" "repo" {}\n', "loc", seen)
         assert renames == []
 
     def test_empty_discriminator_uses_dup(self):
-        seen = {("t", "x")}
+        seen = {("resource", "t", "x")}
         _out, renames = dedupe_tf_resource_labels('resource "t" "x" {}\n', "", seen)
         assert renames == [("t", "x", "x_dup")]
 
@@ -4015,3 +4035,2417 @@ class TestDiffReportManualNotesSection:
         assert "customize による補正・スキップ" not in md
         md2 = format_diff_report([self._report()])
         assert "customize による補正・スキップ" not in md2
+
+
+# ============================================================
+# subnetwork 参照の terraform 参照化 / Container Analysis occurrence の除外
+# ============================================================
+class TestTfBlocksOfType:
+    def test_nested_blocks_are_included_in_body(self):
+        content = (
+            'resource "google_compute_subnetwork" "tokyo" {\n'
+            '  name = "tokyo"\n'
+            '  secondary_ip_range {\n'
+            '    range_name = "pods"\n'
+            '  }\n'
+            '  region = "asia-northeast1"\n'
+            '}\n'
+        )
+        blocks = tf_blocks_of_type(content, "google_compute_subnetwork")
+        assert len(blocks) == 1
+        label, body = blocks[0]
+        assert label == "tokyo"
+        # ネストブロックの後ろにある region まで body に含まれる
+        assert 'region = "asia-northeast1"' in body
+        assert 'range_name = "pods"' in body
+
+    def test_other_types_and_empty(self):
+        assert tf_blocks_of_type('resource "google_compute_network" "n" {}\n',
+                                 "google_compute_subnetwork") == []
+        assert tf_blocks_of_type("", "google_compute_subnetwork") == []
+
+
+class TestRewriteSubnetRefs:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        return o
+
+    def _root(self, temp_dir, subnet_label="tokyo", subnet_project="dst-host"):
+        root = os.path.join(temp_dir, "active", "src-host")
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "subnet.tf"), "w", encoding="utf-8") as f:
+            f.write(
+                f'resource "google_compute_subnetwork" "{subnet_label}" {{\n'
+                f'  name    = "tokyo"\n'
+                f'  project = "{subnet_project}"\n'
+                f'  region  = "asia-northeast1"\n'
+                '}\n'
+            )
+        with open(os.path.join(root, "address.tf"), "w", encoding="utf-8") as f:
+            f.write(
+                'resource "google_compute_address" "a" {\n'
+                '  name       = "fix-tokyo1"\n'
+                '  project    = "dst-host"\n'
+                '  subnetwork = "https://www.googleapis.com/compute/v1/projects/'
+                'dst-host/regions/asia-northeast1/subnetworks/tokyo"\n'
+                '}\n'
+                '# terraform import google_compute_address.a '
+                'projects/dst-host/regions/asia-northeast1/addresses/fix-tokyo1\n'
+            )
+        return root
+
+    def test_same_root_subnet_url_becomes_reference(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        o._rewrite_subnet_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "address.tf"), encoding="utf-8").read()
+        assert "subnetwork = google_compute_subnetwork.tokyo.self_link" in out
+        # import コメントの URL 形式でないパスは触らない
+        assert ("# terraform import google_compute_address.a "
+                "projects/dst-host/regions/asia-northeast1/addresses/fix-tokyo1") in out
+
+    def test_renamed_label_is_followed(self, temp_dir):
+        # dedupe で改名されたラベルでも、確定後の active を読むので追従する
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir, subnet_label="tokyo_us_central1")
+        o._rewrite_subnet_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "address.tf"), encoding="utf-8").read()
+        assert "google_compute_subnetwork.tokyo_us_central1.self_link" in out
+
+    def test_cross_project_subnet_url_is_left_alone(self, temp_dir):
+        # 別ルート（Shared VPC host）の subnet は解決できないので URL のまま
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir, subnet_project="other-host")
+        o._rewrite_subnet_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "address.tf"), encoding="utf-8").read()
+        assert "https://www.googleapis.com/compute/v1/projects/dst-host" in out
+        assert "google_compute_subnetwork." not in out
+
+
+class TestContainerAnalysisOccurrenceSkip:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_occurrence_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        reason = o._skip_reason_for_file(
+            'resource "google_container_analysis_occurrence" "x" {\n'
+            '  note_name = "projects/p/notes/built-by-cloud-build"\n'
+            '}\n')
+        assert reason and "occurrence" in reason
+
+    def test_note_and_pubsub_topic_are_kept(self, temp_dir):
+        o = self._setup(temp_dir)
+        assert o._skip_reason_for_file(
+            'resource "google_container_analysis_note" "n" {}\n') is None
+        assert o._skip_reason_for_file(
+            'resource "google_pubsub_topic" "t" {\n'
+            '  name = "container-analysis-occurrences-v1"\n}\n') is None
+
+
+class TestCustomizeNoteDedupe:
+    def test_identical_notes_collapse(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o._customize_notes = []
+        body = 'resource "google_container_analysis_occurrence" "x" {\n  project = "dst-p"\n}\n'
+        for i in range(3):
+            o._add_customize_note("container_analysis_occurrence", body, f"src/f{i}.tf")
+        assert len(o._customize_notes) == 1
+
+    def test_occurrence_note_row_is_confirmation(self):
+        kind, target, why, how = customize_note_row(
+            {"kind": "container_analysis_occurrence", "resource": "?", "project": "dst-p"})
+        assert kind == "確認"
+        assert "dst-p" in target and "note" in why and "再ビルド" in how
+
+
+# ============================================================
+# deletion_protection の補完 / Artifact Registry イメージ複製
+# ============================================================
+class TestEnsureTfResourceArg:
+    def test_missing_arg_is_inserted(self):
+        content = (
+            'resource "google_cloud_run_v2_service" "svc" {\n'
+            '  name = "svc"\n'
+            '}\n'
+        )
+        out, added = ensure_tf_resource_arg(
+            content, "google_cloud_run_v2_service", "deletion_protection = false")
+        assert added == ["svc"]
+        assert '  deletion_protection = false\n  name = "svc"' in out
+
+    def test_existing_arg_is_untouched(self):
+        content = (
+            'resource "google_container_cluster" "c" {\n'
+            '  deletion_protection = true\n'
+            '}\n'
+        )
+        out, added = ensure_tf_resource_arg(
+            content, "google_container_cluster", "deletion_protection = false")
+        assert added == [] and "deletion_protection = true" in out
+
+    def test_nested_block_arg_does_not_count_as_present(self):
+        # ネストブロック内の同名引数を「あり」と誤判定しない
+        content = (
+            'resource "google_container_cluster" "c" {\n'
+            '  node_config {\n'
+            '    deletion_protection = true\n'
+            '  }\n'
+            '}\n'
+        )
+        _out, added = ensure_tf_resource_arg(
+            content, "google_container_cluster", "deletion_protection = false")
+        assert added == ["c"]
+
+    def test_other_types_untouched(self):
+        content = 'resource "google_storage_bucket" "b" {\n}\n'
+        out, added = ensure_tf_resource_arg(
+            content, "google_cloud_run_v2_service", "deletion_protection = false")
+        assert added == [] and out == content
+
+
+class TestParseArRepositories:
+    def test_docker_only_and_sorted(self):
+        text = json.dumps([
+            {"name": "projects/p/locations/us-central1/repositories/b", "format": "DOCKER"},
+            {"name": "projects/p/locations/asia-northeast1/repositories/a", "format": "DOCKER"},
+            {"name": "projects/p/locations/asia-northeast1/repositories/py", "format": "PYTHON"},
+        ])
+        got = parse_ar_repositories(text)
+        assert [(r["location"], r["repo"]) for r in got] == [
+            ("asia-northeast1", "a"), ("us-central1", "b")]
+
+    def test_broken_input_is_empty(self):
+        assert parse_ar_repositories(None) == []
+        assert parse_ar_repositories("not json") == []
+        assert parse_ar_repositories(json.dumps([{"name": "bad", "format": "DOCKER"}])) == []
+
+
+class TestBuildArImageCopyPlan:
+    def _images(self, **over):
+        base = {
+            "package": "asia-northeast1-docker.pkg.dev/src-p/repo/app",
+            "version": "sha256:" + "ab" * 32,
+            "tags": ["latest", "v1"],
+        }
+        base.update(over)
+        return json.dumps([base])
+
+    def test_project_segment_is_replaced(self):
+        plan = build_ar_image_copy_plan(self._images(), "src-p", "dst-p")
+        assert len(plan) == 1
+        e = plan[0]
+        assert e["src_ref"] == "asia-northeast1-docker.pkg.dev/src-p/repo/app@sha256:" + "ab" * 32
+        assert e["dst_pkg"] == "asia-northeast1-docker.pkg.dev/dst-p/repo/app"
+        assert e["tags"] == ["latest", "v1"]
+
+    def test_image_name_containing_project_id_is_not_mangled(self):
+        # project 部だけを差し替える（イメージ名に src ID が入っていても壊さない）
+        plan = build_ar_image_copy_plan(
+            self._images(package="asia-northeast1-docker.pkg.dev/src-p/repo/src-p-api"),
+            "src-p", "dst-p")
+        assert plan[0]["dst_pkg"] == "asia-northeast1-docker.pkg.dev/dst-p/repo/src-p-api"
+
+    def test_comma_string_tags_are_split(self):
+        plan = build_ar_image_copy_plan(self._images(tags="a,b"), "src-p", "dst-p")
+        assert plan[0]["tags"] == ["a", "b"]
+
+    def test_untagged_image_is_kept(self):
+        plan = build_ar_image_copy_plan(self._images(tags=[]), "src-p", "dst-p")
+        assert plan[0]["tags"] == []
+
+    def test_invalid_digest_or_foreign_project_is_dropped(self):
+        assert build_ar_image_copy_plan(self._images(version="latest"), "src-p", "dst-p") == []
+        assert build_ar_image_copy_plan(self._images(), "other-p", "dst-p") == []
+
+    def test_duplicate_entries_collapse(self):
+        one = json.loads(self._images())[0]
+        plan = build_ar_image_copy_plan(json.dumps([one, one]), "src-p", "dst-p")
+        assert len(plan) == 1
+
+
+class TestArSyncGuards:
+    def _orch(self, temp_dir, steps=None):
+        cfg = _full_config(temp_dir, steps=steps or {})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def test_disabled_by_config(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, steps={
+            "data_sync": {"enabled": True, "artifact_registry": {"enabled": False}}})
+        with patch.object(o, "_soft_run") as soft, \
+             patch.object(o, "_collect_ar_copy_work") as collect:
+            o.step_artifact_registry()
+        assert soft.call_count == 0 and collect.call_count == 0
+
+    def test_src_list_command_is_read_only_and_mock_known(self):
+        cmd = ("gcloud artifacts repositories list --project=p --format=json --quiet")
+        assert is_src_read_only(cmd) and is_known_mock_command(cmd)
+        cmd2 = "gcloud artifacts docker images list host/p/r --include-tags --format=json --quiet"
+        assert is_src_read_only(cmd2) and is_known_mock_command(cmd2)
+
+    def test_write_commands_are_rejected_on_src(self):
+        assert not is_src_read_only("docker push host/p/r/img:latest")
+        assert not is_src_read_only("gcloud artifacts repositories create r --location=l")
+
+
+# ============================================================
+# k8s 所有者マーカー / GKE FW 判定 / import 失敗分類 ほか（レビュー修正）
+# ============================================================
+class TestK8sOwnerMarker:
+    TP = (
+        'resource "google_compute_target_pool" "a0cb2a7138c8b475e8f1de09dc442b6a" {\n'
+        '  description      = "{\\"kubernetes.io/service-name\\":\\"default/frontend-external\\"}"\n'
+        '  health_checks    = ["https://.../httpHealthChecks/k8s-aa49baa47b628c78-node"]\n'
+        '  name             = "a0cb2a7138c8b475e8f1de09dc442b6a"\n'
+        '}\n'
+    )
+
+    def test_marker_detection(self):
+        assert has_k8s_owner_marker(self.TP)
+        assert not has_k8s_owner_marker(
+            'resource "google_compute_target_pool" "t" {\n'
+            '  description = "my pool"\n  name = "user-pool"\n}\n')
+
+    def test_lb_name_detection(self):
+        assert is_k8s_lb_resource_name("a0cb2a7138c8b475e8f1de09dc442b6a")
+        assert not is_k8s_lb_resource_name("user-pool")
+        assert not is_k8s_lb_resource_name("a0cb")
+        assert not is_k8s_lb_resource_name(None)
+
+
+class TestK8sLbResourcesSkipped:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_hex_named_target_pool_with_marker_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        reason = o._skip_reason_for_file(TestK8sOwnerMarker.TP)
+        assert reason and "kubernetes.io" in reason
+
+    def test_forwarding_rule_with_marker_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_compute_forwarding_rule" "a0cb2a7138c8b475e8f1de09dc442b6a" {\n'
+            '  description = "{\\"kubernetes.io/service-name\\":\\"default/frontend-external\\"}"\n'
+            '  name        = "a0cb2a7138c8b475e8f1de09dc442b6a"\n'
+            '}\n'
+        )
+        assert o._skip_reason_for_file(content)
+
+    def test_user_forwarding_rule_without_marker_is_kept(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_compute_forwarding_rule" "lb" {\n'
+            '  name = "my-app-lb"\n'
+            '}\n'
+        )
+        assert o._skip_reason_for_file(content) is None
+
+    def test_user_target_pool_without_marker_is_kept(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_compute_target_pool" "t" {\n'
+            '  name = "user-pool"\n'
+            '}\n'
+        )
+        assert o._skip_reason_for_file(content) is None
+
+
+class TestIsGkeManagedFwRule:
+    def test_marker_wins(self):
+        assert is_gke_managed_fw_rule({
+            "name": "anything",
+            "description": '{"kubernetes.io/service-name":"default/web"}'})
+
+    def test_gke_core_structural_names(self):
+        for n in ("gke-my-ec-cluster-fd56f6a4-vms", "gke-c1-1234abcd-all",
+                  "gk3-ap-cluster-0a1b2c3d-master"):
+            assert is_gke_managed_fw_rule({"name": n}), n
+
+    def test_k8s_hex_structural_names(self):
+        for n in ("k8s-fw-a1b2c3", "k8s-fw-a0cb2a7138c8b475e8f1de09dc442b6a-deny",
+                  "k8s-aa49baa47b628c78-node-http-hc"):
+            assert is_gke_managed_fw_rule({"name": n}), n
+
+    def test_user_rules_with_gke_like_prefix_are_kept(self):
+        # 接頭辞は GKE 風でも構造ハッシュ・マーカーが無ければ利用者ルール
+        for n in ("k8s-nodeport-allow", "gke-admin-bastion", "k8s-deny-all"):
+            assert not is_gke_managed_fw_rule({"name": n}), n
+
+
+class TestImportErrorKind:
+    def test_already_managed(self):
+        assert import_error_kind("Error: Resource already managed by Terraform") == "already"
+
+    def test_missing_variants(self):
+        for t in ("Error: Cannot import non-existent remote object",
+                  "googleapi: Error 404: Not found: projects/p/locations/l/clusters/c",
+                  "Error 404: The resource 'x' was not found, notFound",
+                  'note with ID "x" for project "p" does not exist'):
+            assert import_error_kind(t) == "missing", t
+
+    def test_real_failures_are_none(self):
+        assert import_error_kind("Error 403: Permission denied") is None
+        assert import_error_kind("") is None
+
+
+class TestCoerceNonnegInt:
+    def test_values(self):
+        assert coerce_nonneg_int(30, 120) == 30
+        assert coerce_nonneg_int("45", 120) == 45
+        assert coerce_nonneg_int(0, 120) == 0
+        assert coerce_nonneg_int("2m", 120) == 120
+        assert coerce_nonneg_int(None, 120) == 120
+        assert coerce_nonneg_int(-5, 120) == 120
+
+
+class TestBaseApisProtected:
+    def test_skip_apis_cannot_remove_base(self):
+        plan = build_api_enable_plan(
+            [], [], {}, skip_apis=list(_BASE_DST_APIS))
+        for api in _BASE_DST_APIS:
+            assert api in plan
+
+
+class TestCaiToTfRegionVariants:
+    def test_neg_and_template_variants(self):
+        negs = _CAI_TO_TF_RESOURCE["compute.googleapis.com/NetworkEndpointGroup"]
+        assert "google_compute_region_network_endpoint_group" in negs
+        assert "google_compute_global_network_endpoint_group" in negs
+        tpls = _CAI_TO_TF_RESOURCE["compute.googleapis.com/InstanceTemplate"]
+        assert "google_compute_region_instance_template" in tpls
+
+    def test_lb_types_registered(self):
+        for atype in ("compute.googleapis.com/TargetPool",
+                      "compute.googleapis.com/HttpHealthCheck",
+                      "compute.googleapis.com/ForwardingRule",
+                      "compute.googleapis.com/Autoscaler"):
+            assert atype in _CAI_TO_TF_RESOURCE
+            assert atype in _ASSET_COVERAGE
+
+
+class TestClassifyK8sLbAsReference:
+    def _item(self, atype, name):
+        return {"asset_type": atype, "short_name": name, "name": name,
+                "coverage_step": "terraform_apply", "reason": ""}
+
+    def test_hex_named_target_pool_is_reference(self):
+        got = classify_missing_asset(self._item(
+            "compute.googleapis.com/TargetPool", "a0cb2a7138c8b475e8f1de09dc442b6a"))
+        assert got["level"] == "reference" and got["priority"] == 3
+
+    def test_user_named_target_pool_is_action(self):
+        got = classify_missing_asset(self._item(
+            "compute.googleapis.com/TargetPool", "user-pool"))
+        assert got["level"] == "action"
+
+
+class TestFixProviderCompatRegionBackendService:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        o._customize_notes = []
+        return o
+
+    def test_region_backend_service_iap_gets_enabled(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_compute_region_backend_service" "b" {\n'
+            '  iap {\n'
+            '    oauth2_client_id = "xxx"\n'
+            '  }\n'
+            '  name = "b"\n'
+            '}\n'
+        )
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "enabled = true" in out
+
+
+class TestMockLabelNoFalsePositive:
+    def test_real_resource_named_mock_bucket_is_not_flagged(self, temp_dir):
+        # 実在しうるバケット名 "mock_bucket"（name 属性）は mock 残骸ではない
+        with open(os.path.join(temp_dir, "b.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_storage_bucket" "user_data" {\n'
+                    '  name = "mock_bucket"\n}\n')
+        assert not tf_dir_has_mock_artifacts(temp_dir)
+
+    def test_declaration_label_is_still_flagged(self, temp_dir):
+        with open(os.path.join(temp_dir, "b.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_storage_bucket" "mock_bucket" {\n'
+                    '  name = "org-bucket-shared-data"\n}\n')
+        assert tf_dir_has_mock_artifacts(temp_dir)
+
+
+class TestNonUtf8TfFiles:
+    def test_readers_survive_binary_bytes(self, temp_dir):
+        with open(os.path.join(temp_dir, "x.tf"), "wb") as f:
+            f.write(b'resource "google_container_cluster" "c" {\n'
+                    b'  metadata = "\xff\xfe broken"\n}\n')
+        assert tf_required_apis(temp_dir) == ["container.googleapis.com"]
+        assert tf_dir_has_mock_artifacts(temp_dir) is False
+
+
+class TestDedupeSameFileCollision:
+    def test_sibling_label_equal_to_target_stays_unique(self):
+        # 同一ファイルに x と x_asia が並ぶ場合でも全ラベルが一意に保たれる
+        seen = {("resource", "google_x", "cloud_run")}
+        content = (
+            'resource "google_x" "cloud_run" {}\n'
+            '# terraform import google_x.cloud_run id1\n'
+            'resource "google_x" "cloud_run_asia" {}\n'
+            '# terraform import google_x.cloud_run_asia id2\n'
+        )
+        out, renames = dedupe_tf_resource_labels(content, "asia", seen)
+        labels = re.findall(r'resource "google_x" "([^"]+)"', out)
+        assert len(labels) == 2 and len(set(labels)) == 2, labels
+        # import コメントも宣言と同じラベルを指している
+        for lbl in labels:
+            assert f"google_x.{lbl} id" in out
+
+    def test_data_blocks_are_deduped(self):
+        seen = set()
+        c1 = 'data "google_project" "project" {}\n'
+        c2 = ('data "google_project" "project" {}\n'
+              'resource "google_x" "r" {\n'
+              '  num = data.google_project.project.number\n'
+              '}\n')
+        _o1, r1 = dedupe_tf_resource_labels(c1, "loc-a", seen)
+        out2, r2 = dedupe_tf_resource_labels(c2, "loc-b", seen)
+        assert r1 == [] and len(r2) == 1
+        assert 'data "google_project" "project_loc_b"' in out2
+        # ファイル内参照も追従する
+        assert "data.google_project.project_loc_b.number" in out2
+
+    def test_data_and_resource_namespaces_are_separate(self):
+        seen = set()
+        content = ('resource "google_project" "p" {}\n'
+                   'data "google_project" "p" {}\n')
+        _out, renames = dedupe_tf_resource_labels(content, "loc", seen)
+        assert renames == []
+
+
+# ============================================================
+# AR 未使用 src の soft fail / エラー行抽出
+# ============================================================
+class TestFirstMeaningfulLine:
+    GCLOUD_403 = (
+        "ERROR: (gcloud.artifacts.repositories.list) [a@b.com] does not have permission "
+        "to access projects instance [p]: Artifact Registry API has not been used in "
+        "project p before or it is disabled.\n"
+        "Google developers console API activation\n"
+        "https://console.developers.google.com/apis/api/artifactregistry.googleapis.com\n"
+        "- '@type': type.googleapis.com/google.rpc.ErrorInfo\n"
+        "  domain: googleapis.com\n"
+        "  metadata:\n"
+        "    service: artifactregistry.googleapis.com\n"
+    )
+
+    def test_gcloud_uppercase_error_wins_over_errorinfo_detail(self):
+        got = _first_meaningful_line(self.GCLOUD_403, "")
+        assert got.startswith("ERROR: (gcloud.artifacts.repositories.list)")
+        assert "@type" not in got
+
+    def test_terraform_error_line(self):
+        got = _first_meaningful_line("│ Error: googleapi: Error 403: denied", "")
+        assert got == "Error: googleapi: Error 403: denied"
+
+    def test_warning_lines_are_skipped(self):
+        got = _first_meaningful_line("WARNING: impersonation in use\nplain message", "")
+        assert got == "plain message"
+
+
+class TestIsApiDisabledError:
+    def test_service_disabled_variants(self):
+        assert is_api_disabled_error(
+            "Artifact Registry API has not been used in project p before or it is disabled")
+        assert is_api_disabled_error("SERVICE_DISABLED")
+        assert not is_api_disabled_error("PERMISSION_DENIED: caller lacks permission")
+        assert not is_api_disabled_error("")
+
+
+class TestArSyncSoftFail:
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir, steps={"data_sync": {"enabled": True}})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def test_api_disabled_src_does_not_fail_the_run(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            return 1, "", TestFirstMeaningfulLine.GCLOUD_403
+
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "run_command") as rc:
+            got = o._collect_ar_copy_work("src-p", "dst-p", None, None)
+
+        # soft fail: failed に積まない / run_command（failed 計上経路）も使わない
+        assert got == []
+        assert o.stats.failed == 0
+        assert rc.call_count == 0
+
+    def test_repo_listing_failure_other_than_api_disabled_warns_only(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            return 1, "", "ERROR: PERMISSION_DENIED"
+
+        with patch.object(o, "_soft_run", side_effect=_soft):
+            got = o._collect_ar_copy_work("src-p", "dst-p", None, None)
+        assert got == [] and o.stats.failed == 0
+
+    def test_image_listing_failure_skips_repo_only(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        repos = json.dumps([{"name": "projects/src-p/locations/asia-northeast1"
+                                     "/repositories/r", "format": "DOCKER"}])
+        calls = []
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            calls.append(cmd)
+            if cmd.startswith("gcloud artifacts repositories list"):
+                return 0, repos, ""
+            if cmd.startswith("gcloud artifacts docker images list"):
+                return 1, "", "ERROR: something broke"
+            return 0, "", ""
+
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_gcloud_exists", return_value=True):
+            got = o._collect_ar_copy_work("src-p", "dst-p", None, None)
+
+        assert got == [] and o.stats.failed == 0
+        # イメージ複製（docker pull）までは進まない
+        assert not any(c.startswith("docker pull") for c in calls)
+
+
+# ============================================================
+# Step 3.5: .tf 確定後の最終 API 有効化・検証
+# ============================================================
+class TestStepEnableApisFinal:
+    def _orch(self, temp_dir, steps=None):
+        cfg = _full_config(temp_dir, steps=steps or {})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def _write_tf(self, temp_dir, src_name, body):
+        d = os.path.join(temp_dir, "terraform", "active", src_name)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "x.tf"), "w", encoding="utf-8") as f:
+            f.write(body)
+        return d
+
+    def test_final_verifies_whole_want_set_even_when_nothing_missing(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, steps={
+            "bulk_export": {"output_dir": os.path.join(temp_dir, "terraform")}})
+        for src in ("src-host", "src-svc-1"):
+            self._write_tf(temp_dir, src,
+                           'resource "google_container_cluster" "c" {\n  name = "c"\n}\n')
+
+        # dst には全部有効済み（＝ missing 0 件）
+        with patch.object(o, "_list_enabled_services",
+                          return_value={"container.googleapis.com",
+                                        "compute.googleapis.com",
+                                        "storage.googleapis.com",
+                                        "logging.googleapis.com",
+                                        "bigquery.googleapis.com",
+                                        "iam.googleapis.com",
+                                        "iamcredentials.googleapis.com",
+                                        "serviceusage.googleapis.com",
+                                        "cloudresourcemanager.googleapis.com"}), \
+             patch.object(o, "_enable_apis_on_dst", return_value=[]) as enabler, \
+             patch.object(o, "_wait_for_apis_enabled") as waiter:
+            o.step_enable_apis(final=True)
+
+        # 追加は無いので enable は呼ばれないが、検証は必ず走る
+        assert enabler.call_count == 0
+        assert waiter.call_count == 2, "final は want 全体の有効化確認を必ず行う"
+        verified = set(waiter.call_args_list[0][0][2])
+        assert "container.googleapis.com" in verified
+
+    def test_early_does_not_verify_when_nothing_missing(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, steps={
+            "bulk_export": {"output_dir": os.path.join(temp_dir, "terraform")}})
+        with patch.object(o, "_list_enabled_services",
+                          return_value={"compute.googleapis.com"} | set(_BASE_DST_APIS)), \
+             patch.object(o, "_enable_apis_on_dst", return_value=[]), \
+             patch.object(o, "_wait_for_apis_enabled") as waiter:
+            o.step_enable_apis(final=False)
+        assert waiter.call_count == 0
+
+    def test_final_includes_tf_derived_apis(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, steps={
+            "bulk_export": {"output_dir": os.path.join(temp_dir, "terraform")}})
+        for src in ("src-host", "src-svc-1"):
+            self._write_tf(temp_dir, src,
+                           'resource "google_sql_database_instance" "d" {\n  name = "d"\n}\n')
+        asked = []
+
+        with patch.object(o, "_list_enabled_services", return_value=set()), \
+             patch.object(o, "_enable_apis_on_dst",
+                          side_effect=lambda p, sa, apis: asked.extend(apis) or []), \
+             patch.object(o, "_wait_for_apis_enabled"):
+            o.step_enable_apis(final=True)
+
+        assert "sqladmin.googleapis.com" in asked
+
+    def test_final_ignores_mock_artifacts_in_real_run(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, steps={
+            "bulk_export": {"output_dir": os.path.join(temp_dir, "terraform")}})
+        for src in ("src-host", "src-svc-1"):
+            self._write_tf(
+                temp_dir, src,
+                f"# {_MOCK_TF_MARK}\n"
+                'resource "google_sql_database_instance" "d" {\n  name = "d"\n}\n')
+        asked = []
+
+        with patch.object(o, "_list_enabled_services", return_value=set()), \
+             patch.object(o, "_enable_apis_on_dst",
+                          side_effect=lambda p, sa, apis: asked.extend(apis) or []), \
+             patch.object(o, "_wait_for_apis_enabled"):
+            o.step_enable_apis(final=True)
+
+        # mock 生成物の .tf からは API を引かない（実行時のみのガード）
+        assert "sqladmin.googleapis.com" not in asked
+
+    def test_failures_are_summarized_and_do_not_fail_the_run(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, steps={
+            "bulk_export": {"output_dir": os.path.join(temp_dir, "terraform")}})
+        with patch.object(o, "_list_enabled_services", return_value=set()), \
+             patch.object(o, "_enable_apis_on_dst",
+                          return_value=["source.googleapis.com"]), \
+             patch.object(o, "_wait_for_apis_enabled"):
+            o.step_enable_apis(final=True)
+        assert o.stats.failed == 0
+
+
+class TestArtifactRegistryRunsBeforeTerraform:
+    """AR イメージ複製は terraform apply より前でなければならない。
+
+    Cloud Run は revision 作成時に `image = "...@sha256:"` を解決するため、
+    apply の後に複製しても間に合わない（Image ... not found で失敗する）。
+    """
+
+    def test_execute_order_places_ar_sync_before_terraform_apply(self, temp_dir):
+        from unittest.mock import patch
+        cfg = _full_config(temp_dir, steps={
+            "cai_scan": {"enabled": False},
+            "enable_apis": {"enabled": False},
+            "gce_snapshot": {"enabled": False},
+            # output_dir を temp に向けないと既定の ./terraform を掴み、
+            # 実行中の make run / make plan の多重起動ロックで execute() が
+            # 即終了してテストが落ちる。
+            "bulk_export": {"enabled": False,
+                            "output_dir": os.path.join(temp_dir, "terraform")},
+            "terraform_apply": {"enabled": True},
+            "network_firewall": {"enabled": False},
+            "gce_restore": {"enabled": False},
+            "iam_sync": {"enabled": False},
+            "data_sync": {"enabled": True},
+        })
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        order = []
+
+        with patch.object(o, "check_prerequisites"), \
+             patch.object(o, "check_service_accounts"), \
+             patch.object(o, "check_dst_projects_exist"), \
+             patch.object(o, "step_artifact_registry",
+                          side_effect=lambda: order.append("ar")), \
+             patch.object(o, "step_terraform_apply",
+                          side_effect=lambda: order.append("tf")), \
+             patch.object(o, "step_data_sync",
+                          side_effect=lambda: order.append("data")), \
+             patch.object(o, "_emit_cai_tf_diff"), \
+             patch.object(o, "print_summary", create=True):
+            try:
+                o.execute()
+            except SystemExit:
+                pass
+
+        assert "ar" in order and "tf" in order
+        assert order.index("ar") < order.index("tf"), f"順序が不正: {order}"
+
+    def test_data_sync_no_longer_copies_images(self, temp_dir):
+        from unittest.mock import patch
+        cfg = _full_config(temp_dir, steps={"data_sync": {"enabled": True}})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+
+        with patch.object(o, "_sync_gcs"), patch.object(o, "_sync_bq"), \
+             patch.object(o, "_collect_ar_copy_work") as ar, \
+             patch.object(o, "_copy_ar_image") as cp:
+            o.step_data_sync()
+        assert ar.call_count == 0 and cp.call_count == 0
+
+
+class TestArAttestationSkip:
+    """Cloud Build の attestation / SBOM は実イメージではないので複製しない。"""
+
+    def test_cosign_tagged_versions_are_dropped_from_plan(self):
+        att_tag = "sha256-" + "ab" * 32 + ".att"
+        imgs = json.dumps([
+            {"package": "asia-northeast1-docker.pkg.dev/src-p/repo/app",
+             "version": "sha256:" + "11" * 32, "tags": [att_tag]},
+            {"package": "asia-northeast1-docker.pkg.dev/src-p/repo/app",
+             "version": "sha256:" + "22" * 32, "tags": ["latest"]},
+            # 実タグと attestation タグ混在なら残す（実イメージ側の可能性）
+            {"package": "asia-northeast1-docker.pkg.dev/src-p/repo/app",
+             "version": "sha256:" + "33" * 32, "tags": [att_tag, "v1"]},
+        ])
+        plan = build_ar_image_copy_plan(imgs, "src-p", "dst-p")
+        digests = {e["digest"] for e in plan}
+        assert "sha256:" + "11" * 32 not in digests
+        assert "sha256:" + "22" * 32 in digests
+        assert "sha256:" + "33" * 32 in digests
+
+    def test_unsupported_media_type_pull_is_info_skip(self, temp_dir):
+        from unittest.mock import patch
+        cfg = _full_config(temp_dir, steps={"data_sync": {"enabled": True}})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        calls = []
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            calls.append(cmd)
+            if cmd.startswith("docker pull"):
+                return 1, "", ("unsupported media type "
+                               "application/vnd.oci.empty.v1+json")
+            return 0, "", ""
+
+        item = {"src_ref": "h/src-p/r/app@sha256:" + "ee" * 32,
+                "dst_pkg": "h/dst-p/r/app",
+                "dst_ref": "h/dst-p/r/app@sha256:" + "ee" * 32,
+                "digest": "sha256:" + "ee" * 32, "tags": []}
+        before = o.stats.skipped
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_gcloud_exists", return_value=False):
+            o._copy_ar_image(item, None)
+
+        assert o.stats.skipped == before + 1
+        assert o.stats.failed == 0
+        # push まで進まない
+        assert not any(c.startswith("docker push") for c in calls)
+
+
+class TestArCopyFlatParallel:
+    """AR コピーは (project × repo × image) の flat 単位で並列化する。"""
+
+    def _orch(self, temp_dir, jobs=8):
+        cfg = _full_config(temp_dir, steps={"data_sync": {"enabled": True}})
+        cfg["global"]["dry_run"] = False
+        cfg["global"]["parallel_jobs"] = jobs
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def test_work_from_all_projects_is_copied_in_one_flat_batch(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        # host / svc-1 の 2 プロジェクトからそれぞれ item が出る
+        def fake_collect(src, dst, ssa, dsa):
+            return [{"src_ref": f"h/{src}/r/a@sha256:" + "aa" * 32,
+                     "dst_pkg": f"h/{dst}/r/a", "dst_ref": "x",
+                     "digest": "sha256:" + "aa" * 32, "tags": [], "dst_sa": dsa}]
+        copied = []
+        batches = []
+        orig_pfe = o._parallel_for_each
+
+        def spy_pfe(items, worker, prefix):
+            batches.append((prefix, len(items)))
+            return orig_pfe(items, worker, prefix)
+
+        with patch.object(o, "_collect_ar_copy_work", side_effect=fake_collect), \
+             patch.object(o, "_copy_ar_image",
+                          side_effect=lambda it, sa: copied.append(it["src_ref"])), \
+             patch.object(o, "_soft_run", return_value=(0, "", "")), \
+             patch.object(o, "_parallel_for_each", side_effect=spy_pfe), \
+             patch("shutil.which", return_value="/usr/bin/docker"):
+            o.step_artifact_registry()
+
+        # 列挙はプロジェクト並列、コピーは全プロジェクト合算の 1 バッチ
+        assert ("ar-list", 2) in batches
+        assert ("ar-copy", 2) in batches
+        assert len(copied) == 2
+
+    def test_existing_digests_are_filtered_by_one_repo_listing(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        d_have = "sha256:" + "aa" * 32
+        d_need = "sha256:" + "bb" * 32
+        src_imgs = json.dumps([
+            {"package": "asia-northeast1-docker.pkg.dev/src-p/r/app",
+             "version": d_have, "tags": ["v1"]},
+            {"package": "asia-northeast1-docker.pkg.dev/src-p/r/app",
+             "version": d_need, "tags": ["v2"]},
+        ])
+        repos = json.dumps([{"name": "projects/src-p/locations/asia-northeast1"
+                                     "/repositories/r", "format": "DOCKER"}])
+        describes = []
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
+            if cmd.startswith("gcloud artifacts repositories list"):
+                return 0, repos, ""
+            if "docker images list" in cmd and "/src-p/" in cmd:
+                return 0, src_imgs, ""
+            if "docker images list" in cmd and "/dst-p/" in cmd:
+                return 0, d_have + "\n", ""   # dst には aa だけ存在
+            describes.append(cmd)
+            return 0, "", ""
+
+        before = o.stats.skipped
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_gcloud_exists", return_value=True):
+            work = o._collect_ar_copy_work("src-p", "dst-p", None, None)
+
+        assert [e["digest"] for e in work] == [d_need]
+        assert o.stats.skipped == before + 1
+
+
+# ============================================================
+# 文字列参照 → terraform 参照 変換（SA / compute URL / 通知チャネル）
+# ============================================================
+class TestRewriteResourceRefs:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        o._customize_notes = []
+        return o
+
+    def _root(self, temp_dir):
+        root = os.path.join(temp_dir, "active", "src-host")
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _write(self, root, fn, body):
+        with open(os.path.join(root, fn), "w", encoding="utf-8") as f:
+            f.write(body)
+
+    def test_sa_email_becomes_reference_with_30char_project(self, temp_dir):
+        # actAs 403 の本丸。project ID が上限 30 文字ちょうどでも一致すること
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        proj30 = "shingo-ar-standalone2026081400"
+        assert len(proj30) == 30
+        self._write(root, "sa.tf",
+                    'resource "google_service_account" "eigo_teacher" {\n'
+                    '  account_id = "eigo-teacher"\n'
+                    f'  project    = "{proj30}"\n'
+                    '}\n')
+        self._write(root, "run.tf",
+                    'resource "google_cloud_run_v2_service" "svc" {\n'
+                    '  template {\n'
+                    f'    service_account = "eigo-teacher@{proj30}.iam.gserviceaccount.com"\n'
+                    '  }\n'
+                    '}\n')
+        o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "run.tf"), encoding="utf-8").read()
+        assert "service_account = google_service_account.eigo_teacher.email" in out
+
+    def test_default_compute_sa_is_left_alone(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        self._write(root, "run.tf",
+                    'resource "google_cloud_run_v2_service" "svc" {\n'
+                    '  service_account = "123456789-compute@developer.gserviceaccount.com"\n'
+                    '}\n')
+        o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "run.tf"), encoding="utf-8").read()
+        assert '"123456789-compute@developer.gserviceaccount.com"' in out
+
+    def test_security_policy_url_becomes_self_link(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        self._write(root, "policy.tf",
+                    'resource "google_compute_security_policy" "pol" {\n'
+                    '  name    = "my-policy"\n'
+                    '  project = "dst-host"\n'
+                    '}\n')
+        self._write(root, "bes.tf",
+                    'resource "google_compute_backend_service" "b" {\n'
+                    '  name = "b"\n'
+                    '  security_policy = "https://www.googleapis.com/compute/beta/'
+                    'projects/dst-host/global/securityPolicies/my-policy"\n'
+                    '}\n')
+        o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "bes.tf"), encoding="utf-8").read()
+        assert "security_policy = google_compute_security_policy.pol.self_link" in out
+
+    def test_manually_created_cert_url_is_left_as_string(self, temp_dir):
+        # 証明書が dst に手動作成済みなら proxy は残り、URL 文字列のまま適用される
+        from unittest.mock import patch
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        self._write(root, "proxy.tf",
+                    'resource "google_compute_target_https_proxy" "p" {\n'
+                    '  name = "p"\n  project = "dst-host"\n'
+                    '  ssl_certificates = ["https://www.googleapis.com/compute/v1/'
+                    'projects/dst-host/global/sslCertificates/manual-cert"]\n'
+                    '}\n')
+        with patch.object(o, "_gcloud_exists", return_value=True):
+            o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "proxy.tf"), encoding="utf-8").read()
+        assert "sslCertificates/manual-cert" in out
+
+    def test_missing_cert_holds_proxy_and_forwarding_rule(self, temp_dir):
+        # 未作成の証明書に依存する proxy と、その proxy を参照する FR を保留する
+        from unittest.mock import patch
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        self._write(root, "proxy.tf",
+                    'resource "google_compute_target_https_proxy" "p" {\n'
+                    '  name = "notify-api-proxy"\n  project = "dst-host"\n'
+                    '  ssl_certificates = ["https://www.googleapis.com/compute/v1/'
+                    'projects/dst-host/global/sslCertificates/notify-api"]\n'
+                    '}\n')
+        self._write(root, "fr.tf",
+                    'resource "google_compute_global_forwarding_rule" "fr" {\n'
+                    '  name   = "notify-api-fr"\n  project = "dst-host"\n'
+                    '  target = "https://www.googleapis.com/compute/v1/'
+                    'projects/dst-host/global/targetHttpsProxies/notify-api-proxy"\n'
+                    '}\n')
+        self._write(root, "keep.tf",
+                    'resource "google_compute_url_map" "m" {\n'
+                    '  name = "m"\n  project = "dst-host"\n'
+                    '}\n')
+        with patch.object(o, "_gcloud_exists", return_value=False):
+            o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        left = sorted(os.listdir(root))
+        assert "proxy.tf" not in left and "fr.tf" not in left
+        assert "keep.tf" in left
+        kinds = [n["kind"] for n in o._customize_notes]
+        assert kinds.count("lb_blocked_on_cert") == 2
+
+    def test_in_root_cert_definition_keeps_proxy(self, temp_dir):
+        # Google-managed 等、同ルートで作られる証明書なら保留しない
+        from unittest.mock import patch
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        self._write(root, "cert.tf",
+                    'resource "google_compute_ssl_certificate" "c" {\n'
+                    '  name = "in-root-cert"\n  project = "dst-host"\n'
+                    '}\n')
+        self._write(root, "proxy.tf",
+                    'resource "google_compute_target_https_proxy" "p" {\n'
+                    '  name = "p"\n  project = "dst-host"\n'
+                    '  ssl_certificates = ["https://www.googleapis.com/compute/v1/'
+                    'projects/dst-host/global/sslCertificates/in-root-cert"]\n'
+                    '}\n')
+        with patch.object(o, "_gcloud_exists", return_value=False) as ge:
+            o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        assert os.path.exists(os.path.join(root, "proxy.tf"))
+        assert ge.call_count == 0
+
+    def test_notification_channel_resolved_via_import_comment(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        self._write(root, "ch.tf",
+                    'resource "google_monitoring_notification_channel" "email" {\n'
+                    '  display_name = "email"\n  project = "dst-host"\n'
+                    '}\n'
+                    '# terraform import google_monitoring_notification_channel.email '
+                    'dst-host projects/dst-host/notificationChannels/9027756872843776763\n')
+        self._write(root, "alert.tf",
+                    'resource "google_monitoring_alert_policy" "a" {\n'
+                    '  notification_channels = ["projects/dst-host/notificationChannels/9027756872843776763"]\n'
+                    '}\n')
+        o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "alert.tf"), encoding="utf-8").read()
+        assert ("notification_channels = [google_monitoring_notification_channel"
+                ".email.name]") in out
+
+    def test_unresolved_channel_line_is_stripped_with_note(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        self._write(root, "alert.tf",
+                    'resource "google_monitoring_alert_policy" "a" {\n'
+                    '  project = "dst-host"\n'
+                    '  notification_channels = ["projects/dst-host/notificationChannels/111"]\n'
+                    '}\n')
+        o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "alert.tf"), encoding="utf-8").read()
+        assert "notification_channels" not in out
+        assert any(n["kind"] == "alert_notification_channels"
+                   for n in o._customize_notes)
+
+
+class TestForeignProjectResourceDropped:
+    def test_unmapped_project_file_is_skipped(self, temp_dir):
+        # bulk-export の越境出力（mapping 外プロジェクト）は apply させない
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        raw = os.path.join(temp_dir, "raw", "src-host")
+        active = os.path.join(temp_dir, "active")
+        os.makedirs(raw)
+        with open(os.path.join(raw, "foreign.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_monitoring_notification_channel" "email" {\n'
+                    '  project = "unrelated-foreign-proj"\n'
+                    '}\n')
+        with open(os.path.join(raw, "own.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_pubsub_topic" "t" {\n'
+                    '  name    = "t1"\n'
+                    '  project = "src-host"\n'
+                    '}\n')
+        o.customize_hcl(os.path.join(temp_dir, "raw"), active)
+        files = os.listdir(os.path.join(active, "src-host"))
+        assert not any("foreign" in f for f in files)
+        assert any("own" in f for f in files)
+
+
+# ============================================================
+# DIFF.md の GKE 手動アドバイス（Backup for GKE 前提）
+# ============================================================
+class TestGkeBackupRestoreNote:
+    def test_note_row_is_action_with_both_sides(self):
+        kind, target, why, how = customize_note_row({
+            "kind": "gke_backup_restore", "resource": "my-ec-cluster",
+            "project": "dst-standalone", "src_dir": "my-argolis"})
+        assert kind == "要対応"
+        assert "my-ec-cluster" in target and "dst-standalone" in target
+        # src 側 backup と dst 側 restore の両方を案内する
+        assert "backup-plans create" in how and "--project=my-argolis" in how
+        assert "restore" in how and "dst-standalone" in how
+        assert "gkebackup.googleapis.com" in how
+        # クラスタ外リソース（SSL 証明書等）は対象外である旨も明記
+        assert "対象外" in how
+
+    def test_customize_emits_note_per_cluster(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        raw = os.path.join(temp_dir, "raw", "src-host")
+        os.makedirs(raw)
+        with open(os.path.join(raw, "cluster.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_cluster" "c" {\n'
+                    '  name     = "my-cluster"\n'
+                    '  project  = "src-host"\n'
+                    '  location = "asia-northeast1"\n'
+                    '}\n')
+        with open(os.path.join(raw, "bucket.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_storage_bucket" "b" {\n'
+                    '  name    = "some-bucket"\n'
+                    '  project = "src-host"\n'
+                    '}\n')
+        o.customize_hcl(os.path.join(temp_dir, "raw"), os.path.join(temp_dir, "active"))
+        notes = [n for n in o._customize_notes if n["kind"] == "gke_backup_restore"]
+        assert len(notes) == 1
+        assert notes[0]["resource"] == "my-cluster"
+        assert notes[0]["project"] == "dst-host"
+        assert notes[0]["src_dir"] == "src-host"
+
+    def test_gke_derived_reference_mentions_backup_for_gke(self):
+        got = classify_missing_asset({
+            "asset_type": "compute.googleapis.com/TargetPool",
+            "short_name": "a0cb2a7138c8b475e8f1de09dc442b6a",
+            "full_name": "//x", "coverage_step": "terraform_apply", "reason": ""})
+        assert got["level"] == "reference"
+        assert "Backup for GKE" in got["why"] or "Backup for GKE" in got["how"]
+
+
+class TestFixProviderCompatNodeVersion:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        o._customize_notes = []
+        return o
+
+    def test_node_version_without_min_master_is_removed(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_cluster" "c" {\n'
+                   '  name         = "c"\n'
+                   '  node_version = "1.35.6-gke.1258000"\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "node_version" not in out
+
+    def test_mismatched_pair_drops_node_version_keeps_master(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_cluster" "c" {\n'
+                   '  min_master_version = "1.36.0-gke.100"\n'
+                   '  node_version       = "1.35.6-gke.1258000"\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "node_version" not in out
+        assert 'min_master_version = "1.36.0-gke.100"' in out
+
+    def test_equivalent_pair_is_untouched(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_cluster" "c" {\n'
+                   '  min_master_version = "1.35.6-gke.1258000"\n'
+                   '  node_version       = "1.35.6-gke.1258000"\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert 'node_version       = "1.35.6-gke.1258000"' in out
+
+
+class TestSkipOnRunOverride:
+    """--no-skip-on-run / --skip-on-run（make run SKIP_ON_RUN=0/1）の実行時上書き。"""
+
+    def _orch(self, temp_dir, override):
+        cfg = _full_config(temp_dir, steps={
+            "bulk_export": {"enabled": True,
+                            "output_dir": os.path.join(temp_dir, "terraform"),
+                            "skip_on_run": True}})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path, skip_on_run_override=override)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def _make_active(self, temp_dir, o):
+        # skip 再利用パスに乗る最低条件: active/<src>/*.tf + 現 dst のマーカー
+        d = os.path.join(temp_dir, "terraform", "active", "src-host")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "x.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_pubsub_topic" "t" {\n  name = "t"\n}\n')
+        with open(os.path.join(d, ".dst_project"), "w", encoding="utf-8") as f:
+            f.write("dst-host")
+        d2 = os.path.join(temp_dir, "terraform", "active", "src-svc-1")
+        os.makedirs(d2, exist_ok=True)
+        with open(os.path.join(d2, "y.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_pubsub_topic" "t" {\n  name = "t"\n}\n')
+        with open(os.path.join(d2, ".dst_project"), "w", encoding="utf-8") as f:
+            f.write("dst-svc-1")
+
+    def test_override_false_forces_reexport(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, override=False)
+        self._make_active(temp_dir, o)
+        with patch.object(o, "run_command", return_value="") as rc, \
+             patch.object(o, "_build_project_number_map"), \
+             patch.object(o, "customize_hcl") as cz:
+            o.step_bulk_export()
+        # config は skip_on_run: true だが、上書きにより bulk-export が実行される
+        assert any("bulk-export" in str(c) for c in rc.call_args_list)
+        assert cz.call_count == 1
+
+    def test_config_true_without_override_skips(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, override=None)
+        self._make_active(temp_dir, o)
+        with patch.object(o, "run_command", return_value="") as rc, \
+             patch.object(o, "_build_project_number_map"), \
+             patch.object(o, "customize_hcl") as cz:
+            o.step_bulk_export()
+        assert not any("bulk-export" in str(c) for c in rc.call_args_list)
+        assert cz.call_count == 0
+
+
+# ============================================================
+# Cloud Run 公開設定（allUsers → run.invoker）の複製
+# ============================================================
+class TestRunInvokerPureFunctions:
+    def test_parse_services_list(self):
+        text = json.dumps([
+            {"metadata": {"name": "www-1",
+                          "labels": {"cloud.googleapis.com/location": "us-central1"}}},
+            {"metadata": {"name": "api",
+                          "labels": {"cloud.googleapis.com/location": "asia-northeast1"}}},
+            {"metadata": {"name": "no-region", "labels": {}}},
+        ])
+        assert parse_run_services_list(text) == [
+            ("api", "asia-northeast1"), ("www-1", "us-central1")]
+        assert parse_run_services_list("broken") == []
+
+    def test_public_invoker_members(self):
+        pol = json.dumps({"bindings": [
+            {"role": "roles/run.invoker",
+             "members": ["allUsers", "serviceAccount:x@p.iam.gserviceaccount.com"]},
+            {"role": "roles/run.admin", "members": ["allAuthenticatedUsers"]},
+        ]})
+        # 公開 2 種のみ。SA 個別付与や invoker 以外のロールは対象外
+        assert run_service_public_invoker_members(pol) == ["allUsers"]
+        assert run_service_public_invoker_members(json.dumps({
+            "bindings": [{"role": "roles/run.invoker",
+                          "members": ["allAuthenticatedUsers"]}]})) == \
+            ["allAuthenticatedUsers"]
+
+    def test_conditional_binding_is_ignored(self):
+        pol = json.dumps({"bindings": [
+            {"role": "roles/run.invoker", "members": ["allUsers"],
+             "condition": {"expression": "request.time < x"}},
+        ]})
+        assert run_service_public_invoker_members(pol) == []
+
+
+class TestSyncRunServiceInvokers:
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def _soft_factory(self, dst_service_exists, issued):
+        svc_list = json.dumps([{"metadata": {
+            "name": "any-method-api",
+            "labels": {"cloud.googleapis.com/location": "asia-northeast1"}}}])
+        policy = json.dumps({"bindings": [
+            {"role": "roles/run.invoker", "members": ["allUsers"]}]})
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300,
+                  skip_on_dry_run=True):
+            issued.append(cmd)
+            if cmd.startswith("gcloud run services list"):
+                return 0, svc_list, ""
+            if cmd.startswith("gcloud run services get-iam-policy"):
+                return 0, policy, ""
+            if cmd.startswith("gcloud run services describe"):
+                return (0, "any-method-api", "") if dst_service_exists \
+                    else (1, "", "not found")
+            return 0, "", ""
+        return _soft
+
+    def test_public_binding_is_replicated_when_dst_exists(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        issued = []
+        with patch.object(o, "_soft_run",
+                          side_effect=self._soft_factory(True, issued)):
+            o._sync_run_service_invokers()
+        adds = [c for c in issued
+                if c.startswith("gcloud run services add-iam-policy-binding")]
+        assert adds and "--member=allUsers" in adds[0]
+        assert "--role=roles/run.invoker" in adds[0]
+        assert o.stats.failed == 0
+
+    def test_missing_dst_service_is_skipped_with_warning(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir)
+        issued = []
+        with patch.object(o, "_soft_run",
+                          side_effect=self._soft_factory(False, issued)):
+            o._sync_run_service_invokers()
+        assert not any(c.startswith("gcloud run services add-iam-policy-binding")
+                       for c in issued)
+        assert o.stats.failed == 0
+
+    def test_guards(self):
+        assert is_src_read_only(
+            "gcloud run services get-iam-policy x --region=r --project=p --format=json --quiet")
+        assert is_src_read_only("gcloud run services list --project=p --format=json --quiet")
+        assert not is_src_read_only(
+            "gcloud run services add-iam-policy-binding x --region=r --project=p "
+            "--member=allUsers --role=roles/run.invoker")
+        for c in ("gcloud run services list", "gcloud run services get-iam-policy x",
+                  "gcloud run services describe x",
+                  "gcloud run services add-iam-policy-binding x"):
+            assert is_known_mock_command(c), c
+
+    def test_run_service_asset_types_registered(self):
+        assert _ASSET_COVERAGE["run.googleapis.com/Service"] == "terraform_apply"
+        assert "run.googleapis.com/Revision" in _ASSET_COVERAGE
+        assert "google_cloud_run_v2_service" in \
+            _CAI_TO_TF_RESOURCE["run.googleapis.com/Service"]
+
+
+# ============================================================
+# 移行範囲の選択（steps.bulk_export.resource_types）
+# ============================================================
+class TestResourceTypeFilterPure:
+    def test_exclude_patterns(self):
+        assert not tf_type_kept("google_cloud_run_v2_service", [], ["google_cloud_run_*"])
+        assert tf_type_kept("google_compute_instance", [], ["google_cloud_run_*"])
+
+    def test_include_whitelist(self):
+        inc = ["google_compute_*", "google_service_account"]
+        assert tf_type_kept("google_compute_network", inc, [])
+        assert tf_type_kept("google_service_account", inc, [])
+        assert not tf_type_kept("google_cloud_run_v2_service", inc, [])
+
+    def test_exclude_wins_over_include(self):
+        assert not tf_type_kept("google_compute_snapshot",
+                                ["google_compute_*"], ["google_compute_snapshot"])
+
+    def test_file_reason(self):
+        # 全型除外 → 理由。1 つでも残れば None（安全側 = コピー）
+        assert resource_type_filter_reason(
+            ["google_cloud_run_v2_service"], [], ["google_cloud_run_*"])
+        assert resource_type_filter_reason(
+            ["google_cloud_run_v2_service", "google_compute_network"],
+            [], ["google_cloud_run_*"]) is None
+        # resource ブロック無し / フィルタ未指定は対象外
+        assert resource_type_filter_reason([], [], ["google_*"]) is None
+        assert resource_type_filter_reason(["google_compute_network"], [], []) is None
+
+
+class TestResourceTypeFilterInCustomize:
+    def _run(self, temp_dir, resource_types):
+        cfg = _full_config(temp_dir, steps={
+            "bulk_export": {"enabled": True, "resource_types": resource_types}})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        raw = os.path.join(temp_dir, "raw", "src-host")
+        os.makedirs(raw, exist_ok=True)
+        files = {
+            "run.tf": 'resource "google_cloud_run_v2_service" "svc" {\n'
+                      '  name = "svc"\n  project = "src-host"\n}\n',
+            "net.tf": 'resource "google_compute_network" "n" {\n'
+                      '  name = "vpc0"\n  project = "src-host"\n}\n',
+            "cluster.tf": 'resource "google_container_cluster" "c" {\n'
+                          '  name = "c1"\n  project = "src-host"\n'
+                          '  location = "asia-northeast1"\n}\n',
+        }
+        for fn, body in files.items():
+            with open(os.path.join(raw, fn), "w", encoding="utf-8") as f:
+                f.write(body)
+        o.customize_hcl(os.path.join(temp_dir, "raw"), os.path.join(temp_dir, "active"))
+        return o, sorted(os.listdir(os.path.join(temp_dir, "active", "src-host")))
+
+    def test_exclude_drops_only_matching(self, temp_dir):
+        o, files = self._run(temp_dir, {"exclude": ["google_cloud_run_*",
+                                                    "google_container_*"]})
+        assert "net.tf" in files
+        assert "run.tf" not in files and "cluster.tf" not in files
+        # 除外したクラスタには GKE 移行手順 note を出さない
+        assert not any(n["kind"] == "gke_backup_restore" for n in o._customize_notes)
+
+    def test_include_whitelist_keeps_only_listed(self, temp_dir):
+        _o, files = self._run(temp_dir, {"include": ["google_compute_*"]})
+        assert "net.tf" in files
+        assert "run.tf" not in files and "cluster.tf" not in files
+
+    def test_no_filter_keeps_all(self, temp_dir):
+        o, files = self._run(temp_dir, {})
+        assert {"net.tf", "run.tf", "cluster.tf"} <= set(files)
+        assert any(n["kind"] == "gke_backup_restore" for n in o._customize_notes)
+
+
+class TestResourceTypeFilterInDiff:
+    def _item(self, atype, short):
+        return {"asset_type": atype, "short_name": short, "full_name": "//x",
+                "coverage_step": "terraform_apply", "reason": "", "state": "",
+                "ip_address": ""}
+
+    def test_excluded_type_is_reference_p3(self):
+        got = classify_missing_asset(
+            self._item("run.googleapis.com/Service", "www-1"),
+            rt_exclude=["google_cloud_run_*"])
+        assert got["level"] == "reference" and got["priority"] == 3
+        assert "resource_types" in got["why"]
+
+    def test_not_excluded_type_stays_action(self):
+        got = classify_missing_asset(
+            self._item("run.googleapis.com/Service", "www-1"),
+            rt_exclude=["google_monitoring_*"])
+        assert got["level"] == "action"
+
+    def test_include_mode_marks_out_of_list_as_reference(self):
+        got = classify_missing_asset(
+            self._item("run.googleapis.com/Service", "www-1"),
+            rt_include=["google_compute_*"])
+        assert got["level"] == "reference" and got["priority"] == 3
+
+
+class TestResourceTypeFilterValidation:
+    def _cfg(self, temp_dir, resource_types):
+        cfg = _full_config(temp_dir, steps={
+            "bulk_export": {"enabled": True, "resource_types": resource_types}})
+        return cfg
+
+    def test_valid_patterns_pass(self, temp_dir):
+        errs = validate_steps_config(self._cfg(temp_dir, {
+            "include": ["google_compute_*"], "exclude": ["google_cloud_run_*"]}))
+        assert not [e for e in errs if "resource_types" in e]
+
+    def test_non_google_pattern_is_rejected(self, temp_dir):
+        # typo（google_ 無し）は include が何にも一致せず全除外になる静かな事故
+        errs = validate_steps_config(self._cfg(temp_dir, {"include": ["compute_*"]}))
+        assert any("resource_types.include" in e for e in errs)
+
+    def test_non_list_is_rejected(self, temp_dir):
+        errs = validate_steps_config(self._cfg(temp_dir, {"exclude": "google_x"}))
+        assert any("リスト" in e for e in errs)
+
+
+class TestGkeNodePoolWiring:
+    """別リソース node_pool 運用のクラスタに必要な補完と依存関係。"""
+
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        o._customize_notes = []
+        return o
+
+    def test_initial_node_count_and_remove_default_are_added(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_cluster" "c" {\n'
+                   '  name     = "c1"\n'
+                   '  location = "asia-northeast1"\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "initial_node_count = 1" in out
+        assert "remove_default_node_pool = true" in out
+
+    def test_autopilot_cluster_is_untouched(self, temp_dir):
+        # remove_default_node_pool は enable_autopilot と ConflictsWith
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_cluster" "c" {\n'
+                   '  name             = "c1"\n'
+                   '  enable_autopilot = true\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "remove_default_node_pool" not in out
+        assert "initial_node_count" not in out
+
+    def test_inline_node_pool_cluster_is_untouched(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_cluster" "c" {\n'
+                   '  name = "c1"\n'
+                   '  node_pool {\n'
+                   '    name = "np"\n'
+                   '  }\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "remove_default_node_pool" not in out
+
+    def test_exported_initial_node_count_is_respected(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_cluster" "c" {\n'
+                   '  name               = "c1"\n'
+                   '  initial_node_count = 5\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "initial_node_count = 5" in out
+        assert "initial_node_count = 1" not in out
+
+    def test_node_pool_version_is_removed(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_node_pool" "np" {\n'
+                   '  cluster = "c1"\n'
+                   '  version = "1.35.6-gke.1258000"\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "version" not in out
+        assert 'cluster = "c1"' in out
+
+    def test_node_pool_cluster_becomes_reference(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = os.path.join(temp_dir, "active", "src-host")
+        os.makedirs(root)
+        with open(os.path.join(root, "cluster.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_cluster" "my_ec_cluster" {\n'
+                    '  name     = "my-ec-cluster"\n'
+                    '  project  = "dst-host"\n'
+                    '}\n')
+        with open(os.path.join(root, "np.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_node_pool" "default_pool" {\n'
+                    '  cluster            = "my-ec-cluster"\n'
+                    '  initial_node_count = 3\n'
+                    '  project            = "dst-host"\n'
+                    '}\n')
+        o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "np.tf"), encoding="utf-8").read()
+        assert "cluster            = google_container_cluster.my_ec_cluster.name" in out
+
+    def test_unknown_cluster_name_is_left_as_string(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = os.path.join(temp_dir, "active", "src-host")
+        os.makedirs(root)
+        with open(os.path.join(root, "np.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_node_pool" "p" {\n'
+                    '  cluster = "not-in-this-root"\n'
+                    '}\n')
+        o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "np.tf"), encoding="utf-8").read()
+        assert 'cluster = "not-in-this-root"' in out
+
+
+# ============================================================
+# Backup for GKE 前提の補正（エージェント有効化 / 短縮パス参照）
+# ============================================================
+class TestGkeBackupAgentEnforced:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        o._customize_notes = []
+        return o
+
+    def test_disabled_agent_is_flipped_to_true(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_cluster" "c" {\n'
+                   '  addons_config {\n'
+                   '    gke_backup_agent_config {\n'
+                   '      enabled = false\n'
+                   '    }\n'
+                   '  }\n'
+                   '  name = "c1"\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "enabled = true" in out
+        assert "enabled = false" not in out.split("gke_backup_agent_config")[1][:80]
+
+    def test_missing_addons_config_gets_agent_block(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = 'resource "google_container_cluster" "c" {\n  name = "c2"\n}\n'
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "gke_backup_agent_config" in out and "enabled = true" in out
+
+    def test_already_enabled_is_untouched(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_cluster" "c" {\n'
+                   '  addons_config {\n'
+                   '    gke_backup_agent_config {\n'
+                   '      enabled = true\n'
+                   '    }\n'
+                   '  }\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert out.count("gke_backup_agent_config") == 1
+
+    def test_non_cluster_resource_is_untouched(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = 'resource "google_compute_network" "n" {\n  name = "vpc"\n}\n'
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "gke_backup_agent_config" not in out
+
+
+class TestShortPathNetworkRefs:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        o._customize_notes = []
+        return o
+
+    def _root(self, temp_dir):
+        root = os.path.join(temp_dir, "active", "src-host")
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "net.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_compute_network" "vpc_0" {\n'
+                    '  name    = "vpc-0"\n  project = "dst-host"\n}\n')
+        with open(os.path.join(root, "subnet.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_compute_subnetwork" "subnet_tokyo" {\n'
+                    '  name    = "subnet-tokyo"\n  project = "dst-host"\n'
+                    '  region  = "asia-northeast1"\n}\n')
+        return root
+
+    def test_short_paths_become_references(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        with open(os.path.join(root, "cluster.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_cluster" "c" {\n'
+                    '  name       = "c1"\n  project = "dst-host"\n'
+                    '  network    = "projects/dst-host/global/networks/vpc-0"\n'
+                    '  subnetwork = "projects/dst-host/regions/asia-northeast1'
+                    '/subnetworks/subnet-tokyo"\n'
+                    '}\n')
+        o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "cluster.tf"), encoding="utf-8").read()
+        assert "network    = google_compute_network.vpc_0.self_link" in out
+        assert ("subnetwork = google_compute_subnetwork.subnet_tokyo.self_link"
+                in out)
+
+    def test_cross_project_short_path_is_left_alone(self, temp_dir):
+        # Shared VPC host（別ルート）の参照は解決できないので文字列のまま
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir)
+        with open(os.path.join(root, "cluster.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_container_cluster" "c" {\n'
+                    '  network = "projects/other-host/global/networks/shared-vpc"\n'
+                    '}\n')
+        o._rewrite_resource_refs_in_active(os.path.join(temp_dir, "active"))
+        out = open(os.path.join(root, "cluster.tf"), encoding="utf-8").read()
+        assert '"projects/other-host/global/networks/shared-vpc"' in out
+
+
+class TestGkeBackupNoteCrossProject:
+    def test_note_covers_channels_and_iam(self):
+        _kind, _target, why, how = customize_note_row({
+            "kind": "gke_backup_restore", "resource": "my-ec-cluster",
+            "project": "dst-standalone", "src_dir": "my-argolis"})
+        # 同一プロジェクト制約と回避手段（channel）を明示する
+        assert "同一プロジェクト" in why
+        assert "backup-channels create" in how
+        assert "restore-channels create" in how
+        assert "gkebackup.crossProjectServiceAgent" in how
+        assert "gkebackup.serviceAgent" in how
+        assert "--update-addons=BackupRestore=ENABLED" in how
+
+
+class TestNodePoolConfigInherited:
+    """ノード VM はスナップショット復元しないが、ノードプールの構成は忠実に継承する。"""
+
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        o._customize_notes = []
+        return o
+
+    SRC = (
+        'resource "google_container_node_pool" "default_pool" {\n'
+        '  cluster            = "c1"\n'
+        '  initial_node_count = 3\n'
+        '  location           = "asia-northeast1"\n'
+        '  max_pods_per_node  = 110\n'
+        '  name               = "default-pool"\n'
+        '\n'
+        '  network_config {\n'
+        '    pod_ipv4_cidr_block = "10.4.0.0/17"\n'
+        '    pod_range           = "gke-c1-pods-fd56f6a4"\n'
+        '  }\n'
+        '\n'
+        '  node_config {\n'
+        '    disk_size_gb = 100\n'
+        '    disk_type    = "pd-standard"\n'
+        '    image_type   = "COS_CONTAINERD"\n'
+        '    machine_type = "e2-standard-2"\n'
+        '  }\n'
+        '\n'
+        '  node_count     = 3\n'
+        '  node_locations = ["asia-northeast1-a", "asia-northeast1-b"]\n'
+        '\n'
+        '  upgrade_settings {\n'
+        '    max_surge = 1\n'
+        '  }\n'
+        '\n'
+        '  version = "1.35.6-gke.1258000"\n'
+        '}\n'
+    )
+
+    def test_count_and_hardware_config_are_preserved(self, temp_dir):
+        o = self._setup(temp_dir)
+        out = o._fix_provider_compat(self.SRC, "np.tf")
+        # 台数とゾーン（initial_node_count は node_count と排他のため除去され、
+        # 台数は node_count が引き継ぐ）
+        assert "node_count     = 3" in out
+        assert "initial_node_count" not in out
+        assert 'node_locations = ["asia-northeast1-a", "asia-northeast1-b"]' in out
+        # マシン構成
+        assert 'machine_type = "e2-standard-2"' in out
+        assert "disk_size_gb = 100" in out
+        assert 'disk_type    = "pd-standard"' in out
+        assert 'image_type   = "COS_CONTAINERD"' in out
+        assert "max_pods_per_node  = 110" in out
+        assert "max_surge = 1" in out
+
+    def test_pod_cidr_removed_but_range_name_kept(self, temp_dir):
+        o = self._setup(temp_dir)
+        out = o._fix_provider_compat(self.SRC, "np.tf")
+        assert "pod_ipv4_cidr_block" not in out
+        assert 'pod_range           = "gke-c1-pods-fd56f6a4"' in out
+
+    def test_create_pod_range_true_keeps_cidr(self, temp_dir):
+        # 新規レンジを作る指定なら CIDR は有効なので残す
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_node_pool" "p" {\n'
+                   '  network_config {\n'
+                   '    create_pod_range    = true\n'
+                   '    pod_ipv4_cidr_block = "10.8.0.0/17"\n'
+                   '    pod_range           = "new-range"\n'
+                   '  }\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "np.tf")
+        assert "pod_ipv4_cidr_block" in out
+
+
+class TestNodePoolInitialCountConflict:
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        import logging as _l
+        o.org_logger = _l.getLogger("test-org")
+        o._customize_notes = []
+        return o
+
+    def test_both_set_drops_initial_keeps_node_count(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_node_pool" "p" {\n'
+                   '  cluster            = "c1"\n'
+                   '  initial_node_count = 3\n'
+                   '  node_count     = 3\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "np.tf")
+        assert "initial_node_count" not in out
+        assert "node_count     = 3" in out
+
+    def test_initial_only_is_kept(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_node_pool" "p" {\n'
+                   '  initial_node_count = 2\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "np.tf")
+        assert "initial_node_count = 2" in out
+
+    def test_cluster_initial_node_count_is_not_touched(self, temp_dir):
+        # クラスタ本体の initial_node_count（remove_default_node_pool 用）は残す
+        o = self._setup(temp_dir)
+        content = ('resource "google_container_cluster" "c" {\n'
+                   '  name = "c1"\n'
+                   '}\n')
+        out = o._fix_provider_compat(content, "x.tf")
+        assert "initial_node_count = 1" in out
+
+
+class TestGloballyUniqueResourceSkips:
+    """複製不能なグローバル一意リソース（public DNS ゾーン / ドット入りバケット）。"""
+
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_public_dns_zone_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        reason = o._skip_reason_for_file(
+            'resource "google_dns_managed_zone" "z" {\n'
+            '  dns_name   = "kawanos.demo.altostrat.com."\n'
+            '  name       = "kawanos-demo"\n'
+            '  visibility = "public"\n'
+            '}\n')
+        assert reason and "public DNS" in reason
+
+    def test_zone_without_visibility_defaults_to_public_and_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        assert o._skip_reason_for_file(
+            'resource "google_dns_managed_zone" "z" {\n'
+            '  dns_name = "example.com."\n  name = "z"\n}\n')
+
+    def test_private_dns_zone_is_kept(self, temp_dir):
+        o = self._setup(temp_dir)
+        assert o._skip_reason_for_file(
+            'resource "google_dns_managed_zone" "z" {\n'
+            '  dns_name   = "internal.example."\n'
+            '  visibility = "private"\n'
+            '}\n') is None
+
+    def test_dotted_bucket_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        reason = o._skip_reason_for_file(
+            'resource "google_storage_bucket" "b" {\n'
+            '  name = "artifacts.my-argolis.appspot.com"\n'
+            '}\n')
+        assert reason and "ドット入り" in reason
+
+    def test_normal_bucket_is_kept(self, temp_dir):
+        o = self._setup(temp_dir)
+        assert o._skip_reason_for_file(
+            'resource "google_storage_bucket" "b" {\n'
+            '  name = "normal-bucket-name"\n'
+            '  uniform_bucket_level_access = true\n'
+            '}\n') is None
+
+    def test_note_rows(self):
+        k1, t1, _w1, h1 = customize_note_row(
+            {"kind": "dns_managed_zone", "resource": "kawanos-demo", "project": "dst-p"})
+        assert k1 == "要対応" and "NS 委任" in h1
+        k2, _t2, _w2, h2 = customize_note_row(
+            {"kind": "dotted_bucket", "resource": "artifacts.x.appspot.com",
+             "project": "dst-p"})
+        assert k2 == "要対応" and "overrides" in h2
+
+
+class TestInternalAddressHandling:
+    """内部予約は元 IP 保持 / IN_USE は Step 5 に委ねて複製しない。"""
+
+    def _setup(self, temp_dir, cai_body=None):
+        cfg = _full_config(temp_dir, steps={
+            "cai_scan": {"enabled": True,
+                         "output_dir": os.path.join(temp_dir, "cai")},
+            "gce_restore": {"enabled": True},
+        })
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        os.makedirs(os.path.join(temp_dir, "cai"), exist_ok=True)
+        if cai_body is not None:
+            with open(os.path.join(temp_dir, "cai", "cai_resources_src-host.txt"),
+                      "w", encoding="utf-8") as f:
+                f.write(cai_body)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    CAI = (
+        "---\n"
+        "assetType: compute.googleapis.com/Address\n"
+        "name: //compute.googleapis.com/projects/src-host/regions/r/addresses/vm1-ip\n"
+        "state: IN_USE\n"
+        "additionalAttributes:\n"
+        "  address: 10.100.1.11\n"
+        "---\n"
+        "assetType: compute.googleapis.com/Address\n"
+        "name: //compute.googleapis.com/projects/src-host/regions/r/addresses/hold-ip\n"
+        "state: RESERVED\n"
+        "additionalAttributes:\n"
+        "  address: 10.100.1.203\n"
+    )
+
+    def test_cai_in_use_internal_addresses(self, temp_dir):
+        o = self._setup(temp_dir, self.CAI)
+        got = cai_in_use_internal_addresses(
+            os.path.join(temp_dir, "cai", "cai_resources_src-host.txt"))
+        assert got == {"vm1-ip"}
+
+    def _addr_tf(self, name, ip):
+        return ('resource "google_compute_address" "a" {\n'
+                f'  address      = "{ip}"\n'
+                '  address_type = "INTERNAL"\n'
+                f'  name         = "{name}"\n'
+                '  project      = "src-host"\n'
+                '  region       = "asia-northeast1"\n'
+                '}\n')
+
+    def test_in_use_address_is_skipped_reserved_kept_with_ip(self, temp_dir):
+        o = self._setup(temp_dir, self.CAI)
+        raw = os.path.join(temp_dir, "raw", "src-host")
+        os.makedirs(raw)
+        with open(os.path.join(raw, "vm1-ip.tf"), "w", encoding="utf-8") as f:
+            f.write(self._addr_tf("vm1-ip", "10.100.1.11"))
+        with open(os.path.join(raw, "hold-ip.tf"), "w", encoding="utf-8") as f:
+            f.write(self._addr_tf("hold-ip", "10.100.1.203"))
+        o.customize_hcl(os.path.join(temp_dir, "raw"), os.path.join(temp_dir, "active"))
+        files = os.listdir(os.path.join(temp_dir, "active", "src-host"))
+        assert not any("vm1-ip" in f for f in files), "IN_USE は複製しない"
+        kept = [f for f in files if "hold-ip" in f]
+        assert kept, "RESERVED は複製する"
+        body = open(os.path.join(temp_dir, "active", "src-host", kept[0]),
+                    encoding="utf-8").read()
+        # 取り置きの意味を保つため元 IP を残す（自動採番にしない）
+        assert 'address      = "10.100.1.203"' in body
+
+    def test_external_address_ip_is_still_stripped(self, temp_dir):
+        o = self._setup(temp_dir, self.CAI)
+        content = ('resource "google_compute_address" "e" {\n'
+                   '  address      = "34.84.204.112"\n'
+                   '  address_type = "EXTERNAL"\n'
+                   '  name         = "ext-ip"\n'
+                   '}\n')
+        out = o._strip_reserved_ip(content)
+        assert "34.84.204.112" not in out
+
+    def test_internal_global_address_psa_keeps_ip(self, temp_dir):
+        o = self._setup(temp_dir, self.CAI)
+        content = ('resource "google_compute_global_address" "psa" {\n'
+                   '  address       = "10.50.0.0"\n'
+                   '  address_type  = "INTERNAL"\n'
+                   '  prefix_length = 16\n'
+                   '}\n')
+        out = o._strip_reserved_ip(content)
+        assert '10.50.0.0' in out
+
+
+# ============================================================
+# DIFF.md 要対応の削減（誤検知・自動生成・二重計上の分類）
+# ============================================================
+class TestDiffNoiseReduction:
+    def _item(self, atype, short, full=""):
+        return {"asset_type": atype, "short_name": short,
+                "full_name": full or f"//x/{short}", "location": "global",
+                "coverage_step": "terraform_apply", "reason": "",
+                "state": "", "ip_address": ""}
+
+    def test_system_entry_groups_are_p3(self):
+        got = classify_missing_asset(self._item(
+            "dataplex.googleapis.com/EntryGroup", "@bigquery"))
+        assert got["level"] == "reference" and got["priority"] == 3
+
+    def test_user_entry_group_stays_action(self):
+        got = classify_missing_asset(self._item(
+            "dataplex.googleapis.com/EntryGroup", "my-catalog"))
+        assert got["level"] == "action"
+
+    def test_gke_psc_service_directory_is_p3(self):
+        got = classify_missing_asset(self._item(
+            "servicedirectory.googleapis.com/Service",
+            "gk3-my-ec-cluster-fd56f6a4-b824f17b-pe"))
+        assert got["level"] == "reference" and got["priority"] == 3
+        got2 = classify_missing_asset(self._item(
+            "servicedirectory.googleapis.com/Namespace", "goog-psc-default"))
+        assert got2["level"] == "reference"
+        got3 = classify_missing_asset(self._item(
+            "servicedirectory.googleapis.com/Endpoint", "default",
+            full="//servicedirectory/.../gk3-abc-pe/endpoints/default"))
+        assert got3["level"] == "reference"
+
+    def test_secret_version_folds_into_secret(self):
+        got = classify_missing_asset(self._item(
+            "secretmanager.googleapis.com/SecretVersion", "1"))
+        assert got["level"] == "reference" and got["priority"] == 2
+        got2 = classify_missing_asset(self._item(
+            "secretmanager.googleapis.com/Secret", "DBPASS"))
+        assert got2["level"] == "action"
+
+    def test_numeric_zone_is_duplicate_representation(self):
+        got = classify_missing_asset(self._item(
+            "dns.googleapis.com/ManagedZone", "7616733230961605059"))
+        assert got["level"] == "reference"
+        got2 = classify_missing_asset(self._item(
+            "dns.googleapis.com/ManagedZone", "kawanos-demo"))
+        assert got2["level"] == "action"
+
+    def test_notification_channel_is_reference(self):
+        got = classify_missing_asset(self._item(
+            "monitoring.googleapis.com/NotificationChannel", "9027756872843776763"))
+        assert got["level"] == "reference"
+
+    def test_gen2_function_folds_into_run_service(self):
+        got = classify_missing_asset(
+            self._item("cloudfunctions.googleapis.com/Function", "www-1"),
+            run_service_names={"www-1", "test-1"})
+        assert got["level"] == "reference" and got["priority"] == 1
+        got2 = classify_missing_asset(
+            self._item("cloudfunctions.googleapis.com/Function", "function-1"),
+            run_service_names={"www-1"})
+        assert got2["level"] == "action"
+
+    def test_gke_internal_range_is_p3(self):
+        got = classify_missing_asset(self._item(
+            "networkconnectivity.googleapis.com/InternalRange",
+            "gke-my-ec-cluster-pods-fd56f6a4"))
+        assert got["level"] == "reference" and got["priority"] == 3
+
+
+class TestParseTfResourcesIdFallbacks:
+    def test_repository_id_is_used_when_no_name(self, temp_dir):
+        with open(os.path.join(temp_dir, "ar.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_artifact_registry_repository" '
+                    '"cloud_run_source_deploy" {\n'
+                    '  repository_id = "cloud-run-source-deploy"\n'
+                    '  location      = "asia-northeast1"\n'
+                    '}\n')
+        got = parse_tf_resources(temp_dir)
+        assert "cloud-run-source-deploy" in \
+            got["google_artifact_registry_repository"]
+
+    def test_label_fallback_registers_hyphen_alias(self, temp_dir):
+        with open(os.path.join(temp_dir, "x.tf"), "w", encoding="utf-8") as f:
+            f.write('resource "google_dataform_repository" "my_repo" {\n'
+                    '  display_name = "x"\n'
+                    '}\n')
+        got = parse_tf_resources(temp_dir)
+        names = got["google_dataform_repository"]
+        assert "my_repo" in names and "my-repo" in names
+
+
+class TestCheckDstProjectsExist:
+    """dst 未作成のまま 30 分走らせない fail-fast。"""
+
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def test_missing_project_exits_before_any_write(self, temp_dir):
+        from unittest.mock import patch, MagicMock
+        o = self._orch(temp_dir)
+        res = MagicMock(returncode=1, stdout="", stderr="ERROR: not found")
+        with patch("subprocess.run", return_value=res), \
+             pytest.raises(SystemExit):
+            o.check_dst_projects_exist()
+
+    def test_active_projects_pass(self, temp_dir):
+        from unittest.mock import patch, MagicMock
+        o = self._orch(temp_dir)
+        res = MagicMock(returncode=0, stdout="ACTIVE\n", stderr="")
+        with patch("subprocess.run", return_value=res):
+            o.check_dst_projects_exist()   # 例外なし
+
+    def test_delete_requested_state_fails(self, temp_dir):
+        from unittest.mock import patch, MagicMock
+        o = self._orch(temp_dir)
+        res = MagicMock(returncode=0, stdout="DELETE_REQUESTED\n", stderr="")
+        with patch("subprocess.run", return_value=res), \
+             pytest.raises(SystemExit):
+            o.check_dst_projects_exist()
+
+    def test_mock_mode_skips(self, temp_dir):
+        from unittest.mock import patch
+        cfg = _full_config(temp_dir)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path, mock_override=True)
+        o.load_config()
+        o.org_logger = logging.getLogger("test-org")
+        with patch("subprocess.run") as sr:
+            o.check_dst_projects_exist()
+        assert sr.call_count == 0
+
+
+class TestRunLock:
+    """make run / plan の多重起動ガード（state 相互破壊の防止）。"""
+
+    def _orch(self, temp_dir):
+        cfg = _full_config(temp_dir, steps={
+            "bulk_export": {"output_dir": os.path.join(temp_dir, "terraform")}})
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_second_instance_is_rejected(self, temp_dir):
+        o1 = self._orch(temp_dir)
+        o1._acquire_run_lock()
+        o2 = self._orch(temp_dir)
+        with pytest.raises(SystemExit):
+            o2._acquire_run_lock()
+
+    def test_lock_released_on_close(self, temp_dir):
+        o1 = self._orch(temp_dir)
+        o1._acquire_run_lock()
+        o1._run_lock_file.close()   # プロセス終了相当
+        o2 = self._orch(temp_dir)
+        o2._acquire_run_lock()      # 取得できる（例外なし）
+
+    def test_mock_uses_separate_lock_dir(self, temp_dir):
+        o1 = self._orch(temp_dir)
+        o1._acquire_run_lock()
+        cfg = _full_config(temp_dir, steps={
+            "bulk_export": {"output_dir": os.path.join(temp_dir, "terraform")}})
+        path = os.path.join(temp_dir, "config2.yaml")
+        _write_yaml(path, cfg)
+        om = MigrationOrchestrator(path, mock_override=True)
+        om.load_config()
+        om._acquire_run_lock()      # terraform/mock 配下なので競合しない
+
+
+# ============================================================
+# bulk-export の timeout 対策（Kind 絞り込み / storage-path / 再試行）
+# ============================================================
+class TestBulkExportScaleOptions:
+    def _orch(self, temp_dir, bulk_extra):
+        bulk = {"enabled": True, "output_dir": os.path.join(temp_dir, "terraform")}
+        bulk.update(bulk_extra)
+        cfg = _full_config(temp_dir, steps={"bulk_export": bulk})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def _run(self, o):
+        from unittest.mock import patch
+        issued = []
+
+        def _rc(cmd, **kw):
+            issued.append((cmd, kw))
+            return ""
+
+        with patch.object(o, "run_command", side_effect=_rc), \
+             patch.object(o, "_build_project_number_map"), \
+             patch.object(o, "customize_hcl"):
+            o.step_bulk_export()
+        return [(c, k) for c, k in issued if "bulk-export" in c]
+
+    def test_export_resource_types_passed_to_gcloud(self, temp_dir):
+        o = self._orch(temp_dir, {"export_resource_types":
+                                  ["ComputeInstance", "ComputeNetwork"]})
+        got = self._run(o)
+        assert got and "--resource-types=ComputeInstance,ComputeNetwork" in got[0][0]
+        # 排他なので storage-path は付かない
+        assert "--storage-path" not in got[0][0]
+
+    def test_storage_path_passed_when_no_kind_filter(self, temp_dir):
+        o = self._orch(temp_dir, {"storage_path": "gs://b/prefix"})
+        got = self._run(o)
+        assert got and "--storage-path=gs://b/prefix" in got[0][0]
+
+    def test_kind_filter_wins_over_storage_path(self, temp_dir):
+        o = self._orch(temp_dir, {"export_resource_types": ["ComputeInstance"],
+                                  "storage_path": "gs://b/prefix"})
+        got = self._run(o)
+        assert "--resource-types=ComputeInstance" in got[0][0]
+        assert "--storage-path" not in got[0][0]
+
+    def test_retry_defaults_are_longer_and_fewer(self, temp_dir):
+        o = self._orch(temp_dir, {})
+        got = self._run(o)
+        _cmd, kw = got[0]
+        assert kw["retries"] == 2
+        assert kw["retry_wait_seconds"] == 180
+
+    def test_retry_settings_are_configurable(self, temp_dir):
+        o = self._orch(temp_dir, {"retries": 1, "retry_wait_seconds": 600})
+        _cmd, kw = self._run(o)[0]
+        assert kw["retries"] == 1 and kw["retry_wait_seconds"] == 600
+
+    def test_no_options_keeps_plain_command(self, temp_dir):
+        o = self._orch(temp_dir, {})
+        cmd = self._run(o)[0][0]
+        assert "--resource-types" not in cmd and "--storage-path" not in cmd
+
+
+class TestBulkExportScaleValidation:
+    def _errs(self, temp_dir, bulk_extra):
+        bulk = {"enabled": True}
+        bulk.update(bulk_extra)
+        return validate_steps_config(_full_config(temp_dir,
+                                                  steps={"bulk_export": bulk}))
+
+    def test_terraform_type_in_kind_list_is_rejected(self, temp_dir):
+        errs = self._errs(temp_dir, {"export_resource_types": ["google_compute_instance"]})
+        assert any("KRM Kind" in e for e in errs)
+
+    def test_lowercase_kind_is_rejected(self, temp_dir):
+        errs = self._errs(temp_dir, {"export_resource_types": ["computeInstance"]})
+        assert any("KRM Kind" in e for e in errs)
+
+    def test_valid_kinds_pass(self, temp_dir):
+        errs = self._errs(temp_dir, {"export_resource_types":
+                                     ["ComputeInstance", "ContainerCluster"]})
+        assert not [e for e in errs if "export_resource_types" in e]
+
+    def test_bad_storage_path_is_rejected(self, temp_dir):
+        errs = self._errs(temp_dir, {"storage_path": "my-bucket/prefix"})
+        assert any("gs://" in e for e in errs)
+
+    def test_valid_storage_path_passes(self, temp_dir):
+        errs = self._errs(temp_dir, {"storage_path": "gs://my-bucket/prefix"})
+        assert not [e for e in errs if "storage_path" in e]
+
+
+class TestRunCommandRetryWait:
+    def test_custom_wait_is_used(self, temp_dir):
+        from unittest.mock import patch, MagicMock
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.org_logger = logging.getLogger("test-org")
+        o.dst_logger = logging.getLogger("test-dst")
+        slept = []
+        fail = MagicMock(returncode=1, stdout="", stderr="boom")
+        with patch("subprocess.run", return_value=fail), \
+             patch("time.sleep", side_effect=lambda s: slept.append(s)):
+            o.run_command("gcloud compute instances list --project=p", side="src",
+                          logger=o.org_logger, allow_fail=True,
+                          retries=2, retry_wait_seconds=120)
+        assert slept == [120, 120]
+
+    def test_default_backoff_unchanged(self, temp_dir):
+        from unittest.mock import patch, MagicMock
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.org_logger = logging.getLogger("test-org")
+        o.dst_logger = logging.getLogger("test-dst")
+        slept = []
+        fail = MagicMock(returncode=1, stdout="", stderr="boom")
+        with patch("subprocess.run", return_value=fail), \
+             patch("time.sleep", side_effect=lambda s: slept.append(s)):
+            o.run_command("gcloud compute instances list --project=p", side="src",
+                          logger=o.org_logger, allow_fail=True, retries=2)
+        assert slept == [5, 10]
+
+
+class TestAutoKindExclusion:
+    """export_resource_types: auto — Kind 自動判定で k8s を対象外にする。"""
+
+    def test_parse_krm_kinds_filters_unsupported(self):
+        text = json.dumps([
+            {"GVK": {"Kind": "ComputeInstance"}, "SupportsBulkExport": True},
+            {"GVK": {"Kind": "ComputeNetwork"}, "SupportsBulkExport": True},
+            {"GVK": {"Kind": "IAMPolicy"}, "SupportsBulkExport": False},
+            {"GVK": {"Kind": ""}, "SupportsBulkExport": True},
+        ])
+        assert parse_krm_kinds(text) == ["ComputeInstance", "ComputeNetwork"]
+
+    def test_parse_krm_kinds_broken_input(self):
+        assert parse_krm_kinds(None) == [] and parse_krm_kinds("nope") == []
+
+    def _orch(self, temp_dir, bulk_extra):
+        bulk = {"enabled": True, "output_dir": os.path.join(temp_dir, "terraform")}
+        bulk.update(bulk_extra)
+        cfg = _full_config(temp_dir, steps={"bulk_export": bulk})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        return o
+
+    def test_auto_queries_kinds_and_passes_them(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, {"export_resource_types": "auto"})
+        kinds_json = json.dumps([
+            {"GVK": {"Kind": "ComputeInstance"}, "SupportsBulkExport": True},
+            {"GVK": {"Kind": "ContainerCluster"}, "SupportsBulkExport": True},
+        ])
+        issued = []
+
+        with patch.object(o, "_soft_run", return_value=(0, kinds_json, "")), \
+             patch.object(o, "run_command",
+                          side_effect=lambda cmd, **kw: issued.append(cmd) or ""), \
+             patch.object(o, "_build_project_number_map"), \
+             patch.object(o, "customize_hcl"):
+            o.step_bulk_export()
+
+        exports = [c for c in issued if "bulk-export" in c]
+        assert exports
+        assert "--resource-types=ComputeInstance,ContainerCluster" in exports[0]
+
+    def test_auto_falls_back_when_listing_fails(self, temp_dir):
+        from unittest.mock import patch
+        o = self._orch(temp_dir, {"export_resource_types": "auto"})
+        issued = []
+        with patch.object(o, "_soft_run", return_value=(1, "", "ERROR: denied")), \
+             patch.object(o, "run_command",
+                          side_effect=lambda cmd, **kw: issued.append(cmd) or ""), \
+             patch.object(o, "_build_project_number_map"), \
+             patch.object(o, "customize_hcl"):
+            o.step_bulk_export()
+        exports = [c for c in issued if "bulk-export" in c]
+        # 取得できなければ絞り込みなしで続行（移行範囲は狭めない安全側）
+        assert exports and "--resource-types" not in exports[0]
+
+    def test_auto_is_accepted_by_validation(self, temp_dir):
+        errs = validate_steps_config(_full_config(temp_dir, steps={
+            "bulk_export": {"enabled": True, "export_resource_types": "auto"}}))
+        assert not [e for e in errs if "export_resource_types" in e]
+
+    def test_bad_string_still_rejected(self, temp_dir):
+        errs = validate_steps_config(_full_config(temp_dir, steps={
+            "bulk_export": {"enabled": True, "export_resource_types": "everything"}}))
+        assert any("export_resource_types" in e for e in errs)
+
+    def test_list_command_is_read_only_and_mock_known(self):
+        cmd = ("gcloud beta resource-config list-resource-types "
+               "--project=p --format=json --quiet")
+        assert is_src_read_only(cmd) and is_known_mock_command(cmd)

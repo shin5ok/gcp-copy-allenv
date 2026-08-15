@@ -35,7 +35,10 @@ CUSTOM_ROLE_ID="migrationSrcReader"
 # serviceusage.services.list は Step 1.5（dst API 事前有効化）で src の有効 API を
 # 読むために必要。無い場合は CAI 出力にフォールバックするため fail-fast にはしない。
 CUSTOM_PERMS="storage.buckets.get,storage.buckets.list,storage.objects.get,storage.objects.list,compute.snapshots.useReadOnly,compute.snapshots.get,compute.snapshots.list,compute.disks.get,compute.disks.list,compute.firewalls.list,compute.networkFirewallPolicies.list,resourcemanager.projects.getIamPolicy,serviceusage.services.list"
-PREDEFINED_ROLES=("roles/bigquery.dataViewer")
+# Artifact Registry のイメージ読み取り（Step 3.7 の AR イメージ複製。dst SA が
+# src のイメージを pull するため必要。カスタムロールに artifactregistry.* を
+# 個別列挙するより定義済みロールの方が版追従で安全）
+PREDEFINED_ROLES=("roles/bigquery.dataViewer" "roles/artifactregistry.reader")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

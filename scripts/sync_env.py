@@ -26,6 +26,8 @@ import time
 import datetime
 import threading
 import concurrent.futures
+import fnmatch
+import fcntl
 from typing import Dict, Iterable, List, Optional, Any, Set, Tuple
 
 # ---------------------------------------------------------------------------
@@ -45,6 +47,9 @@ _WRITE_VERBS = (
     "suspend", "resume",
     "apply", "destroy", "mk", "cp", "rm", "rsync", "mv",
     "import", "patch", "replace",
+    # Artifact Registry イメージ複製で使う書込動詞。src 側で誤って実行されないよう
+    # 拒否リストに入れる（copy は将来 gcloud に生えた場合の保険）。
+    "copy", "push", "tag", "rmi",
 )
 
 # Mock モード時に「分かっている」と判定するコマンド先頭パターン。
@@ -52,6 +57,7 @@ _WRITE_VERBS = (
 _MOCK_KNOWN_PATTERNS = (
     "gcloud asset search-all-resources",
     "gcloud beta resource-config bulk-export",
+    "gcloud beta resource-config list-resource-types",
     "gcloud compute instances list",
     "gcloud compute instances describe",
     "gcloud compute instances create",
@@ -90,10 +96,24 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud compute network-firewall-policies associations create",
     "gcloud access-context-manager perimeters describe",
     "gcloud access-context-manager perimeters update",
+    "gcloud run services list",
+    "gcloud run services get-iam-policy",
+    "gcloud run services describe",
+    "gcloud run services add-iam-policy-binding",
     "gcloud iam service-accounts create",
     "gcloud projects get-iam-policy",
     "gcloud projects add-iam-policy-binding",
     "gcloud services enable",
+    "gcloud artifacts repositories list",
+    "gcloud artifacts repositories describe",
+    "gcloud artifacts repositories create",
+    "gcloud artifacts docker images list",
+    "gcloud artifacts docker images describe",
+    "gcloud auth configure-docker",
+    "docker pull",
+    "docker tag",
+    "docker push",
+    "docker image rm",
     "bq ls",
     "bq show",
     "bq mk",
@@ -133,6 +153,12 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
     "compute.googleapis.com/InstanceGroupManager": "terraform_apply",
     "compute.googleapis.com/InstanceGroup":        "terraform_apply",
     "compute.googleapis.com/NetworkEndpointGroup": "terraform_apply",
+    "compute.googleapis.com/TargetPool":           "terraform_apply",   # k8s LB 由来は skip + DIFF 参考
+    "compute.googleapis.com/HttpHealthCheck":      "terraform_apply",
+    "compute.googleapis.com/HttpsHealthCheck":     "terraform_apply",
+    "compute.googleapis.com/HealthCheck":          "terraform_apply",
+    "compute.googleapis.com/Autoscaler":           "terraform_apply",
+    "compute.googleapis.com/ForwardingRule":       "terraform_apply",
     # --- container (GKE: クラスタ構成のみ複製。ノード VM は Step 2/5 で除外) ---
     "container.googleapis.com/Cluster":       "terraform_apply",
     "container.googleapis.com/NodePool":      "terraform_apply",
@@ -144,6 +170,59 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
     "storage.googleapis.com/Bucket":          "data_sync",             # terraform で作成、data_sync で内容コピー
     "bigquery.googleapis.com/Dataset":        "data_sync",
     "bigquery.googleapis.com/Table":          "data_sync",
+    # --- artifact registry ---
+    "artifactregistry.googleapis.com/Repository":  "terraform_apply",  # bulk-export 出力
+    "artifactregistry.googleapis.com/DockerImage": "data_sync",        # _sync_artifact_registry がイメージ複製
+    # --- pubsub / monitoring / logging（bulk-export が出力する） ---
+    "pubsub.googleapis.com/Topic":            "terraform_apply",
+    "monitoring.googleapis.com/AlertPolicy":  "terraform_apply",
+    "monitoring.googleapis.com/NotificationChannel": "terraform_apply",  # 越境分は customize が skip + 注記
+    "monitoring.googleapis.com/Dashboard":    None,   # 可視化。運用継続に必須でない（必要なら手動エクスポート）
+    "monitoring.googleapis.com/UptimeCheckConfig": None,  # 監視設定。dst URL が変わるため手動再作成が自然
+    "logging.googleapis.com/LogMetric":       "terraform_apply",  # export されない場合は要対応で出る
+    # --- LB フロント（bulk-export が出力する） ---
+    "compute.googleapis.com/BackendService":  "terraform_apply",
+    "compute.googleapis.com/SecurityPolicy":  "terraform_apply",
+    "compute.googleapis.com/TargetHttpsProxy": "terraform_apply",
+    "compute.googleapis.com/TargetHttpProxy":  "terraform_apply",
+    "compute.googleapis.com/UrlMap":          "terraform_apply",
+    "compute.googleapis.com/SslCertificate":  "terraform_apply",  # self-managed は customize が skip + 要対応注記
+    # --- secret / functions / build（export されない = 欠落は要対応で出る） ---
+    "secretmanager.googleapis.com/Secret":        "terraform_apply",
+    "secretmanager.googleapis.com/SecretVersion": "terraform_apply",  # classify で Secret 本体へ集約
+    "cloudfunctions.googleapis.com/Function":     "terraform_apply",
+    "cloudbuild.googleapis.com/BuildTrigger":     "terraform_apply",
+    "cloudbuild.googleapis.com/GlobalTriggerSettings": None,  # プロジェクト設定シングルトン。作成不可
+    # --- dataplex / servicedirectory（大半は自動生成。classify で判定） ---
+    "dataplex.googleapis.com/EntryGroup":     "terraform_apply",
+    "servicedirectory.googleapis.com/Namespace": "terraform_apply",
+    "servicedirectory.googleapis.com/Service":   "terraform_apply",
+    "servicedirectory.googleapis.com/Endpoint":  "terraform_apply",
+    # --- Security Command Center（サービス設定オブジェクト。自動存在・作成不可） ---
+    "securitycentermanagement.googleapis.com/SecurityCenterService": None,
+    "securitycenter.googleapis.com/ContainerThreatDetectionSettings": None,
+    "securitycenter.googleapis.com/EventThreatDetectionSettings": None,
+    "securitycenter.googleapis.com/SecurityHealthAnalyticsSettings": None,
+    "securitycenter.googleapis.com/VirtualMachineThreatDetectionSettings": None,
+    "securitycenter.googleapis.com/WebSecurityScannerSettings": None,
+    # --- その他（export されない。欠落は要対応） ---
+    "certificatemanager.googleapis.com/DnsAuthorization": "terraform_apply",
+    "networkservices.googleapis.com/WasmPlugin":         "terraform_apply",
+    "networkservices.googleapis.com/WasmPluginVersion":  "terraform_apply",
+    "aiplatform.googleapis.com/NotebookRuntimeTemplate": "terraform_apply",
+    "networkconnectivity.googleapis.com/InternalRange":  "terraform_apply",
+    "dataform.googleapis.com/Repository":                "terraform_apply",
+    "firestore.googleapis.com/Database":                 "terraform_apply",
+    "dns.googleapis.com/ResourceRecordSet":  None,  # zone とセットで手動移行（zone の注記参照）
+    "orgpolicy.googleapis.com/Policy":       "terraform_apply",  # export されない。dst 挙動に影響するため要対応
+    # --- dns ---
+    "dns.googleapis.com/ManagedZone":        "terraform_apply",  # public は customize が skip + DIFF 要対応
+    "dns.googleapis.com/ResourceRecordSet":  None,               # zone とセットで手動移行（委任切替が要る）
+    # --- cloud run ---
+    # bulk-export はリージョンによって取りこぼす（regression: us-central1 の
+    # www-1 / test-1 が未出力）。欠落は DIFF 要対応で手動作成を案内する。
+    "run.googleapis.com/Service":  "terraform_apply",
+    "run.googleapis.com/Revision": None,   # リビジョン履歴。デプロイで再生成される
     # --- iam ---
     "iam.googleapis.com/Role":                "terraform_apply",       # bulk-export が custom role を出力
     "iam.googleapis.com/ServiceAccount":      "terraform_apply",       # bulk-export 出力
@@ -414,13 +493,55 @@ _CAI_TO_TF_RESOURCE: Dict[str, Tuple[str, ...]] = {
     "compute.googleapis.com/Snapshot":        ("google_compute_snapshot",),
     "compute.googleapis.com/Image":           ("google_compute_image",),
     "compute.googleapis.com/ResourcePolicy":  ("google_compute_resource_policy",),
-    "compute.googleapis.com/InstanceTemplate": ("google_compute_instance_template",),
+    "compute.googleapis.com/InstanceTemplate": ("google_compute_instance_template",
+                                                "google_compute_region_instance_template"),
     "compute.googleapis.com/InstanceGroupManager": ("google_compute_instance_group_manager",
                                                     "google_compute_region_instance_group_manager"),
     "compute.googleapis.com/InstanceGroup":   ("google_compute_instance_group",),
-    "compute.googleapis.com/NetworkEndpointGroup": ("google_compute_network_endpoint_group",),
+    # Cloud Run のサーバーレス NEG は必ず regional として export される。
+    # zonal 変種しか登録しないと「bulk-export が出力しなかった」と誤報し続ける。
+    "compute.googleapis.com/NetworkEndpointGroup": (
+        "google_compute_network_endpoint_group",
+        "google_compute_region_network_endpoint_group",
+        "google_compute_global_network_endpoint_group"),
+    "compute.googleapis.com/TargetPool":      ("google_compute_target_pool",),
+    "compute.googleapis.com/HttpHealthCheck": ("google_compute_http_health_check",),
+    "compute.googleapis.com/HttpsHealthCheck": ("google_compute_https_health_check",),
+    "compute.googleapis.com/HealthCheck":     ("google_compute_health_check",
+                                               "google_compute_region_health_check"),
+    "compute.googleapis.com/Autoscaler":      ("google_compute_autoscaler",
+                                               "google_compute_region_autoscaler"),
+    "compute.googleapis.com/ForwardingRule":  ("google_compute_forwarding_rule",
+                                               "google_compute_global_forwarding_rule"),
     "container.googleapis.com/Cluster":       ("google_container_cluster",),
     "container.googleapis.com/NodePool":      ("google_container_node_pool",),
+    "artifactregistry.googleapis.com/Repository": ("google_artifact_registry_repository",),
+    "run.googleapis.com/Service": ("google_cloud_run_v2_service",
+                                   "google_cloud_run_service"),
+    "pubsub.googleapis.com/Topic": ("google_pubsub_topic",),
+    "monitoring.googleapis.com/AlertPolicy": ("google_monitoring_alert_policy",),
+    "monitoring.googleapis.com/NotificationChannel": ("google_monitoring_notification_channel",),
+    "logging.googleapis.com/LogMetric": ("google_logging_metric",),
+    "compute.googleapis.com/BackendService": ("google_compute_backend_service",
+                                              "google_compute_region_backend_service"),
+    "compute.googleapis.com/SecurityPolicy": ("google_compute_security_policy",),
+    "compute.googleapis.com/TargetHttpsProxy": ("google_compute_target_https_proxy",),
+    "compute.googleapis.com/TargetHttpProxy": ("google_compute_target_http_proxy",),
+    "compute.googleapis.com/UrlMap": ("google_compute_url_map",),
+    "compute.googleapis.com/SslCertificate": ("google_compute_ssl_certificate",
+                                              "google_compute_managed_ssl_certificate"),
+    "secretmanager.googleapis.com/Secret": ("google_secret_manager_secret",),
+    "cloudfunctions.googleapis.com/Function": ("google_cloudfunctions_function",
+                                               "google_cloudfunctions2_function"),
+    "cloudbuild.googleapis.com/BuildTrigger": ("google_cloudbuild_trigger",),
+    "dataplex.googleapis.com/EntryGroup": ("google_dataplex_entry_group",),
+    "servicedirectory.googleapis.com/Namespace": ("google_service_directory_namespace",),
+    "servicedirectory.googleapis.com/Service": ("google_service_directory_service",),
+    "servicedirectory.googleapis.com/Endpoint": ("google_service_directory_endpoint",),
+    "certificatemanager.googleapis.com/DnsAuthorization": ("google_certificate_manager_dns_authorization",),
+    "networkconnectivity.googleapis.com/InternalRange": ("google_network_connectivity_internal_range",),
+    "firestore.googleapis.com/Database": ("google_firestore_database",),
+    "dataform.googleapis.com/Repository": ("google_dataform_repository",),
     "storage.googleapis.com/Bucket":          ("google_storage_bucket",),
     "bigquery.googleapis.com/Dataset":        ("google_bigquery_dataset",),
     "bigquery.googleapis.com/Table":          ("google_bigquery_table",),
@@ -545,8 +666,27 @@ def parse_tf_resources(tf_dir: str) -> Dict[str, List[str]]:
                 body_end = text.find("\nresource ", body_start)
                 body = text[body_start: body_end if body_end != -1 else len(text)]
                 nm = _TF_NAME_ATTR_RE.search(body)
-                name_val = nm.group(1) if nm else label
-                out.setdefault(rtype, []).append(name_val)
+                if nm:
+                    out.setdefault(rtype, []).append(nm.group(1))
+                    continue
+                # name を持たない型は型固有の ID 属性を使う（例: Artifact Registry の
+                # repository_id、SA の account_id、Secret の secret_id）。これを
+                # 見ないと Terraform ラベル（ハイフンが _ に変換されている）と
+                # CAI 名（ハイフン）が食い違い、export 済みリソースまで
+                # 「bulk-export が出力しなかった」と誤検知する（regression:
+                # AR リポジトリ 5 件が要対応に出ていた）。
+                idm = re.search(
+                    r'^\s*(?:repository_id|account_id|secret_id|metric_id|'
+                    r'trigger_id|topic|dataset_id)\s*=\s*"([^"]+)"', body, re.M)
+                if idm:
+                    out.setdefault(rtype, []).append(idm.group(1))
+                    continue
+                # ラベルにフォールバック。bulk-export のラベルは名前のハイフンを
+                # `_` に変えただけのことが多いので、逆変換の別名も登録して
+                # CAI 名（ハイフン）と照合できるようにする。
+                out.setdefault(rtype, []).append(label)
+                if "_" in label:
+                    out.setdefault(rtype, []).append(label.replace("_", "-"))
     return out
 
 
@@ -731,6 +871,15 @@ _GKE_DERIVED_ASSET_TYPES = frozenset({
     "compute.googleapis.com/InstanceGroupManager",
     "compute.googleapis.com/InstanceGroup",
     "compute.googleapis.com/NetworkEndpointGroup",
+    # k8s Service (type=LoadBalancer) が作る LB 一式。名前は gke-*/k8s-* 接頭辞
+    # または a+32hex（is_k8s_lb_resource_name）。
+    "compute.googleapis.com/TargetPool",
+    "compute.googleapis.com/ForwardingRule",
+    "compute.googleapis.com/HttpHealthCheck",
+    "compute.googleapis.com/HealthCheck",
+    "compute.googleapis.com/Autoscaler",
+    # GKE の Pod range に対応して自動作成される internal range 表現
+    "networkconnectivity.googleapis.com/InternalRange",
 })
 
 
@@ -767,6 +916,59 @@ def is_gke_managed_name(name: Optional[str]) -> bool:
     スキップ / DIFF.md 分類の 3 箇所すべてに同時に効く点に注意。
     """
     return bool(name) and str(name).startswith(_GKE_MANAGED_NAME_PREFIXES)
+
+
+# k8s の service controller が GCE リソース（target pool / forwarding rule /
+# health check / FW ルール）に必ず書き込む所有者マーカー。名前が hex UID
+# （`a<31hex>`）で接頭辞判定に掛からないリソースはこれで判定する。
+# HCL 上はエスケープ済み（description = "{\"kubernetes.io/service-name\":...}"）。
+_K8S_OWNER_MARKER_RE = re.compile(
+    r'^\s*description\s*=\s*".*kubernetes\.io/(service-name|service-ip|cluster-id)',
+    re.M,
+)
+
+# k8s Service (type=LoadBalancer) が作るリソース名: "a" + サービス UID の hex 32 桁。
+_K8S_LB_NAME_RE = re.compile(r'^a[0-9a-f]{31}$')
+
+
+def has_k8s_owner_marker(content: str) -> bool:
+    """HCL 本文の description に kubernetes.io 所有者マーカーがあれば True。"""
+    return bool(_K8S_OWNER_MARKER_RE.search(content or ""))
+
+
+def is_k8s_lb_resource_name(name: Optional[str]) -> bool:
+    """名前が k8s LB リソースの UID 由来命名（a+32hex）なら True。"""
+    return bool(name) and bool(_K8S_LB_NAME_RE.match(str(name)))
+
+
+# GKE 本体が作る classic FW ルール名: gke-<cluster>-<8hex>-<suffix>
+# （vms / all / master / exkubelet / inkubelet 等。suffix は増えるので固定しない）。
+# こちらは description マーカーを持たないため構造で判定する。
+_GKE_CORE_FW_NAME_RE = re.compile(r'^(gke|gk3)-.+-[0-9a-f]{8}-[a-z0-9-]+$')
+
+# k8s service controller のルール名（hex ハッシュ入りの機械命名）。description
+# マーカーが正だが、gcloud の list 出力に description が無い等の場合の保険。
+_K8S_FW_NAME_RE = re.compile(
+    r'^(k8s-fw-a?[0-9a-f]{6,}(-[a-z0-9-]+)?'
+    r'|k8s-[0-9a-f]{12,}-node(-[a-z0-9-]+)?'
+    r'|k8s2-[0-9a-f]{4,10}-.+-[0-9a-f]{4,10})$'
+)
+
+
+def is_gke_managed_fw_rule(rule: Dict[str, Any]) -> bool:
+    """classic FW ルールが GKE / k8s の自動生成なら True。
+
+    第一判定は description の kubernetes.io 所有者マーカー（k8s service
+    controller が作る k8s-fw-* / k8s2-* / ノード HC ルールは必ず持つ）。
+    フォールバックは構造判定（GKE 本体ルールのクラスタ固有 8 hex /
+    k8s ルールの hex ハッシュ命名）。**接頭辞だけでは判定しない**:
+    `k8s-nodeport-allow` / `gke-admin-bastion` のような利用者ルール
+    （DENY かもしれない）を落とすと dst が src より緩くなる。
+    """
+    if 'kubernetes.io/' in (rule.get('description') or ''):
+        return True
+    name = rule.get('name') or ''
+    return bool(_GKE_CORE_FW_NAME_RE.match(name)) or bool(_K8S_FW_NAME_RE.match(name))
 
 
 # ---------------------------------------------------------------------------
@@ -815,11 +1017,97 @@ def bound_custom_role_ids(src_policies: Dict[str, Dict[str, Any]]) -> set:
     return out
 
 
+def cai_in_use_internal_addresses(cai_path: str) -> Set[str]:
+    """CAI から「src で VM 等が使用中（IN_USE）の内部アドレス」名を返す（純粋関数）。
+
+    これらの予約は Step 5 (gce_restore) が VM と同じプロジェクトに
+    `mig-<vm>-<ip>` として作り直す責務を持つ（DIFF の P1 分類と同じ設計知識）。
+    Terraform 側でも複製すると二重予約になり、特に Shared VPC では
+    「host 側の予約が service プロジェクトの VM 作成をブロックする」
+    （reserved by another project）ため、customize で複製から外す。
+    RESERVED（未使用の取り置き）は元 IP のまま複製する（対象外）。
+    """
+    names: Set[str] = set()
+    for rec in parse_cai_resources(cai_path):
+        if not rec.get("asset_type", "").endswith("/Address"):
+            continue
+        if rec.get("state") != "IN_USE":
+            continue
+        if not _is_private_ip(rec.get("ip_address")):
+            continue
+        short = (rec.get("short_name") or "").strip()
+        if short:
+            names.add(short)
+    return names
+
+
+def parse_krm_kinds(text: Optional[str]) -> List[str]:
+    """`gcloud beta resource-config list-resource-types --format=json` を解析する。
+
+    bulk-export 可能な KRM Kind 名（`ComputeInstance` 等）だけをソートして返す
+    （純粋関数）。この一覧は **GCP リソースの Kind のみ**で、クラスタ内の
+    k8s オブジェクト（Pod / Deployment 等）は最初から含まれない。
+    """
+    try:
+        data = json.loads(text) if text else []
+    except (ValueError, TypeError):
+        return []
+    kinds: Set[str] = set()
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict) or not item.get("SupportsBulkExport"):
+            continue
+        kind = ((item.get("GVK") or {}).get("Kind") or "").strip()
+        if kind:
+            kinds.add(kind)
+    return sorted(kinds)
+
+
+def tf_type_kept(
+    tf_type: str, include: Iterable[str], exclude: Iterable[str],
+) -> bool:
+    """Terraform リソース型が移行対象かを判定する（純粋関数）。
+
+    `steps.bulk_export.resource_types` による移行範囲の絞り込み。
+    - `exclude` に一致したら対象外（**exclude が include より強い**）
+    - `include` が空なら全型が対象（既定 = 全量コピー）
+    - `include` があればそれに一致する型だけが対象
+    パターンは fnmatch（`google_compute_*` のようなワイルドカード）。
+    """
+    inc = [p for p in (include or []) if p]
+    exc = [p for p in (exclude or []) if p]
+    if any(fnmatch.fnmatchcase(tf_type, p) for p in exc):
+        return False
+    if not inc:
+        return True
+    return any(fnmatch.fnmatchcase(tf_type, p) for p in inc)
+
+
+def resource_type_filter_reason(
+    tf_types: Iterable[str], include: Iterable[str], exclude: Iterable[str],
+) -> Optional[str]:
+    """ファイル内の全リソース型が対象外なら skip 理由を返す（純粋関数）。
+
+    **1 つでも対象の型が残るファイルは落とさない**（安全側 = コピーする）。
+    resource ブロックが無いファイルやフィルタ未指定のときは None。
+    """
+    types = [t for t in (tf_types or []) if t]
+    if not types:
+        return None
+    if not [p for p in (include or []) if p] and not [p for p in (exclude or []) if p]:
+        return None
+    if any(tf_type_kept(t, include, exclude) for t in types):
+        return None
+    return (f"resource_types の対象外（{', '.join(sorted(set(types)))}）")
+
+
 def classify_missing_asset(
     item: Dict[str, Any],
     iam_sync_enabled: bool = True,
     bound_custom_roles: Optional[set] = None,
     gce_restore_enabled: bool = True,
+    rt_include: Optional[Iterable[str]] = None,
+    rt_exclude: Optional[Iterable[str]] = None,
+    run_service_names: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """欠落 1 件を action / reference に分類し、WHAT 用の種別と WHY / HOW を返す。
 
@@ -848,6 +1136,17 @@ def classify_missing_asset(
 
     def act(why: str, how: str) -> Dict[str, Any]:
         return {"level": "action", "kind": kind, "why": why, "how": how, "priority": 0}
+
+    # 利用者が resource_types で意図的に対象外にした型は「対応不要」。
+    # 期待 TF 型が全て対象外のときだけ落とす（型が引けないものは従来判定へ）。
+    expected_tf = _CAI_TO_TF_RESOURCE.get(atype, ())
+    if expected_tf and (rt_include or rt_exclude) and not any(
+            tf_type_kept(t, rt_include or [], rt_exclude or []) for t in expected_tf):
+        return ref(
+            "steps.bulk_export.resource_types で移行対象から除外している型"
+            f"（{', '.join(expected_tf)}）。設定どおり dst に作られていない。",
+            "移行したくなった場合は resource_types の指定を外して再実行。",
+            priority=3)
 
     if atype == "iam.googleapis.com/ServiceAccount":
         if not parse_user_managed_sa(short):
@@ -929,12 +1228,73 @@ def classify_missing_asset(
             "--format='value(address,status,users)'` で用途を確認 → 必要なら下記の "
             "create コマンドで dst に予約（**IP 値は変わる**ので参照側の設定も更新）。")
 
-    if atype in _GKE_DERIVED_ASSET_TYPES and is_gke_managed_name(short):
+    # Cloud DNS はゾーンを name と数値 ID（v2 API 表現）の 2 系統で CAI に出す。
+    # 数値 ID の行は名前付きゾーン行の重複計上なので、独立の作業項目にしない。
+    if atype == "dns.googleapis.com/ManagedZone" and short.isdigit():
+        return ref(
+            "同一ゾーンの別表現（CAI の v2 API 形式は数値 ID で同じゾーンを再掲する）。",
+            "名前付きの ManagedZone 行（または customize 注記）で対応すれば足りる。",
+            priority=2)
+
+    # 通知チャネルは server 採番 ID のため別プロジェクトへ同 ID では複製できない。
+    # customize が参照を除去して注記済み（alert_notification_channels）。
+    if atype == "monitoring.googleapis.com/NotificationChannel":
+        return ref(
+            "通知チャネルは server 採番 ID で、同じ ID を dst に作ることは不可能。"
+            "customize がアラートからの参照を外し、DIFF の注記に再設定手順がある。",
+            "dst でチャネルを作成し直し、アラートポリシーに再設定する（注記参照）。",
+            priority=2)
+
+    # gen2 Cloud Functions の実体は Cloud Run サービス。同名の run.Service が
+    # CAI にあるなら二重計上なので、Cloud Run 側の行に集約する。
+    if (atype == "cloudfunctions.googleapis.com/Function"
+            and run_service_names and short in run_service_names):
+        return ref(
+            "gen2 Cloud Functions。実体は同名の Cloud Run サービス"
+            "（別行の run.googleapis.com/Service）で、二重計上を避けるため集約。",
+            "Cloud Run サービス側の行に従って対応する。",
+            priority=1)
+
+    # Dataplex Universal Catalog のシステム EntryGroup（@bigquery / @storage 等）は
+    # 連携サービスから自動生成される。手動作成は不可能かつ不要（dst でデータを
+    # 作れば自動的に再生成される）。`@` 始まりでないものは利用者作成なので action。
+    if atype == "dataplex.googleapis.com/EntryGroup" and short.startswith("@"):
+        return ref(
+            "Dataplex Universal Catalog のシステム EntryGroup。BigQuery / GCS 等の"
+            "連携サービスから自動生成されるもので、手動作成は不可能かつ不要。",
+            "dst 側でデータ（dataset / bucket 等）が複製されれば自動的に再生成される。",
+            priority=3)
+
+    # Service Directory の GKE / PSC 自動登録（gk3-* の control plane endpoint、
+    # goog-psc-default namespace 等）。クラスタ / PSC を作れば dst で再生成される。
+    if atype.startswith("servicedirectory.googleapis.com/") and (
+            is_gke_managed_name(short) or short.startswith("goog-")
+            or "gk3-" in full or "gke-" in full or "goog-psc" in full):
+        return ref(
+            "GKE / Private Service Connect が自動登録する Service Directory エントリ。",
+            "dst クラスタ / PSC 構成が出来れば自動的に再登録される。",
+            priority=3)
+
+    # SecretVersion（秘密値そのもの）は Secret 本体の移行に含めて扱う。
+    # 値の複製はツールの対象外（秘密情報を自動で写さない方針）。
+    if atype == "secretmanager.googleapis.com/SecretVersion":
+        return ref(
+            "Secret の値（バージョン）。Secret 本体の移行（別行の要対応）に含めて"
+            "対応するもので、独立した作業項目ではない。",
+            "Secret 作成時に `gcloud secrets versions add <name> --data-file=-` で"
+            "値を投入する（値の転記はツール対象外 = 秘密情報を自動で写さない）。",
+            priority=2)
+
+    if atype in _GKE_DERIVED_ASSET_TYPES and (
+            is_gke_managed_name(short) or is_k8s_lb_resource_name(short)):
         return ref(
             "GKE / k8s コントローラが自動生成するリソース。Step 4 terraform が "
-            "google_container_cluster / node_pool を apply すれば、dst クラスタが同等物を"
-            "自分で再生成する（src の名前にはクラスタ固有ハッシュが入るため同名複製は無意味）。",
-            "dst で `gcloud container clusters list` を実行しクラスタが作成されたことを確認。",
+            "google_container_cluster / node_pool を apply し、Backup for GKE の "
+            "restore（または再デプロイ）でワークロードを戻せば、dst クラスタが"
+            "同等物を自分で再生成する（src の名前にはクラスタ固有ハッシュが入るため"
+            "同名複製は無意味）。",
+            "Backup for GKE の restore 完了後、dst で同等リソースが再生成されたことを"
+            "確認（例: `gcloud container clusters list` / Service の EXTERNAL-IP）。",
             priority=3)
 
     if item.get("coverage_step") == "<unknown>":
@@ -955,6 +1315,8 @@ def analyze_cai_tf_diff(
     iam_sync_enabled: bool = True,
     bound_custom_roles: Optional[set] = None,
     gce_restore_enabled: bool = True,
+    rt_include: Optional[Iterable[str]] = None,
+    rt_exclude: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """CAI と terraform 出力を突合し、欠落リソースとリカバリコマンドを返す。
 
@@ -991,6 +1353,11 @@ def analyze_cai_tf_diff(
     unknown_types: set = set()
     covered = 0
     auto_handled = 0  # 専用ステップ複製 / 意図的対象外（DIFF.md からは除外、件数のみ）
+    # gen2 Cloud Functions（実体 = Cloud Run）の二重計上を classify で集約するための集合
+    run_service_names = {
+        r.get("short_name", "") for r in cai_records
+        if r.get("asset_type") == "run.googleapis.com/Service"
+    }
 
     for r in cai_records:
         atype = r.get("asset_type", "")
@@ -1051,6 +1418,8 @@ def analyze_cai_tf_diff(
             entry, iam_sync_enabled=iam_sync_enabled,
             bound_custom_roles=bound_custom_roles,
             gce_restore_enabled=gce_restore_enabled,
+            rt_include=rt_include, rt_exclude=rt_exclude,
+            run_service_names=run_service_names,
         ))
         missing.append(entry)
 
@@ -1202,7 +1571,8 @@ def format_diff_report(
     lines.append("")
     lines.append("- 専用ステップ（Step 4.5 network_firewall / Step 5 gce_restore / Step 6 data_sync）が複製。")
     lines.append("- `_ASSET_COVERAGE` で None 指定の意図的対象外（実害なし）。")
-    lines.append("- GKE クラスタ内の k8s.io/* オブジェクト（dst クラスタ作成後にワークロードを再デプロイ）。")
+    lines.append("- GKE クラスタ内の k8s.io/* オブジェクト（dst クラスタ作成後に "
+                 "**Backup for GKE の backup/restore** で移行、または再デプロイ）。")
     lines.append("")
     lines.append("## プロジェクト別 詳細")
     lines.append("")
@@ -1518,7 +1888,11 @@ def build_api_enable_plan(
     skip = set(_DST_API_SKIP) | {
         str(s or "").strip() for s in list(skip_apis or []) if str(s or "").strip()
     }
-    return sorted(want - skip)
+    # 基盤 API（CRM / ServiceUsage / IAM）は skip_apis でも外させない。
+    # enable 失敗時の案内文が「不要なら skip_apis へ」と勧めるため、transient な
+    # 失敗の対処として基盤 API を skip に入れてしまうと、以後 terraform が一切
+    # 動かない dst を「設定どおり」に作り続けてしまう。
+    return sorted((want - skip) | set(_BASE_DST_APIS))
 
 
 # ---------------------------------------------------------------------------
@@ -1651,6 +2025,295 @@ _TF_TYPE_API_PREFIXES: Tuple[Tuple[str, str], ...] = tuple(
 _TF_BLOCK_RE = re.compile(r'^\s*(?:resource|data)\s+"([A-Za-z0-9_-]+)"', re.M)
 
 
+# ---------------------------------------------------------------------------
+# Artifact Registry イメージ複製（Step 6）
+# ---------------------------------------------------------------------------
+# Terraform が作るのは**リポジトリ（箱）だけ**でイメージ本体は複製されない。
+# Cloud Run は `...@sha256:<digest>` でイメージを固定参照するため、イメージが
+# 無いと revision 作成が `Image '...' not found.` で失敗し、サービスが tainted で
+# state に残る（regression: my-argolis の Cloud Run 3 件）。GCS/BQ と同じ
+# 「データ移行」として Step 6 で複製する。
+#
+# gcloud には（SDK 580 時点で）`artifacts docker images copy` が無く、
+# crane/gcrane/buildx も前提にできないため docker CLI で pull→tag→push する。
+# **docker 経由は digest が変わりうる**（マルチアーキ index を単一プラットフォームに
+# 落とす等）ので、push 後に dst 側へ同一 digest が存在するか必ず確認し、
+# 変わっていたら WARNING で知らせる（Cloud Run の digest 固定参照が壊れるため）。
+_AR_DIGEST_RE = re.compile(r'^sha256:[0-9a-f]{64}$')
+
+# cosign / Cloud Build が attestation・署名・SBOM に付けるタグ形式。
+# これしかタグが無い version は実イメージではないので複製プランから外す
+# （タグ無しの attestation は list 時点では見分けられないため、
+#  pull 時の "unsupported media type" 判定が本命のガード）。
+_AR_ARTIFACT_TAG_RE = re.compile(r'^sha256-[0-9a-f]{64}\.(att|sig|sbom)$')
+
+
+def parse_ar_repositories(text: Optional[str]) -> List[Dict[str, str]]:
+    """`gcloud artifacts repositories list --format=json` を解析する（純粋関数）。
+
+    name は `projects/<p>/locations/<loc>/repositories/<repo>` 形式。
+    DOCKER 形式のみ返す（他形式は docker CLI で複製できない）。
+    """
+    try:
+        data = json.loads(text) if text else []
+    except (ValueError, TypeError):
+        return []
+    out: List[Dict[str, str]] = []
+    for r in data if isinstance(data, list) else []:
+        if not isinstance(r, dict):
+            continue
+        if (r.get("format") or "").upper() != "DOCKER":
+            continue
+        m = re.match(r'^projects/([^/]+)/locations/([^/]+)/repositories/(.+)$',
+                     r.get("name") or "")
+        if not m:
+            continue
+        out.append({"project": m.group(1), "location": m.group(2), "repo": m.group(3)})
+    return sorted(out, key=lambda d: (d["location"], d["repo"]))
+
+
+def build_ar_image_copy_plan(
+    text: Optional[str], src_proj: str, dst_proj: str,
+) -> List[Dict[str, Any]]:
+    """`gcloud artifacts docker images list --include-tags --format=json` から
+    複製プランを作る（純粋関数）。
+
+    package は `<loc>-docker.pkg.dev/<project>/<repo>/<image>`。project 部だけを
+    dst に差し替える（image 名に src プロジェクト ID が含まれても壊さないよう、
+    パス区切りで分解して 2 番目の要素だけ置換する）。
+    """
+    try:
+        data = json.loads(text) if text else []
+    except (ValueError, TypeError):
+        return []
+    plan: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for img in data if isinstance(data, list) else []:
+        if not isinstance(img, dict):
+            continue
+        pkg = (img.get("package") or "").strip()
+        digest = (img.get("version") or "").strip()
+        if not pkg or not _AR_DIGEST_RE.match(digest):
+            continue
+        parts = pkg.split("/")
+        if len(parts) < 3 or parts[1] != src_proj:
+            continue
+        dst_pkg = "/".join([parts[0], dst_proj] + parts[2:])
+        raw_tags = img.get("tags")
+        if isinstance(raw_tags, str):
+            tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+        elif isinstance(raw_tags, list):
+            tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+        else:
+            tags = []
+        if tags and all(_AR_ARTIFACT_TAG_RE.match(t) for t in tags):
+            # attestation / 署名 / SBOM 専用タグしか持たない = 実イメージではない
+            continue
+        key = f"{pkg}@{digest}"
+        if key in seen:
+            continue
+        seen.add(key)
+        plan.append({
+            "src_ref": key,
+            "dst_pkg": dst_pkg,
+            "dst_ref": f"{dst_pkg}@{digest}",
+            "digest": digest,
+            "tags": sorted(tags),
+        })
+    return plan
+
+
+# provider 既定で deletion_protection = true になり、**export には出てこない**型。
+# 既定 true のままだと、apply が途中で失敗して tainted になったリソースを
+# 次回 replace できず `cannot destroy service without setting
+# deletion_protection=false` で移行が恒久的に詰む（regression: my-argolis の
+# Cloud Run サービス 3 件）。export に無い＝src の設定ではなく provider 既定なので、
+# dst 側だけ false を明示して収束できるようにする。
+# **export が明示している場合は触らない**（src の意図を上書きしない）。
+_DELETION_PROTECTION_DEFAULT_TRUE_TYPES = (
+    "google_cloud_run_v2_service",
+    "google_cloud_run_v2_job",
+    "google_container_cluster",
+    "google_sql_database_instance",
+)
+
+
+def ensure_tf_resource_arg(
+    content: str, tf_type: str, arg_line: str,
+) -> Tuple[str, List[str]]:
+    """resource ブロック直下に引数が無ければ先頭へ挿入する（純粋関数）。
+
+    `ensure_hcl_block_arg` は `name {` 形式のネストブロック用で、
+    `resource "type" "label" {` には一致しないため別関数にする。
+    戻り値は (書き換え後, 挿入したラベル一覧)。
+    """
+    arg_name = arg_line.split('=', 1)[0].strip()
+    decl_re = re.compile(
+        rf'^(\s*)resource\s+"{re.escape(tf_type)}"\s+"([^"]+)"\s*\{{\s*$'
+    )
+    arg_re = re.compile(rf'^\s*{re.escape(arg_name)}\s*=', re.M)
+    lines = content.split('\n')
+    out: List[str] = []
+    inserted: List[str] = []
+    i = 0
+    while i < len(lines):
+        m = decl_re.match(lines[i])
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+        depth = 1
+        j = i + 1
+        while j < len(lines) and depth > 0:
+            depth += lines[j].count('{') - lines[j].count('}')
+            j += 1
+        body = lines[i + 1:j]
+        out.append(lines[i])
+        # ネストブロック内の同名引数を誤検出しないよう、depth 1 の行だけ見る
+        depth_now = 1
+        has_arg = False
+        for ln in body:
+            if depth_now == 1 and arg_re.match(ln):
+                has_arg = True
+                break
+            depth_now += ln.count('{') - ln.count('}')
+        if not has_arg:
+            out.append(f"{m.group(1)}  {arg_line}")
+            inserted.append(m.group(2))
+        out.extend(body)
+        i = j
+    return '\n'.join(out), inserted
+
+
+def is_api_disabled_error(text: Optional[str]) -> bool:
+    """API 未有効（＝そのサービスを src で使っていない）エラーなら True。
+
+    src がその機能を使っていないだけなので、失敗ではなく「対象なし」として
+    静かに扱う（`make run` の exit code を落とさない）。
+    """
+    low = (text or "").lower()
+    return ("has not been used in project" in low
+            or "service_disabled" in low
+            or "api is not enabled" in low
+            or "is disabled" in low and "enable it by visiting" in low)
+
+
+# ---------------------------------------------------------------------------
+# Cloud Run サービス個別 IAM（公開設定）の複製
+# ---------------------------------------------------------------------------
+# Cloud Run の「未認証アクセスを許可」は **サービスリソース個別の IAM**
+# （allUsers → roles/run.invoker）で表現される。bulk-export は IAM バインディングを
+# 出力せず、iam_sync もプロジェクト IAM のみ対象のため、放置すると dst が
+# 認証必須になる（= src と挙動が変わる）。invoker の公開 2 メンバーだけを
+# 忠実複製し、付与したら最後に警告でまとめて見せる（roles/owner と同じ方針）。
+_RUN_PUBLIC_MEMBERS = ("allUsers", "allAuthenticatedUsers")
+
+
+def parse_run_services_list(text: Optional[str]) -> List[Tuple[str, str]]:
+    """`gcloud run services list --format=json` から [(name, region), ...] を返す（純粋関数）。"""
+    try:
+        data = json.loads(text) if text else []
+    except (ValueError, TypeError):
+        return []
+    out: List[Tuple[str, str]] = []
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("metadata") or {}
+        name = (meta.get("name") or "").strip()
+        region = ((meta.get("labels") or {}).get("cloud.googleapis.com/location")
+                  or "").strip()
+        if name and region:
+            out.append((name, region))
+    return sorted(set(out))
+
+
+def run_service_public_invoker_members(text: Optional[str]) -> List[str]:
+    """サービス IAM ポリシー JSON から公開 invoker メンバーを返す（純粋関数）。
+
+    対象は allUsers / allAuthenticatedUsers × roles/run.invoker のみ。
+    それ以外のメンバー（SA 個別付与など）はプロジェクト間で意味が変わるため
+    複製しない（iam_sync の対象外方針と同じ）。
+    """
+    try:
+        data = json.loads(text) if text else {}
+    except (ValueError, TypeError):
+        return []
+    members: Set[str] = set()
+    for b in (data.get("bindings") or []) if isinstance(data, dict) else []:
+        if not isinstance(b, dict) or b.get("role") != "roles/run.invoker":
+            continue
+        if b.get("condition"):
+            continue
+        for m in b.get("members") or []:
+            if m in _RUN_PUBLIC_MEMBERS:
+                members.add(m)
+    return sorted(members)
+
+
+def coerce_nonneg_int(value: Any, default: int) -> int:
+    """値を非負整数へ安全に変換する（純粋関数）。
+
+    validate_steps_config は**有効なステップしか検査しない**が、
+    `steps.enable_apis` の設定は enabled: false でも Step 4
+    (`_ensure_dst_prereq_apis`) が読む。そこで `int("2m")` のような
+    ValueError が並列 worker から送出されると、apply 途中の `make run` が
+    traceback で落ちるため、型不正は default に倒す。
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return n if n >= 0 else default
+
+
+def import_error_kind(text: str) -> Optional[str]:
+    """terraform import の失敗出力を分類する（純粋関数）。
+
+    Returns:
+        "already": state に取り込み済み（無視してよい）
+        "missing": リモートに実体が無い（apply が作成するので無視してよい）。
+                   provider により表現が違う: compute は `Error 404 ... notFound`、
+                   GKE は `googleapi: Error 404: Not found:`、terraform 本体は
+                   `Cannot import non-existent remote object`。
+        None:      本当の失敗（権限・API 無効など。警告として見せる）
+    """
+    low = (text or "").lower()
+    if "already managed by terraform" in low or (
+            "resource address" in low and "already" in low):
+        return "already"
+    if ("cannot import non-existent remote object" in low
+            or "status code: 404" in low
+            or "error 404" in low
+            or "notfound" in low
+            or "does not exist" in low):
+        return "missing"
+    return None
+
+
+def tf_blocks_of_type(content: str, tf_type: str) -> List[Tuple[str, str]]:
+    """指定型の resource ブロックを [(label, body), ...] で返す（純粋関数）。
+
+    ネストしたブロック（`secondary_ip_range { ... }` など）があるため、
+    `[^}]*` の素朴な正規表現ではなく brace の対応を数えて本文を切り出す。
+    """
+    out: List[Tuple[str, str]] = []
+    decl_re = re.compile(
+        rf'resource\s+"{re.escape(tf_type)}"\s+"([^"]+)"\s*\{{'
+    )
+    for m in decl_re.finditer(content):
+        depth = 1
+        i = m.end()
+        while i < len(content) and depth > 0:
+            if content[i] == '{':
+                depth += 1
+            elif content[i] == '}':
+                depth -= 1
+            i += 1
+        out.append((m.group(1), content[m.end():i - 1]))
+    return out
+
+
 def tf_type_to_api(tf_type: str) -> Optional[str]:
     """Terraform リソース型から必要な API 名を返す。未知なら None。"""
     t = (tf_type or "").strip()
@@ -1683,7 +2346,12 @@ def tf_required_apis(tf_dir: str) -> List[str]:
         if not name.endswith(".tf"):
             continue
         try:
-            with open(os.path.join(tf_dir, name), encoding="utf-8") as f:
+            # errors="replace": bulk-export は VM の metadata / startup-script を
+            # 原文のまま出すため非 UTF-8 バイトが混ざりうる。except OSError では
+            # UnicodeDecodeError を捕まえられず、_parallel_for_each の worker から
+            # 送出されて run 全体が traceback で落ちる。
+            with open(os.path.join(tf_dir, name), encoding="utf-8",
+                      errors="replace") as f:
                 text = f.read()
         except OSError:
             continue
@@ -1702,9 +2370,15 @@ def tf_required_apis(tf_dir: str) -> List[str]:
 # mock の出力先は `_tf_base_dir()` で分離済みだが、分離前に汚染された
 # terraform/active/ が残っている環境でも事故らないよう、内容からも検出する。
 _MOCK_TF_MARK = "copy-all-env:mock-generated"
-# 旧 mock（マーク行が無い時代）が書いたリソースラベル。
-_LEGACY_MOCK_TF_LABELS = ('"mock_vm"', '"mock_bucket"', '"mock_cluster"',
-                          '"mock_gke_template"')
+# 旧 mock（マーク行が無い時代）が書いたリソースラベル。**宣言の 2 番目ラベル**
+# として照合する。裸の部分文字列照合だと、実リソースの name = "mock_bucket"
+# （GCS はアンダースコア可）まで mock 残骸と誤検知し、正当な active の再利用拒否 +
+# Step 4 の apply 拒否（rm -rf 案内つき）で移行が止まる。
+_LEGACY_MOCK_TF_LABELS = ("mock_vm", "mock_bucket", "mock_cluster",
+                          "mock_gke_template")
+_LEGACY_MOCK_DECL_RE = re.compile(
+    r'\bresource\s+"[A-Za-z0-9_-]+"\s+"(' + "|".join(_LEGACY_MOCK_TF_LABELS) + r')"'
+)
 
 
 def tf_dir_has_mock_artifacts(tf_dir: str) -> bool:
@@ -1717,13 +2391,15 @@ def tf_dir_has_mock_artifacts(tf_dir: str) -> bool:
         if not name.endswith(".tf"):
             continue
         try:
-            with open(os.path.join(tf_dir, name), encoding="utf-8") as f:
+            # errors="replace": 非 UTF-8 バイト混入で run を落とさない（tf_required_apis と同じ）。
+            with open(os.path.join(tf_dir, name), encoding="utf-8",
+                      errors="replace") as f:
                 text = f.read()
         except OSError:
             continue
         if _MOCK_TF_MARK in text:
             return True
-        if any(label in text for label in _LEGACY_MOCK_TF_LABELS):
+        if _LEGACY_MOCK_DECL_RE.search(text):
             return True
     return False
 
@@ -1736,54 +2412,81 @@ def tf_dir_has_mock_artifacts(tf_dir: str) -> bool:
 # asia-northeast1 と us-central1 の両方にある）、customize_hcl の平坦化で
 # 同一 Terraform ルートに同じ (type, label) が同居し、
 # 「Duplicate resource "<type>" configuration」で init/plan が落ちる。
-_TF_RESOURCE_DECL_RE = re.compile(r'\bresource\s+"([A-Za-z0-9_-]+)"\s+"([^"]+)"')
+_TF_RESOURCE_DECL_RE = re.compile(
+    r'\b(resource|data)\s+"([A-Za-z0-9_-]+)"\s+"([^"]+)"')
 
 
 def dedupe_tf_resource_labels(
-    content: str, discriminator: str, seen: Set[Tuple[str, str]],
+    content: str, discriminator: str, seen: Set[Tuple[str, str, str]],
 ) -> Tuple[str, List[Tuple[str, str, str]]]:
-    """flatten 後に同居する resource の (type, label) 重複を一意化する（純粋関数）。
+    """flatten 後に同居する resource/data の (kind, type, label) 重複を一意化する（純粋関数）。
 
-    seen（同一 Terraform ルートで既に確定した (type, label) の集合）に無い
-    ラベルはそのまま登録し、衝突したブロックだけ `<label>_<discriminator>`
-    （さらに衝突したら `_2`, `_3`, …）へ改名する。宣言と同じファイル内の
-    `# terraform import <type>.<label> ...` コメントも揃えて書き換える
+    seen（同一 Terraform ルートで既に確定した (kind, type, label) の集合）に
+    無いラベルはそのまま登録し、衝突したブロックだけ `<label>_<discriminator>`
+    （さらに衝突したら `_2`, `_3`, …）へ改名する。`data` ブロックも対象
+    （resource と data は別名前空間なので kind をキーに含める）。
+    同一ファイル内の参照（`<type>.<label>` / `data.<type>.<label>`、
+    `# terraform import` コメント含む）も揃えて書き換える
     （import アドレスがズレると `_terraform_import_existing` の adopt が外れる）。
 
-    改名は**走査順に依存する**ため、呼び出し側はファイル走査を必ずソートして
-    決定的にすること。実行ごとにどのブロックが改名されるかが変わると、
-    前回 state のアドレスと食い違って destroy/create の差分が出る。
+    実装メモ:
+    - 宣言の改名は **findall+re.sub ではなく span 置換**。ファイル内に
+      `x` と `x_asia` が並ぶ場合、`x` → `x_asia` の全文 sub は既存の
+      `x_asia` ブロックまで巻き込み、両方が同一ラベルに潰れて
+      「Duplicate resource」を自ら作ってしまう（regression）。
+    - 参照の書き換えは「旧ラベル → 一意トークン → 新ラベル」の 2 段階。
+      改名 A の新ラベルが改名 B の旧ラベルと一致するケース
+      （`x`→`x_asia` と `x_asia`→`x_asia_2`）で、A の書き換え結果を
+      B が再度書き換える連鎖を防ぐ。旧ラベルの長い順に token 化する。
+    - 改名は**走査順に依存する**ため、呼び出し側はファイル走査を必ずソートして
+      決定的にすること（順序が変わると前回 state のアドレスと食い違う）。
 
     Args:
         content:       .tf ファイル本文
         discriminator: 改名時の suffix 素材（location ディレクトリ名など）。
                        Terraform ラベルに使えない文字は `_` に置換される
-        seen:          このルートで確定済みの (type, label)。**呼び出しで更新される**
+        seen:          このルートで確定済みの (kind, type, label)。**呼び出しで更新される**
     Returns:
         (書き換え後の content, [(type, old_label, new_label), ...])
     """
-    renames: List[Tuple[str, str, str]] = []
-    for rtype, label in _TF_RESOURCE_DECL_RE.findall(content):
-        key = (rtype, label)
+    planned: List[Tuple[re.Match, str, str, str, str]] = []
+    for m in _TF_RESOURCE_DECL_RE.finditer(content):
+        kind, rtype, label = m.group(1), m.group(2), m.group(3)
+        key = (kind, rtype, label)
         if key not in seen:
             seen.add(key)
             continue
         base = re.sub(r'[^A-Za-z0-9_]', '_', discriminator or '').strip('_') or 'dup'
         new_label = f"{label}_{base}"
         n = 2
-        while (rtype, new_label) in seen:
+        while (kind, rtype, new_label) in seen:
             new_label = f"{label}_{base}_{n}"
             n += 1
-        seen.add((rtype, new_label))
+        seen.add((kind, rtype, new_label))
+        planned.append((m, kind, rtype, label, new_label))
+    if not planned:
+        return content, []
+
+    # 1. 宣言ラベルを span で改名（後ろから。前方の span を壊さない）
+    for m, _kind, _rtype, _old, new_label in reversed(planned):
+        s, e = m.span(3)
+        content = content[:s] + new_label + content[e:]
+
+    # 2. 参照を token 化 → 展開の 2 段階で書き換え（旧ラベルの長い順）
+    order = sorted(range(len(planned)), key=lambda i: -len(planned[i][3]))
+    for i in order:
+        _m, kind, rtype, old, _new = planned[i]
+        prefix = "data." if kind == "data" else ""
         content = re.sub(
-            rf'(\bresource\s+"{re.escape(rtype)}"\s+)"{re.escape(label)}"',
-            lambda m: m.group(1) + f'"{new_label}"', content,
+            rf'(?<![A-Za-z0-9_.-]){re.escape(prefix + rtype)}\.{re.escape(old)}'
+            rf'(?![A-Za-z0-9_-])',
+            f"\x00DEDUPE{i}\x00", content,
         )
-        content = re.sub(
-            rf'(#\s*terraform import\s+){re.escape(rtype)}\.{re.escape(label)}(?![A-Za-z0-9_-])',
-            lambda m: m.group(1) + f'{rtype}.{new_label}', content,
-        )
-        renames.append((rtype, label, new_label))
+    renames: List[Tuple[str, str, str]] = []
+    for i, (_m, kind, rtype, old, new_label) in enumerate(planned):
+        prefix = "data." if kind == "data" else ""
+        content = content.replace(f"\x00DEDUPE{i}\x00", f"{prefix}{rtype}.{new_label}")
+        renames.append((rtype, old, new_label))
     return content, renames
 
 
@@ -1811,9 +2514,108 @@ def customize_note_row(note: Dict[str, str]) -> Tuple[str, str, str, str]:
             "要対応",
             f"SSL 証明書 `{res}`（{proj}）",
             "自己管理証明書の秘密鍵は API から export できず Terraform では作成不能。"
-            "作成するまで参照元の HTTPS LB（target proxy）の apply が失敗する",
+            "作成するまで参照元の HTTPS LB（target proxy）の apply が失敗する。"
+            "クラスタ外の Compute リソースのため **Backup for GKE でも移行されない**",
             f"鍵を用意して手動作成: `gcloud compute ssl-certificates create {res}"
             f" --certificate=<crt> --private-key=<key> --project={proj}`",
+        )
+    if kind == "dns_managed_zone":
+        return (
+            "要対応",
+            f"public DNS ゾーン `{res}`（{proj}）",
+            "ドメインはグローバル一意で、同一ドメインの public ゾーンは別プロジェクトに"
+            "作成できない場合がある（reserved/policy の 400）。作成できても NS 委任は"
+            "src 側を向いたままで機能しない",
+            "移行するなら: ① dst で "
+            f"`gcloud dns managed-zones create {res} --dns-name=<domain> "
+            f"--description=migrated --project={proj}` ② レコードを移行 "
+            "③ レジストラ / 親ゾーンの NS 委任を dst のネームサーバーへ切替。"
+            "src 併用中は切替えないこと（検証用途なら不要）",
+        )
+    if kind == "dotted_bucket":
+        return (
+            "要対応",
+            f"ドット入りバケット `{res}`（{proj}）",
+            "ドメイン形式のバケットはドメイン検証済み TLD 配下でないと作成できない"
+            "（*.appspot.com は Google 管理のシステムバケットで複製自体が不可能）",
+            "データが必要な場合のみ `rename_rules.gcs.overrides` に"
+            "ドット無しの dst バケット名を指定 → data_sync が作成 + 同期する。"
+            "GCR レイヤー（us.artifacts.*）や GAE staging は通常移行不要",
+        )
+    if kind == "lb_blocked_on_cert":
+        return (
+            "要対応",
+            f"HTTPS LB フロントエンド `{res}`（{proj}）",
+            "参照する SSL 証明書が dst に未作成のため、今回の terraform 適用から"
+            "保留した（文字列参照のまま適用すると証明書を作るまで毎回 404 で "
+            "run が失敗する）",
+            "DIFF の SSL 証明書の項に従い `gcloud compute ssl-certificates create ...` "
+            "で証明書を作成 → 次回 `make run` で proxy / forwarding rule が自動適用される",
+        )
+    if kind == "gke_backup_restore":
+        src_p = note.get("src_dir") or "<src>"
+        return (
+            "要対応",
+            f"GKE クラスタ `{res}` のワークロード・PV データ（{proj}）",
+            "本ツールはクラスタ / ノードプールの**構成のみ**複製する。クラスタ内の "
+            "k8s オブジェクト・Secret・PersistentVolume のデータは対象外で、"
+            "移行しない限り dst クラスタは空のまま。"
+            "**Backup for GKE は既定では同一プロジェクト内の restore しかできない**"
+            "（restore plan は別プロジェクトの backup plan を参照できない）ため、"
+            "別プロジェクトへの移行では backup channel / restore channel が要る",
+            "① src で backup（ツール対象外・手動）: "
+            f"`gcloud container clusters update <srcクラスタ> --project={src_p} "
+            f"--update-addons=BackupRestore=ENABLED` → "
+            f"`gcloud beta container backup-restore backup-plans create {res}-bp "
+            f"--project={src_p} --location=<loc> --cluster=<srcクラスタのフルパス> "
+            f"--all-namespaces --include-secrets --include-volume-data` → "
+            f"`backups create`  "
+            "② クロスプロジェクトの通り道を作る: "
+            f"`gcloud beta container backup-restore backup-channels create <ch> "
+            f"--project={src_p} --location=<loc> --destination-project=projects/<dst番号>` / "
+            f"`restore-channels create <rch> --project={src_p} --location=<loc> "
+            f"--destination-project=projects/<dst番号>`  "
+            "③ dst 側の権限（サービスエージェント）: "
+            f"`gcloud beta services identity create --service=gkebackup.googleapis.com "
+            f"--project={proj}` → {proj} に "
+            "`roles/gkebackup.serviceAgent`（gcp-sa-gkebackup）、"
+            f"backup 保持プロジェクトに `roles/gkebackup.crossProjectServiceAgent`"
+            "（container-engine-robot）を付与  "
+            f"④ dst で restore: `restore-plans create` → `restores create`"
+            f"（project={proj}）。"
+            "dst クラスタのエージェントは本ツールが有効化済み。"
+            "クラスタ外リソース（Cloud Run 用 LB の SSL 証明書等）は対象外のまま",
+        )
+    if kind == "alert_notification_channels":
+        return (
+            "確認",
+            f"アラートポリシーの通知チャネル（{proj}）",
+            "通知チャネルは server 採番 ID で参照されるため別プロジェクトへ複製できず、"
+            "旧 ID のままでは解決しない。チャネル指定を外してアラート本体のみ複製した"
+            "（アラートは発火するが通知は飛ばない）",
+            "dst で通知チャネルを作成し直し、アラートポリシーに再設定: "
+            f"`gcloud beta monitoring channels create --project={proj} ...` → "
+            "コンソールでポリシーに紐付け",
+        )
+    if kind == "deletion_protection":
+        return (
+            "確認",
+            f"`{res}`（{proj}）の削除保護",
+            "export に deletion_protection が含まれず provider 既定の true が効くと、"
+            "apply 途中で失敗した (tainted) リソースを次回 replace できず移行が詰むため、"
+            "dst 側は false を明示して複製した",
+            "本番運用に切り替える際は dst で削除保護を戻す"
+            "（`deletion_protection = true` に変更して apply、またはコンソールで有効化）",
+        )
+    if kind == "container_analysis_occurrence":
+        return (
+            "確認",
+            f"Container Analysis の occurrence（{proj}）",
+            "過去ビルドの来歴・署名レコード。参照先の note（`built-by-cloud-build` 等）は"
+            "Cloud Build が自プロジェクトに作るもので dst には存在せず、"
+            "署名鍵も Google 管理プロジェクトのため複製不能",
+            "dst で再ビルドすれば自動生成される。Binary Authorization で"
+            "attestation を必須にしている場合は、再ビルドか手動 attestation が必要",
         )
     if kind == "iap_enabled":
         return (
@@ -2203,20 +3005,33 @@ def log_stage_header(logger: logging.Logger, step_no: int, title: str, count: Op
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 
+# gcloud が 403/404 で吐く構造化エラー詳細（google.rpc.ErrorInfo の YAML ダンプ）。
+# 情報量が無いうえ `- '@type': ...ErrorInfo` が 'Error' 判定に引っかかって
+# サマリーを占拠する（regression: 失敗詳細が全部 `- '@type': ...` になっていた）。
+_ERROR_DETAIL_RE = re.compile(
+    r"^(-\s*'?@type'?:|domain:|reason:|metadata:|links:|-\s*description:|url:|"
+    r"activationUrl:|consumer:|containerInfo:|service:|serviceTitle:)"
+)
+
+
 def _first_meaningful_line(stderr: Optional[str], stdout: Optional[str], limit: int = 200) -> str:
     """サマリー用に、stderr/stdout から最も情報量の多い1行を抽出する。
 
-    WARNING / impersonation 警告 / 装飾用の空行や枠線は飛ばし、
-    "Error:" を含む行があれば優先する。なければ最初の非空行を返す。
+    WARNING / impersonation 警告 / 装飾用の空行や枠線、gcloud の構造化エラー詳細は
+    飛ばし、エラー行（gcloud の `ERROR:` / terraform の `Error:`）を優先する。
     """
     for src in (stderr, stdout):
         if not src:
             continue
         text = _ANSI_RE.sub('', src)
         lines = [ln.strip(' │╷╵') for ln in text.splitlines() if ln.strip(' │╷╵')]
-        # Error: を含む行を優先
+        lines = [ln for ln in lines if not _ERROR_DETAIL_RE.match(ln)]
+        # エラー行を優先。'Error' の単純な部分一致だと gcloud の大文字 `ERROR:` を
+        # 取り逃し、代わりに 'ErrorInfo' を含む詳細行を拾ってしまう。
         for ln in lines:
-            if 'Error' in ln and 'WARNING' not in ln:
+            if 'WARNING' in ln:
+                continue
+            if re.match(r'^(ERROR|Error)\b', ln) or 'Error:' in ln or 'error:' in ln:
                 return ln[:limit]
         # それ以外は WARNING / impersonation を除いた最初の行
         for ln in lines:
@@ -2372,6 +3187,78 @@ def validate_steps_config(config: Dict[str, Any]) -> List[str]:
     def sval(d: Dict[str, Any], key: str) -> str:
         return str((d.get(key) if isinstance(d, dict) else '') or '').strip()
 
+    # --- Step 3: 移行範囲の絞り込み (bulk_export.resource_types) ---
+    # typo（google_ 無し）は include が何にも一致せず「全部除外」という静かな事故に
+    # なるため、パターン形式を実行前に検査する。
+    bulk = steps.get('bulk_export', {})
+    rt = bulk.get('resource_types') if isinstance(bulk, dict) else None
+    if rt is not None:
+        if not isinstance(rt, dict):
+            errors.append("steps.bulk_export.resource_types は辞書で指定してください"
+                          "（include / exclude のリスト）")
+        else:
+            for key in ("include", "exclude"):
+                val = rt.get(key)
+                if val is None:
+                    continue
+                if not isinstance(val, list):
+                    errors.append(
+                        f"steps.bulk_export.resource_types.{key} はリストで"
+                        f"指定してください（例: [\"google_compute_*\"]）")
+                    continue
+                for pat in val:
+                    ps = str(pat or '').strip()
+                    if not ps:
+                        errors.append(
+                            f"steps.bulk_export.resource_types.{key} に空の"
+                            f"パターンがあります")
+                    elif not ps.startswith("google_"):
+                        errors.append(
+                            f"steps.bulk_export.resource_types.{key} の "
+                            f"'{ps}' は Terraform リソース型ではありません"
+                            f"（google_ で始まる必要があります。例: google_compute_*）")
+
+    # --- Step 3: CAI エクスポートの規模調整 ---
+    # export_resource_types は **KRM Kind**（ComputeInstance）で、customize 側の
+    # resource_types が取る **Terraform 型**（google_compute_instance）とは別物。
+    # 取り違えると「何にも一致せず全除外」または gcloud の引数エラーになるため、
+    # 実行前に形式を検査する。
+    if isinstance(bulk, dict):
+        ert = bulk.get('export_resource_types')
+        if isinstance(ert, str) and ert.strip().lower() == "auto":
+            ert = None   # "auto" は実行時に list-resource-types から引く
+        if ert is not None:
+            if not isinstance(ert, list):
+                errors.append(
+                    "steps.bulk_export.export_resource_types はリストまたは "
+                    "\"auto\" で指定してください"
+                    "（例: [\"ComputeInstance\", \"ComputeNetwork\"] / \"auto\"）")
+            else:
+                for kind in ert:
+                    ks = str(kind or '').strip()
+                    if not ks:
+                        errors.append(
+                            "steps.bulk_export.export_resource_types に空の要素があります")
+                    elif ks.startswith("google_"):
+                        errors.append(
+                            f"steps.bulk_export.export_resource_types の '{ks}' は "
+                            f"Terraform 型です。ここは KRM Kind を指定してください"
+                            f"（例: ComputeInstance）。Terraform 型で絞るなら "
+                            f"steps.bulk_export.resource_types を使います")
+                    elif not ks[0].isupper():
+                        errors.append(
+                            f"steps.bulk_export.export_resource_types の '{ks}' は "
+                            f"KRM Kind ではありません（大文字始まり。一覧は "
+                            f"`gcloud beta resource-config list-resource-types "
+                            f"--project=<src>`）")
+        sp = bulk.get('storage_path')
+        if sp is not None:
+            sps = str(sp or '').strip()
+            if sps and not sps.startswith("gs://"):
+                errors.append(
+                    f"steps.bulk_export.storage_path は gs:// で始まる GCS パスを"
+                    f"指定してください（現在: '{sps}'）")
+
     # --- Step 7: VPC Service Controls ---
     # access-context-manager は --project を持たないため billing_project が無いと
     # ローカル gcloud config の無関係プロジェクトを quota に使い SERVICE_DISABLED で失敗する。
@@ -2457,6 +3344,7 @@ class MigrationOrchestrator:
         verbose_override: Optional[bool] = None,
         mock_override: Optional[bool] = None,
         auto_approve: bool = False,
+        skip_on_run_override: Optional[bool] = None,
     ):
         self.config_path = config_path
         self.config: Dict[str, Any] = {}
@@ -2473,6 +3361,9 @@ class MigrationOrchestrator:
         # --yes / -y。続行確認 ([y/N]) を自動承認する。
         # 環境変数では「いつ設定したか気付けない」ため、明示的な引数だけを承認手段とする。
         self.auto_approve = auto_approve
+        # bulk_export.skip_on_run の実行時上書き（config.yaml を触らず 1 回だけ
+        # 変えたいとき用。None = config に従う）。make run SKIP_ON_RUN=0 / 1。
+        self.skip_on_run_override = skip_on_run_override
         self.stats = StageStats()
         self.start_t = time.time()
         # src プロジェクト番号 → dst プロジェクト番号 の対応（customize で番号置換に使用）
@@ -2940,6 +3831,7 @@ class MigrationOrchestrator:
         impersonate_sa: Optional[str] = None,
         retries: int = 0,
         expect_not_found_ok: bool = False,
+        retry_wait_seconds: Optional[int] = None,
     ) -> Optional[str]:
         """外部コマンドを安全に実行する。
 
@@ -3006,24 +3898,34 @@ class MigrationOrchestrator:
         attempt = 0
         while True:
             try:
+                t0 = time.time()
                 result = subprocess.run(
                     cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, cwd=cwd, env=env,
                 )
+                elapsed = int(time.time() - t0)
                 if result.returncode != 0:
-                    # まだリトライ余地があれば、失敗カウントせず再試行
+                    # まだリトライ余地があれば、失敗カウントせず再試行。
+                    # 待ち時間は既定 min(5*n, 30) 秒だが、サーバ側の長時間処理が
+                    # timeout したケース（bulk-export の 30 分待ち等）では即再試行しても
+                    # 同じ時間を溶かすだけなので retry_wait_seconds で延ばせるようにする。
                     if attempt < retries:
                         attempt += 1
+                        wait = (retry_wait_seconds if retry_wait_seconds is not None
+                                else min(5 * attempt, 30))
                         logger.warning(
-                            f"{tag}一時失敗 (exit={result.returncode})。再試行 {attempt}/{retries}"
+                            f"{tag}一時失敗 (exit={result.returncode}, {elapsed}秒経過)。"
+                            f"{wait}秒待って再試行 {attempt}/{retries}"
                         )
-                        time.sleep(min(5 * attempt, 30))
+                        time.sleep(wait)
                         continue
                     combined = f"{result.stdout or ''}\n{result.stderr or ''}"
                     if expect_not_found_ok and "Not found" in combined:
                         logger.info(f"{tag}存在しません（Not Found）")
                         return None
-                    logger.error(f"{tag}✗ 失敗 (exit={result.returncode})")
+                    logger.error(
+                        f"{tag}✗ 失敗 (exit={result.returncode}, {elapsed}秒経過)"
+                    )
                     if result.stderr and result.stderr.strip():
                         logger.error(f"      理由(stderr): {result.stderr.strip()[:2000]}")
                     if result.stdout and result.stdout.strip():
@@ -3129,6 +4031,74 @@ class MigrationOrchestrator:
                     "zone": f"projects/{proj_id}/zones/asia-northeast1-a",
                     "labels": {"goog-gke-node": ""},
                     "disks": [{"boot": True, "source": f"projects/{proj_id}/zones/asia-northeast1-a/disks/gke-mock-cluster-default-pool-1234abcd-xyz1"}],
+                },
+            ])
+
+        if cmd.strip().startswith("gcloud beta resource-config list-resource-types"):
+            logger.info(f"{tag}[MOCK] KRM Kind 一覧をシミュレート ({proj_id})")
+            # k8s の Kind は含まれない（実機と同じ）。除外が壊れると気付けるよう
+            # bulk-export 非対応の Kind も 1 つ混ぜておく。
+            return json.dumps([
+                {"GVK": {"Group": "compute.cnrm.cloud.google.com",
+                         "Kind": "ComputeInstance"}, "SupportsBulkExport": True},
+                {"GVK": {"Group": "compute.cnrm.cloud.google.com",
+                         "Kind": "ComputeNetwork"}, "SupportsBulkExport": True},
+                {"GVK": {"Group": "container.cnrm.cloud.google.com",
+                         "Kind": "ContainerCluster"}, "SupportsBulkExport": True},
+                {"GVK": {"Group": "iam.cnrm.cloud.google.com",
+                         "Kind": "IAMPolicy"}, "SupportsBulkExport": False},
+            ])
+
+        if cmd.strip().startswith("gcloud run services list"):
+            logger.info(f"{tag}[MOCK] Cloud Run サービス一覧をシミュレート ({proj_id})")
+            return json.dumps([{
+                "metadata": {
+                    "name": "mock-public-api",
+                    "labels": {"cloud.googleapis.com/location": "asia-northeast1"},
+                },
+            }])
+
+        if cmd.strip().startswith("gcloud run services get-iam-policy"):
+            logger.info(f"{tag}[MOCK] Cloud Run IAM ポリシーをシミュレート")
+            # 公開サービス（allUsers → run.invoker）。複製パスが壊れると
+            # make mock の add-iam-policy-binding が出なくなるので気付ける。
+            return json.dumps({
+                "bindings": [
+                    {"role": "roles/run.invoker", "members": ["allUsers"]},
+                ],
+            })
+
+        if cmd.strip().startswith("gcloud artifacts repositories list"):
+            logger.info(f"{tag}[MOCK] AR リポジトリ一覧をシミュレート ({proj_id})")
+            return json.dumps([
+                {
+                    "name": f"projects/{proj_id}/locations/asia-northeast1"
+                            f"/repositories/cloud-run-source-deploy",
+                    "format": "DOCKER",
+                },
+                # DOCKER 以外は複製対象外。除外が壊れると docker pull が走る。
+                {
+                    "name": f"projects/{proj_id}/locations/asia-northeast1"
+                            f"/repositories/python-repo",
+                    "format": "PYTHON",
+                },
+            ])
+
+        if cmd.strip().startswith("gcloud artifacts docker images list"):
+            m = re.search(r'images list (\S+)', cmd)
+            path = m.group(1) if m else "asia-northeast1-docker.pkg.dev/p/r"
+            logger.info(f"{tag}[MOCK] AR イメージ一覧をシミュレート ({path})")
+            return json.dumps([
+                {
+                    "package": f"{path}/mock-api",
+                    "version": "sha256:" + "ab" * 32,
+                    "tags": ["latest"],
+                },
+                # tag 無し（digest 参照専用）。合成タグでの push が壊れると気付ける。
+                {
+                    "package": f"{path}/mock-worker",
+                    "version": "sha256:" + "cd" * 32,
+                    "tags": [],
                 },
             ])
 
@@ -3284,6 +4254,22 @@ class MigrationOrchestrator:
         logger.info(f"{tag}[MOCK] コマンド成功をシミュレート: {cmd.split()[0]} {cmd.split()[1] if len(cmd.split()) > 1 else ''}")
         return "Success"
 
+    def _resource_type_filters(self) -> Tuple[List[str], List[str]]:
+        """steps.bulk_export.resource_types の (include, exclude) を返す。
+
+        移行範囲の絞り込み。未指定なら両方空 = 全量コピー（既定）。
+        DIFF (Step 99) も同じ値を見て、除外した型の欠落を「対応不要」に分類する。
+        """
+        cfg = (self.config.get('steps', {}).get('bulk_export', {}) or {}).get(
+            'resource_types', {})
+        if not isinstance(cfg, dict):
+            return [], []
+        inc = [str(p).strip() for p in (cfg.get('include') or [])
+               if isinstance(cfg.get('include'), list) and str(p).strip()]
+        exc = [str(p).strip() for p in (cfg.get('exclude') or [])
+               if isinstance(cfg.get('exclude'), list) and str(p).strip()]
+        return inc, exc
+
     # ----- Terraform 作業ディレクトリ -----
     def _tf_base_dir(self) -> str:
         """terraform の raw/active を置くベースディレクトリ。
@@ -3359,11 +4345,88 @@ resource "google_container_cluster" "mock_cluster" {{
         except Exception as e:
             self.org_logger.error(f"  [MOCK] ダミー TF 書き出し失敗: {e}")
 
+    def check_dst_projects_exist(self):
+        """dst プロジェクトの実在を fail-fast で検査する（mock はスキップ）。
+
+        config の dst を新しい番号に書き換えたのに `make projects` を忘れると、
+        Step 1〜3（src read 中心）と API 有効化（soft fail）は素通りし、
+        **30 分走った Step 4 の apply で初めて**
+        `The resource 'projects/<dst>' was not found` の 404 で全滅する
+        （regression: 081401 系で発生）。dst へ何も書く前に全件列挙して止め、
+        `make projects` を案内する。`make plan` でも実行する。
+        """
+        if self.mock:
+            return
+        dsts = sorted({d for _s, d, _ss, _ds in self._iter_project_pairs()})
+        missing: List[str] = []
+        for dst in dsts:
+            try:
+                res = subprocess.run(
+                    f"gcloud projects describe {dst} "
+                    f"--format='value(lifecycleState)' --quiet",
+                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env=os.environ.copy(), timeout=60,
+                )
+                state = (res.stdout or "").strip()
+                if res.returncode != 0 or state != "ACTIVE":
+                    missing.append(
+                        f"{dst}（{state or _first_meaningful_line(res.stderr, res.stdout)[:80]}）"
+                    )
+            except Exception as e:
+                missing.append(f"{dst}（確認失敗: {e}）")
+        if missing:
+            self.org_logger.error(
+                "[dst 実在チェック] 以下の dst プロジェクトが存在しない/アクセスできません:"
+            )
+            for m in missing:
+                self.org_logger.error(f"  - {m}")
+            self.org_logger.error(
+                "  config.yaml の dst を新しい ID に変えた場合は、先に "
+                "`make projects`（作成）と `make bootstrap`（Shared VPC 等）を"
+                "実行してください。dst へは何も書き込まずに停止します"
+            )
+            sys.exit(1)
+        self.org_logger.info(
+            f"  [dst 実在チェック] {len(dsts)} プロジェクトすべて ACTIVE ✓"
+        )
+
+    def _acquire_run_lock(self):
+        """多重起動ガード（flock）。
+
+        同じ terraform 作業ディレクトリを 2 つの `make run` / `make plan` が
+        同時に触ると、state lock 競合（`Error acquiring the state lock`）・
+        `Saved plan is stale`・`-lock=false` の import 並走による state 破壊で
+        **両方の run が壊れる**（regression: run の二重起動で 3 ルートが
+        lock/stale で失敗した）。terraform 配下の `.sync_env.lock` を
+        排他 flock し、取れなければ即エラーで止める。
+        プロセス終了（異常終了含む）で OS が自動解放するため、
+        古いロックの掃除は不要。mock は `_tf_base_dir()` が別ディレクトリを
+        指すので実行系とは競合しない。
+        """
+        lock_dir = self._tf_base_dir()
+        os.makedirs(lock_dir, exist_ok=True)
+        lock_path = os.path.join(lock_dir, ".sync_env.lock")
+        self._run_lock_file = open(lock_path, "w", encoding="utf-8")
+        try:
+            fcntl.flock(self._run_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print(
+                f"エラー: 別の make run / make plan がこの作業ディレクトリ"
+                f"（{lock_dir}）で実行中です。多重実行は terraform state を"
+                f"破壊するため停止します。先行プロセスの終了を待ってください。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        self._run_lock_file.write(str(os.getpid()))
+        self._run_lock_file.flush()
+
     # ----- 実行制御 -----
     def execute(self):
         self.load_config()
+        self._acquire_run_lock()
         self.check_prerequisites()
         self.check_service_accounts()
+        self.check_dst_projects_exist()
 
         self.org_logger.info("=" * 60)
         self.org_logger.info(" copy-all-env  移行オーケストレータ  開始")
@@ -3394,6 +4457,17 @@ resource "google_container_cluster" "mock_cluster" {{
                 self.step_gce_snapshot()
             if step_enabled(steps, 'bulk_export'):
                 self.step_bulk_export()
+            # Step 3.5: 必要 API が確定する唯一の時点（.tf が出揃った直後）。
+            # ここで全 dst プロジェクト分をまとめて有効化 + 伝播確認してから
+            # terraform に進む。Step 1.5 は src 由来だけなので、export された
+            # .tf 固有の API（GKE 等）を取りこぼしうる。
+            if step_enabled(steps, 'enable_apis'):
+                self.step_enable_apis(final=True)
+            # Step 3.7: AR イメージは terraform より前に置く。Cloud Run は
+            # revision 作成時に digest を解決するため、apply の後に複製しても
+            # 間に合わない（Image ... not found で apply が失敗する）。
+            if step_enabled(steps, 'data_sync'):
+                self.step_artifact_registry()
             if step_enabled(steps, 'terraform_apply'):
                 self.step_terraform_apply()
             if step_enabled(steps, 'network_firewall'):
@@ -3443,6 +4517,7 @@ resource "google_container_cluster" "mock_cluster" {{
         # 未取得（iam_sync 無効 / 取得失敗）なら None を渡して安全側（要対応）に倒す。
         iam_sync_enabled = step_enabled(self.config.get('steps', {}), 'iam_sync')
         gce_restore_enabled = step_enabled(self.config.get('steps', {}), 'gce_restore')
+        rt_include, rt_exclude = self._resource_type_filters()
         bound_roles = (
             bound_custom_role_ids(self._src_iam_policies)
             if self._src_iam_policies else None
@@ -3469,6 +4544,7 @@ resource "google_container_cluster" "mock_cluster" {{
                 iam_sync_enabled=iam_sync_enabled,
                 bound_custom_roles=bound_roles,
                 gce_restore_enabled=gce_restore_enabled,
+                rt_include=rt_include, rt_exclude=rt_exclude,
             )
             reports.append(report)
             self.org_logger.info(
@@ -3714,32 +4790,51 @@ resource "google_container_cluster" "mock_cluster" {{
     # ============================================================
     # Step 1.5: dst API 事前有効化
     # ============================================================
-    def step_enable_apis(self):
+    def step_enable_apis(self, final: bool = False):
         """src で有効な API を dst でも有効化する（冪等 / soft fail）。
 
         dst で API が無効なままだと Step 4 の terraform apply が
         「<API> has not been used in project ... before or it is disabled」の 403 で
-        止まる（GKE = container.googleapis.com が典型）。src 側の有効 API 一覧を
-        そのまま dst に反映し、有効ステップが必ず使う API を足して先回りで有効化する。
+        止まる（GKE = container.googleapis.com が典型）。
 
-        有効 API の取得元は 2 つ（片方が欠けても動く）:
+        **必要 API がいつ確定するか**（この 2 段構えの理由）:
+          - Step 1 (cai_scan) 完了時点 … src で有効な API と assetType が分かる。
+            ただし「terraform が実際に何を作るか」はまだ分からない。
+          - Step 3 (bulk_export + customize) 完了時点 … active/<src>/*.tf が確定し、
+            `tf_required_apis()` で **apply に要る API が確定する**。
+            つまり **完全な一覧が揃う最初の時点が Step 3 完了後**。
+        そこで:
+          - `final=False`（Step 1.5, cai_scan 直後）… src 由来を先行有効化し、
+            Step 2/3 の実行中に伝播時間を稼ぐ。
+          - `final=True`（Step 3.5, bulk_export 直後 / terraform の前）…
+            .tf 由来を含めた**全量**を有効化し、terraform を回す前に
+            「全部 enabled として見えるか」を検証する（取りこぼしゼロの関門）。
+
+        有効 API の取得元（どれか欠けても動く）:
           1. `gcloud services list --enabled`（src read-only）
           2. Step 1 の CAI 出力にある `serviceusage.googleapis.com/Service`
+          3. active/<src>/*.tf のリソース型（final=True では必ず揃っている）
+          4. 有効ステップが dst で必ず叩く API (`_STEP_DST_APIS` / `_BASE_DST_APIS`)
         失敗は WARNING + 手動コマンド案内に留める（`stats.failed` に積まない）。
         本当に必要な API なら、後続ステップが本来のエラーで止めてくれる。
         """
         pairs = list(self._iter_project_pairs())
         log_stage_header(
-            self.dst_logger, 15, "dst API 事前有効化 (src で有効な API を dst に反映)",
+            self.dst_logger,
+            35 if final else 15,
+            ("dst API 最終有効化 (.tf から確定した必要 API を全て有効化・検証)"
+             if final else "dst API 事前有効化 (src で有効な API を dst に反映)"),
             len(pairs),
         )
+        results: List[Tuple[str, int, int, List[str]]] = []
+        results_lock = threading.Lock()
         steps = self.config.get('steps', {})
         cfg = steps.get('enable_apis', {})
         if not isinstance(cfg, dict):
             cfg = {}
         extra = cfg.get('extra_apis') or []
         skip = cfg.get('skip_apis') or []
-        wait_sec = int(cfg.get('wait_seconds', 120))
+        wait_sec = coerce_nonneg_int(cfg.get('wait_seconds', 120), 120)
         cai_dir = (steps.get('cai_scan', {}) or {}).get('output_dir', './cai_export')
 
         def worker(item):
@@ -3755,12 +4850,21 @@ resource "google_container_cluster" "mock_cluster" {{
                     f" 有効ステップの必須 API のみ有効化します"
                 )
             src_services = (listed or set()) | cai_services
-            # 既に export 済みの active/<src> があれば（make plan 済みなど）、
-            # これから apply する .tf が使う API もこの時点で足しておく。
-            # 無ければ空リスト。apply 直前にも _ensure_dst_prereq_apis が
-            # 同じ計算をやり直すので、ここで取れなくても最終的には埋まる。
+            # active/<src> の .tf から「これから apply する型」→ API を引く。
+            # final=True（Step 3.5）では bulk_export 直後なので **必ず確定している**。
+            # final=False（Step 1.5）では前回 plan の残りがあれば拾えるだけの保険。
             tf_dir = os.path.join(self._tf_base_dir(), 'active', src_proj)
-            tf_apis = [] if tf_dir_has_mock_artifacts(tf_dir) else tf_required_apis(tf_dir)
+            # mock 生成物ガードは実行時のみ。mock モードでは _tf_base_dir() が
+            # terraform/mock/ を指しており、そこの .tf は mock にとっての正なので
+            # 読む（読まないと mock が TF 由来パスの回帰テストにならない）。
+            ignore_tf = not self.mock and tf_dir_has_mock_artifacts(tf_dir)
+            tf_apis = [] if ignore_tf else tf_required_apis(tf_dir)
+            if final and not tf_apis and not self.dry_run:
+                # dry_run は customize が .tf を書き出さないので空で正常。
+                self.dst_logger.warning(
+                    f"  → {dst_proj}: {tf_dir} から必要 API を引けませんでした"
+                    f"（.tf 無し / mock 生成物）。src 由来の API のみ有効化します"
+                )
             want = build_api_enable_plan(
                 src_services, asset_types, steps, list(extra) + tf_apis, skip,
             )
@@ -3779,17 +4883,23 @@ resource "google_container_cluster" "mock_cluster" {{
                 f"  → {dst_proj} (src={src_proj}): 必要 {len(want)} 件 / "
                 f"有効済み {len(want) - len(missing)} 件 / 追加 {len(missing)} 件"
             )
-            if not missing:
-                return
-            self.dst_logger.info(f"    有効化対象: {', '.join(missing)}")
-            failed = self._enable_apis_on_dst(dst_proj, dst_sa, missing)
+            failed: List[str] = []
+            if missing:
+                self.dst_logger.info(f"    有効化対象: {', '.join(missing)}")
+                failed = self._enable_apis_on_dst(dst_proj, dst_sa, missing)
             enabled_now = [a for a in missing if a not in failed]
-            # 有効化直後は反映ラグがあり、すぐ terraform を回すと 403 になる。
-            if enabled_now and wait_sec > 0 and not self.dry_run and not self.mock:
-                self._wait_for_apis_enabled(
-                    dst_proj, dst_sa, enabled_now,
-                    timeout_sec=wait_sec, interval_sec=8,
-                )
+            with results_lock:
+                results.append((dst_proj, len(want), len(missing), list(failed)))
+            if wait_sec > 0 and not self.dry_run and not self.mock:
+                # 有効化直後は反映ラグがあり、すぐ terraform を回すと 403 になる。
+                # final では**新規分だけでなく want 全体**が enabled として見えることを
+                # 確認してから次へ進む（「事前に全部有効」を保証する関門）。
+                verify = [a for a in want if a not in failed] if final else enabled_now
+                if verify:
+                    self._wait_for_apis_enabled(
+                        dst_proj, dst_sa, verify,
+                        timeout_sec=wait_sec, interval_sec=8,
+                    )
             if failed:
                 self.dst_logger.warning(
                     f"    ⚠ {dst_proj} で有効化できなかった API {len(failed)} 件: "
@@ -3806,16 +4916,36 @@ resource "google_container_cluster" "mock_cluster" {{
                 )
 
         self._parallel_for_each(pairs, worker, "enable-apis")
-        self.dst_logger.info("  ✓ Step 1.5 完了")
+
+        label = "Step 3.5" if final else "Step 1.5"
+        all_failed = [(p, f) for p, _w, _m, f in results if f]
+        total_want = sum(w for _p, w, _m, _f in results)
+        total_added = sum(m for _p, _w, m, _f in results)
+        if all_failed:
+            self.dst_logger.warning(
+                f"  ⚠ {label}: 有効化できなかった API があります"
+                f"（apply が 403 で止まる可能性）:"
+            )
+            for proj, apis in all_failed:
+                self.dst_logger.warning(f"      {proj}: {', '.join(apis)}")
+        else:
+            self.dst_logger.info(
+                f"  ✓ {label} 完了: {len(results)} プロジェクトで必要 API を確保"
+                f"（必要 計 {total_want} 件 / 今回追加 {total_added} 件）"
+            )
 
     def _list_enabled_services(
         self, project: str, side: str, sa: Optional[str],
     ) -> Optional[Set[str]]:
         """プロジェクトで有効な API 名の集合を返す。取得できなければ None。"""
         logger = self.org_logger if side == "src" else self.dst_logger
+        # --quiet: serviceusage API 自体が無効なプロジェクトでは gcloud が
+        # 「enable and retry? (y/N)」の対話プロンプトを出す。src 側で y と答えると
+        # src への書き込みになる（is_src_read_only はコマンド文字列しか見ないので
+        # 検出できない）。非対話でも timeout までハングする。
         rc, out, err = self._soft_run(
             f"gcloud services list --enabled --project={project} "
-            f"--format='value(config.name)'",
+            f"--format='value(config.name)' --quiet",
             side, logger, impersonate_sa=sa, timeout=180, skip_on_dry_run=False,
         )
         if rc != 0:
@@ -3841,7 +4971,7 @@ resource "google_container_cluster" "mock_cluster" {{
         for i in range(0, len(apis), _API_ENABLE_BATCH):
             chunk = apis[i:i + _API_ENABLE_BATCH]
             rc, out, err = self._soft_run(
-                f"gcloud services enable {' '.join(chunk)} --project={dst_proj}",
+                f"gcloud services enable {' '.join(chunk)} --project={dst_proj} --quiet",
                 "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=900,
             )
             if rc == 0:
@@ -3860,7 +4990,7 @@ resource "google_container_cluster" "mock_cluster" {{
             )
             for api in chunk:
                 rc1, out1, err1 = self._soft_run(
-                    f"gcloud services enable {api} --project={dst_proj}",
+                    f"gcloud services enable {api} --project={dst_proj} --quiet",
                     "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=300,
                 )
                 if rc1 == 0:
@@ -3992,7 +5122,16 @@ resource "google_container_cluster" "mock_cluster" {{
 
         # `make run` 時のみ skip。`make plan` (dry-run) と mock では従来どおり実行し、
         # active が無い・空の場合は安全側で実行する。
-        if bulk_cfg.get('skip_on_run') and not self.dry_run and not self.mock:
+        # 実行時上書き（--skip-on-run / --no-skip-on-run = make run SKIP_ON_RUN=1/0）が
+        # あれば config より優先する（config.yaml を触らず 1 回だけ変えたいとき用）。
+        skip_on_run = bulk_cfg.get('skip_on_run')
+        if self.skip_on_run_override is not None:
+            skip_on_run = self.skip_on_run_override
+            self.org_logger.info(
+                f"  skip_on_run をコマンドラインで上書き: {skip_on_run}"
+                f"（config: {bool(bulk_cfg.get('skip_on_run'))}）"
+            )
+        if skip_on_run and not self.dry_run and not self.mock:
             has_active = os.path.isdir(active_dir) and any(
                 any(f.endswith('.tf') for f in os.listdir(os.path.join(active_dir, d)))
                 for d in os.listdir(active_dir)
@@ -4088,6 +5227,40 @@ resource "google_container_cluster" "mock_cluster" {{
         os.makedirs(raw_dir, exist_ok=True)
         os.makedirs(active_dir, exist_ok=True)
 
+        # CAI エクスポートの規模・再試行の調整（大規模プロジェクトの timeout 対策）。
+        # "auto" 指定時は list-resource-types から Kind を引く（後述の worker 内）。
+        raw_kinds = bulk_cfg.get('export_resource_types')
+        auto_kinds = isinstance(raw_kinds, str) and raw_kinds.strip().lower() == "auto"
+        export_kinds = [] if auto_kinds else [
+            str(k).strip() for k in (raw_kinds or []) if str(k).strip()
+        ]
+        storage_path = str(bulk_cfg.get('storage_path') or '').strip()
+        export_retries = coerce_nonneg_int(bulk_cfg.get('retries', 2), 2)
+        export_retry_wait = coerce_nonneg_int(
+            bulk_cfg.get('retry_wait_seconds', 180), 180)
+        if auto_kinds:
+            self.org_logger.info(
+                "  export 対象 Kind を自動判定します（list-resource-types。"
+                "k8s オブジェクトは対象外）"
+            )
+            if storage_path:
+                self.org_logger.warning(
+                    "  export_resource_types と storage_path は排他のため、"
+                    "storage_path は無視します（gcloud の仕様）"
+                )
+        elif export_kinds:
+            self.org_logger.info(
+                f"  export 対象 Kind を {len(export_kinds)} 種に限定: "
+                f"{', '.join(export_kinds)}"
+            )
+            if storage_path:
+                self.org_logger.warning(
+                    "  export_resource_types と storage_path は排他のため、"
+                    "storage_path は無視します（gcloud の仕様）"
+                )
+        elif storage_path:
+            self.org_logger.info(f"  CAI エクスポート先バケット: {storage_path}")
+
         def bulk_export_worker(item):
             proj_id, sa = item
             self.org_logger.info(f"  → src '{proj_id}' をエクスポート")
@@ -4108,12 +5281,50 @@ resource "google_container_cluster" "mock_cluster" {{
                 f"--project={proj_id} --resource-format=terraform "
                 f"--path={proj_raw_dir} --quiet"
             )
+            # `--resource-types`（KRM Kind）と `--storage-path` は gcloud 上で排他。
+            # 資産数が多いプロジェクトは CAI エクスポートが config-connector 内部の
+            # 30 分待ちに引っかかって `error waiting for operation:` で落ちるため、
+            # ① Kind を絞って CAI クエリ自体を小さくする（GCS を使わない経路）か
+            # ② 既存バケットを使って毎回の一時バケット作成を省く、を選べるようにする。
+            kinds = export_kinds
+            if auto_kinds:
+                # プロジェクトが対応する KRM Kind を実機から引いて全指定する。
+                # 一覧は GCP リソースの Kind だけなので **k8s オブジェクトは自動的に
+                # 対象外**になり、移行範囲を狭めずに CAI クエリだけを小さくできる
+                # （k8s は Backup for GKE の担当。my-argolis では CAI 1,480 件中
+                #  908 件が k8s オブジェクト）。
+                rc_k, out_k, err_k = self._soft_run(
+                    f"gcloud beta resource-config list-resource-types "
+                    f"--project={proj_id} --format=json --quiet",
+                    "src", self.org_logger, impersonate_sa=sa, timeout=300,
+                    skip_on_dry_run=False,
+                )
+                kinds = parse_krm_kinds(out_k) if rc_k == 0 else []
+                if kinds:
+                    self.org_logger.info(
+                        f"    {proj_id}: KRM Kind {len(kinds)} 種を明示指定"
+                        f"（k8s オブジェクトは対象外）"
+                    )
+                else:
+                    self.org_logger.warning(
+                        f"    {proj_id}: Kind 一覧を取得できませんでした"
+                        f"（{_first_meaningful_line(err_k, out_k)}）。"
+                        f" 絞り込みなしで export します"
+                    )
+            if kinds:
+                cmd += f" --resource-types={','.join(kinds)}"
+            elif storage_path:
+                cmd += f" --storage-path={storage_path}"
             self.run_command(
                 cmd, side="src", logger=self.org_logger,
                 desc=f"Bulk Export {proj_id}",
                 explanation=f"{proj_id} のリソース定義を Terraform HCL としてエクスポート",
                 impersonate_sa=sa, allow_fail=True,
-                retries=3,  # config-connector は時々フレーキーに失敗するため再試行
+                # config-connector は時々フレーキーに失敗するため再試行するが、
+                # timeout 起因（30 分待ちの末に失敗）の場合は即再試行しても同じ時間を
+                # 溶かすだけ。既定 2 回 / 間隔 180 秒に抑え、config で調整可能にする。
+                retries=export_retries,
+                retry_wait_seconds=export_retry_wait,
             )
 
         self._parallel_for_each(projects, bulk_export_worker, "bulk-export")
@@ -4276,6 +5487,395 @@ resource "google_container_cluster" "mock_cluster" {{
                     result[(dst_proj, nm.group(1))] = label
         return result
 
+    def _rewrite_subnet_refs_in_active(self, active_dir: str):
+        """active の各 Terraform ルートで subnetwork URL を terraform 参照に変換する。
+
+        bulk-export は `subnetwork = "https://.../projects/<p>/regions/<r>/
+        subnetworks/<n>"` のハードコード URL を出すため、同じルートに subnetwork の
+        定義があっても Terraform が依存関係を認識できず、address / instance などが
+        subnetwork より先に作られて
+        `The resource 'projects/<dst>/regions/<r>/subnetworks/<n>' was not found`
+        の 404 になる（regression: shingo-ar-sharedhost0926 の fix-tokyo1）。
+        network 参照 (`_rewrite_network_refs`) と同じ対処を subnetwork にも行う。
+
+        **customize の全書き出しが終わってから**呼ぶこと。ラベルは
+        `dedupe_tf_resource_labels` で改名されうるため、確定した active を読んで
+        マップを作らないと存在しないラベルを参照してしまう。
+        """
+        try:
+            roots = sorted(os.listdir(active_dir))
+        except OSError:
+            return
+        for name in roots:
+            root = os.path.join(active_dir, name)
+            if os.path.isdir(root):
+                self._rewrite_subnet_refs_one_root(root)
+
+    def _rewrite_subnet_refs_one_root(self, root: str):
+        files = sorted(f for f in os.listdir(root) if f.endswith('.tf'))
+        contents: Dict[str, str] = {}
+        # {(project, region, subnet_name): label}
+        sub_map: Dict[tuple, str] = {}
+        for fn in files:
+            try:
+                with open(os.path.join(root, fn), encoding='utf-8', errors='replace') as f:
+                    contents[fn] = f.read()
+            except OSError:
+                continue
+            if 'google_compute_subnetwork' not in contents[fn]:
+                continue
+            for label, body in tf_blocks_of_type(
+                    contents[fn], "google_compute_subnetwork"):
+                pm = re.search(r'\bproject\s*=\s*"([^"]+)"', body)
+                nm = re.search(r'\bname\s*=\s*"([^"]+)"', body)
+                rm = re.search(r'\bregion\s*=\s*"([^"]+)"', body)
+                if pm and nm and rm:
+                    sub_map[(pm.group(1), rm.group(1), nm.group(1))] = label
+        if not sub_map:
+            return
+        url_re = re.compile(
+            r'"https://www\.googleapis\.com/compute/v\d+(?:beta\d*)?/projects/'
+            r'([A-Za-z0-9_.-]+)/regions/([A-Za-z0-9-]+)/subnetworks/([A-Za-z0-9_.-]+)"'
+        )
+        for fn, content in contents.items():
+            def repl(m: re.Match) -> str:
+                label = sub_map.get((m.group(1), m.group(2), m.group(3)))
+                if not label:
+                    # 別ルート（別プロジェクト = Shared VPC host など）の subnet は
+                    # ここでは解決できないので URL のまま残す。
+                    return m.group(0)
+                return f"google_compute_subnetwork.{label}.self_link"
+
+            new = url_re.sub(repl, content)
+            if new == content:
+                continue
+            try:
+                with open(os.path.join(root, fn), 'w', encoding='utf-8') as f:
+                    f.write(new)
+                self.org_logger.info(
+                    f"      subnetwork 参照を terraform 参照に変換: {fn}"
+                )
+            except OSError as e:
+                self.org_logger.warning(f"      subnetwork 参照の書き換え失敗 {fn}: {e}")
+
+    # ----- 同一ルート内の文字列参照 → terraform 参照 変換（2 パス目） -----
+    # bulk-export は他リソースへの参照を URL / email / リソースパスの**文字列**で
+    # 出力するため、Terraform が依存関係を認識できず、参照先より先に参照元を
+    # 作ろうとして 403/404/400 になる（regression: Cloud Run の actAs 403、
+    # backend service の security policy 400、forwarding rule の 404。
+    # network/subnetwork と同じ問題の別リソース版）。
+    # (URL パス種別, 参照先 tf 型) — 参照属性は self_link。
+    _URL_REF_KINDS = (
+        ("securityPolicies", "google_compute_security_policy"),
+        ("targetHttpsProxies", "google_compute_target_https_proxy"),
+        ("targetHttpProxies", "google_compute_target_http_proxy"),
+        ("urlMaps", "google_compute_url_map"),
+        ("backendServices", "google_compute_backend_service"),
+        ("sslCertificates", "google_compute_ssl_certificate"),
+    )
+    # account_id は 6-30 文字、project ID は 6-30 文字（上限を切り詰めると
+    # 30 文字ちょうどの dst プロジェクト ID で不一致になる。regression:
+    # shingo-ar-standalone2026081400 = 30 文字で actAs 修正が効かなかった）。
+    _SA_EMAIL_REF_RE = re.compile(
+        r'"([a-z][a-z0-9-]{5,29})@([a-z][a-z0-9-]{5,29})\.iam\.gserviceaccount\.com"'
+    )
+    _NOTIF_CHANNEL_REF_RE = re.compile(
+        r'"projects/[A-Za-z0-9_.-]+/notificationChannels/(\d+)"'
+    )
+
+    def _rewrite_resource_refs_in_active(self, active_dir: str):
+        """active の各ルートで SA email / compute URL / 通知チャネル参照を変換する。
+
+        `_rewrite_subnet_refs_in_active` と同じ 2 パス目（全書き出し後）。
+        ラベルは dedupe で改名されうるため、確定した active を読んでマップを作る。
+        同一ルートに定義が無い参照は文字列のまま残す（別プロジェクト参照や、
+        skip 済みリソース＝SSL 証明書などは apply 時の本来のエラーで露見させる）。
+        """
+        try:
+            roots = sorted(os.listdir(active_dir))
+        except OSError:
+            return
+        for name in roots:
+            root = os.path.join(active_dir, name)
+            if os.path.isdir(root):
+                self._rewrite_resource_refs_one_root(root)
+
+    # 証明書 URL（global / region 両対応）
+    _SSL_CERT_URL_RE = re.compile(
+        r'https://www\.googleapis\.com/compute/[a-z0-9]+/projects/'
+        r'([A-Za-z0-9_.-]+)/(global|regions/[A-Za-z0-9-]+)/sslCertificates/'
+        r'([A-Za-z0-9_.-]+)'
+    )
+
+    def _drop_cert_blocked_lb_files(
+        self, root: str, contents: Dict[str, str],
+    ) -> Dict[str, str]:
+        """未作成の SSL 証明書に依存する LB フロント（proxy / FR）を今回の適用から外す。
+
+        self-managed 証明書は秘密鍵が export 不能で **dst に手動作成するしかない**
+        （DIFF 要対応）。参照する target proxy を文字列参照のまま残すと、証明書を
+        作るまで**毎回 `make run` が 404 で exit 1** になる（regression:
+        `Error creating TargetHttpsProxy: ... sslCertificates/notify-api not found`）。
+        そこで証明書が dst に実在するかを確認し:
+          - 実在（手動作成済み）→ そのまま適用（URL は API で解決できる）
+          - 未作成 → proxy と、それを参照する forwarding rule を active から外し、
+            DIFF に「証明書作成後の次回 run で自動適用」と要対応で載せる。
+            次回 customize が再判定するので、証明書を作れば自動的に適用対象に戻る。
+        """
+        cert_defined: Set[Tuple[str, str]] = set()
+        for content in contents.values():
+            for _label, body in tf_blocks_of_type(
+                    content, "google_compute_ssl_certificate"):
+                pm = re.search(r'\bproject\s*=\s*"([^"]+)"', body)
+                nm = re.search(r'\bname\s*=\s*"([^"]+)"', body)
+                if pm and nm:
+                    cert_defined.add((pm.group(1), nm.group(1)))
+
+        sa_map = self._build_dst_sa_map()
+        dst_sa = sa_map.get(os.path.basename(root))
+        cert_exists_cache: Dict[Tuple[str, str, str], bool] = {}
+
+        def cert_available(proj: str, scope: str, name: str) -> bool:
+            if (proj, name) in cert_defined:
+                return True   # 同ルートで作られる（Google-managed 等）
+            key = (proj, scope, name)
+            if key not in cert_exists_cache:
+                loc_flag = ("--global" if scope == "global"
+                            else f"--region={scope.split('/', 1)[1]}")
+                cert_exists_cache[key] = self._gcloud_exists(
+                    f"gcloud compute ssl-certificates describe {name} {loc_flag} "
+                    f"--project={proj} --format='value(name)' --quiet",
+                    dst_sa,
+                )
+            return cert_exists_cache[key]
+
+        removed_proxies: Set[Tuple[str, str]] = set()
+        for fn in sorted(contents):
+            content = contents[fn]
+            for tf_type in ("google_compute_target_https_proxy",
+                            "google_compute_region_target_https_proxy"):
+                if f'resource "{tf_type}"' not in content:
+                    continue
+                missing = [
+                    m for m in self._SSL_CERT_URL_RE.finditer(content)
+                    if not cert_available(m.group(1), m.group(2), m.group(3))
+                ]
+                if not missing:
+                    continue
+                for _label, body in tf_blocks_of_type(content, tf_type):
+                    pm = re.search(r'\bproject\s*=\s*"([^"]+)"', body)
+                    nm = re.search(r'\bname\s*=\s*"([^"]+)"', body)
+                    if pm and nm:
+                        removed_proxies.add((pm.group(1), nm.group(1)))
+                names = ", ".join(sorted({m.group(3) for m in missing}))
+                self.org_logger.warning(
+                    f"      SSL 証明書未作成のため LB proxy を保留（証明書 {names} "
+                    f"を作成後の次回 run で適用）: {fn}"
+                )
+                self._add_customize_note("lb_blocked_on_cert", content, fn)
+                try:
+                    os.remove(os.path.join(root, fn))
+                except OSError:
+                    pass
+                del contents[fn]
+                break
+
+        if removed_proxies:
+            proxy_url_re = re.compile(
+                r'https://www\.googleapis\.com/compute/[a-z0-9]+/projects/'
+                r'([A-Za-z0-9_.-]+)/(?:global|regions/[A-Za-z0-9-]+)/'
+                r'targetHttpsProxies/([A-Za-z0-9_.-]+)'
+            )
+            for fn in sorted(contents):
+                content = contents[fn]
+                if 'forwarding_rule"' not in content and \
+                        '_forwarding_rule"' not in content:
+                    continue
+                refs = {(m.group(1), m.group(2))
+                        for m in proxy_url_re.finditer(content)}
+                if not (refs & removed_proxies):
+                    continue
+                self.org_logger.warning(
+                    f"      保留した proxy を参照するため forwarding rule も保留: {fn}"
+                )
+                self._add_customize_note("lb_blocked_on_cert", content, fn)
+                try:
+                    os.remove(os.path.join(root, fn))
+                except OSError:
+                    pass
+                del contents[fn]
+        return contents
+
+    def _rewrite_resource_refs_one_root(self, root: str):
+        files = sorted(f for f in os.listdir(root) if f.endswith('.tf'))
+        contents: Dict[str, str] = {}
+        for fn in files:
+            try:
+                with open(os.path.join(root, fn), encoding='utf-8',
+                          errors='replace') as f:
+                    contents[fn] = f.read()
+            except OSError:
+                continue
+
+        # 未作成 SSL 証明書に依存する LB フロントを先に外す（外したファイルへの
+        # 参照が terraform 参照に書き換わって validate エラーになるのを防ぐため、
+        # 参照書き換えより前に行う）。
+        contents = self._drop_cert_blocked_lb_files(root, contents)
+
+        # 参照先マップを確定後の active から構築する
+        url_maps: Dict[str, Dict[Tuple[str, str], str]] = {}
+        for _path_kind, tf_type in self._URL_REF_KINDS:
+            m: Dict[Tuple[str, str], str] = {}
+            for fn, content in contents.items():
+                if tf_type not in content:
+                    continue
+                for label, body in tf_blocks_of_type(content, tf_type):
+                    pm = re.search(r'\bproject\s*=\s*"([^"]+)"', body)
+                    nm = re.search(r'\bname\s*=\s*"([^"]+)"', body)
+                    if pm and nm:
+                        m[(pm.group(1), nm.group(1))] = label
+            url_maps[tf_type] = m
+        # network / subnetwork の短縮パス参照用マップ（(project, name) → label）。
+        net_short_map: Dict[str, Dict[Tuple[str, str], str]] = {}
+        for path_kind, tf_type in (("networks", "google_compute_network"),
+                                   ("subnetworks", "google_compute_subnetwork")):
+            m2: Dict[Tuple[str, str], str] = {}
+            for fn, content in contents.items():
+                if tf_type not in content:
+                    continue
+                for label, body in tf_blocks_of_type(content, tf_type):
+                    pm = re.search(r'\bproject\s*=\s*"([^"]+)"', body)
+                    nm = re.search(r'^\s*name\s*=\s*"([^"]+)"', body, re.M)
+                    if pm and nm:
+                        m2[(pm.group(1), nm.group(1))] = label
+            net_short_map[path_kind] = m2
+
+        # GKE クラスタ名 → ラベル。node pool の `cluster = "<name>"` は文字列なので
+        # 依存が張られず、クラスタより先に node pool を作ろうとして 404 になる
+        # （さらに remove_default_node_pool の既定プール削除とも競合しうる）。
+        cluster_map: Dict[str, str] = {}
+        for fn, content in contents.items():
+            if 'google_container_cluster' not in content:
+                continue
+            for label, body in tf_blocks_of_type(content, "google_container_cluster"):
+                nm = re.search(r'^\s*name\s*=\s*"([^"]+)"', body, re.M)
+                if nm:
+                    cluster_map[nm.group(1)] = label
+
+        sa_map: Dict[Tuple[str, str], str] = {}
+        for fn, content in contents.items():
+            if 'google_service_account' not in content:
+                continue
+            for label, body in tf_blocks_of_type(content, "google_service_account"):
+                pm = re.search(r'\bproject\s*=\s*"([^"]+)"', body)
+                am = re.search(r'\baccount_id\s*=\s*"([^"]+)"', body)
+                if pm and am:
+                    sa_map[(am.group(1), pm.group(1))] = label
+        # 通知チャネルは server 採番 ID で参照される。旧 ID は import コメントに
+        # しか残らないため、そこから 旧 ID → ラベル を引く。
+        channel_map: Dict[str, str] = {}
+        for fn, content in contents.items():
+            if 'google_monitoring_notification_channel' not in content:
+                continue
+            for label, _body in tf_blocks_of_type(
+                    content, "google_monitoring_notification_channel"):
+                cm = re.search(
+                    rf'#\s*terraform import\s+google_monitoring_notification_channel\.'
+                    rf'{re.escape(label)}\b[^\n]*notificationChannels/(\d+)', content)
+                if cm:
+                    channel_map[cm.group(1)] = label
+
+        url_re = re.compile(
+            r'"https://www\.googleapis\.com/compute/[a-z0-9]+/projects/'
+            r'([A-Za-z0-9_.-]+)/(?:global|regions/[A-Za-z0-9-]+)/'
+            r'([A-Za-z]+)/([A-Za-z0-9_.-]+)"'
+        )
+        # GKE 等は network/subnetwork を **短縮パス**（URL でない
+        # `projects/<p>/global/networks/<n>`）で出す。URL 版だけ変換していると
+        # 依存が張られず、VPC より先にクラスタが作られて 404 になる。
+        short_path_re = re.compile(
+            r'"projects/([A-Za-z0-9_.-]+)/(?:global|regions/[A-Za-z0-9-]+)/'
+            r'(networks|subnetworks)/([A-Za-z0-9_.-]+)"'
+        )
+        kind_to_type = dict(self._URL_REF_KINDS)
+
+        for fn, content in contents.items():
+            orig = content
+
+            def url_repl(m: re.Match) -> str:
+                tf_type = kind_to_type.get(m.group(2))
+                if not tf_type:
+                    return m.group(0)
+                label = url_maps.get(tf_type, {}).get((m.group(1), m.group(3)))
+                if not label:
+                    return m.group(0)
+                return f"{tf_type}.{label}.self_link"
+
+            content = url_re.sub(url_repl, content)
+
+            def short_repl(m: re.Match) -> str:
+                tf_type = ("google_compute_network" if m.group(2) == "networks"
+                           else "google_compute_subnetwork")
+                label = net_short_map.get(m.group(2), {}).get((m.group(1), m.group(3)))
+                if not label:
+                    # 別ルート（Shared VPC host）の参照は解決できないので URL のまま。
+                    return m.group(0)
+                return f"{tf_type}.{label}.self_link"
+
+            content = short_path_re.sub(short_repl, content)
+
+            def sa_repl(m: re.Match) -> str:
+                label = sa_map.get((m.group(1), m.group(2)))
+                if not label:
+                    return m.group(0)
+                return f"google_service_account.{label}.email"
+
+            content = self._SA_EMAIL_REF_RE.sub(sa_repl, content)
+
+            if 'resource "google_container_node_pool"' in content:
+                def cluster_repl(m: re.Match) -> str:
+                    label = cluster_map.get(m.group(2))
+                    if not label:
+                        return m.group(0)
+                    return f"{m.group(1)}google_container_cluster.{label}.name"
+
+                content = re.sub(
+                    r'^(\s*cluster\s*=\s*)"([^"]+)"', cluster_repl, content,
+                    flags=re.M,
+                )
+
+            def ch_repl(m: re.Match) -> str:
+                label = channel_map.get(m.group(1))
+                if not label:
+                    return m.group(0)
+                # .name = "projects/<dst>/notificationChannels/<新 ID>"（apply 後に確定）
+                return f"google_monitoring_notification_channel.{label}.name"
+
+            content = self._NOTIF_CHANNEL_REF_RE.sub(ch_repl, content)
+
+            # 解決できなかった通知チャネル参照は旧 ID のままでは絶対に見つからない
+            # （ID は server 採番で dst に同じ番号は存在しない）ため、行ごと落として
+            # DIFF に「確認」で出す。チャネル無しでもアラート本体は作成できる。
+            if re.search(r'^\s*notification_channels\s*=.*notificationChannels/',
+                         content, re.M):
+                content = re.sub(
+                    r'^\s*notification_channels\s*=[^\n]*\n', '', content, flags=re.M)
+                self.org_logger.warning(
+                    f"      通知チャネル参照を除去（dst に存在しない旧 ID）: {fn}"
+                )
+                self._add_customize_note("alert_notification_channels", content, fn)
+
+            if content == orig:
+                continue
+            try:
+                with open(os.path.join(root, fn), 'w', encoding='utf-8') as f:
+                    f.write(content)
+                self.org_logger.info(
+                    f"      リソース参照を terraform 参照に変換: {fn}"
+                )
+            except OSError as e:
+                self.org_logger.warning(f"      参照の書き換え失敗 {fn}: {e}")
+
     def _rewrite_network_refs(self, content: str, net_map: Dict[tuple, str]) -> str:
         """同一プロジェクト内の network URL を terraform 参照 (self_link) に変換する。
 
@@ -4356,6 +5956,15 @@ resource "google_container_cluster" "mock_cluster" {{
         # Terraform ルート（active/<project>/ または active 直下）ごとに確定済みの
         # resource (type, label)。flatten での重複ラベル一意化に使う。
         seen_labels: Dict[str, Set[Tuple[str, str]]] = {}
+        # 越境リソース判定用: dst として正当なプロジェクト ID の集合。
+        dst_project_ids = set(proj_map.values())
+        rt_include, rt_exclude = self._resource_type_filters()
+        # src で使用中（IN_USE）の内部アドレス名（src プロジェクトごと）。
+        # Step 5 が VM と同じプロジェクトに予約し直すため Terraform 複製から外す。
+        gce_restore_on = step_enabled(self.config.get('steps', {}), 'gce_restore')
+        cai_dir = (self.config.get('steps', {}).get('cai_scan', {}) or {}).get(
+            'output_dir', './cai_export')
+        in_use_addrs: Dict[str, Set[str]] = {}
 
         # dedupe_tf_resource_labels は走査順依存（先勝ちで元ラベルを維持）なので、
         # 実行ごとに改名対象が入れ替わらないよう walk を必ずソートする。
@@ -4441,6 +6050,24 @@ resource "google_container_cluster" "mock_cluster" {{
                     #    （廃止ブロック除去 / 必須化された引数の補完）。
                     content = self._fix_provider_compat(content, rel)
 
+                    # 3.8. project_mapping 外プロジェクトのリソースを除外する。
+                    #    bulk-export は monitoring workspace などを介して**別プロジェクト
+                    #    のリソースまで越境出力する**ことがある（例: my-argolis の export に
+                    #    shingo-ar-genai0718 の notification channel が混入）。ID 置換は
+                    #    mapping に無いプロジェクトを変えないため、そのまま apply すると
+                    #    **無関係な実プロジェクトへ書き込もうとする**。安全のため落とす。
+                    #    プロジェクト番号（数値）は proj_num_map で dst に置換済みのため
+                    #    ここでは判定対象外（dry_run では番号 map が無く誤検知するため）。
+                    pm_ = re.search(r'^\s*project\s*=\s*"([^"]+)"', content, re.M)
+                    if pm_ and not pm_.group(1).isdigit() and \
+                            pm_.group(1) not in dst_project_ids:
+                        self.org_logger.warning(
+                            f"      スキップ（project_mapping 外プロジェクト "
+                            f"'{pm_.group(1)}' への越境リソース）: {active_rel}"
+                        )
+                        self.stats.incr("skipped")
+                        continue
+
                     # 4. Google 管理のデフォルト SA など、Terraform で作成不能な
                     #    リソースはスキップ（account_id が GCP 命名規則違反のもの）。
                     skip_reason = self._skip_reason_for_file(content)
@@ -4449,8 +6076,54 @@ resource "google_container_cluster" "mock_cluster" {{
                         # 埋もれる）。新しい「複製不能 → skip」を足すときも同様に注記する。
                         if 'resource "google_compute_ssl_certificate"' in content:
                             self._add_customize_note("ssl_certificate", content, rel)
+                        elif 'resource "google_container_analysis_occurrence"' in content:
+                            self._add_customize_note(
+                                "container_analysis_occurrence", content, rel)
+                        elif 'resource "google_dns_managed_zone"' in content:
+                            self._add_customize_note("dns_managed_zone", content, rel)
+                        elif ('resource "google_storage_bucket"' in content
+                              and "ドット入り" in (skip_reason or "")):
+                            self._add_customize_note("dotted_bucket", content, rel)
                         self.org_logger.info(f"      スキップ（{skip_reason}）: {active_rel}")
                         continue
+
+                    # 3.85. src で VM が使用中（IN_USE）の内部アドレスは複製しない。
+                    #    Step 5 が `mig-<vm>-<ip>` として VM と同じプロジェクトに予約
+                    #    し直す（DIFF P1 と同じ設計）。Terraform 側でも作ると二重予約で、
+                    #    Shared VPC では host 側予約が svc の VM 作成をブロックする。
+                    if gce_restore_on and 'resource "google_compute_address"' in content:
+                        src_p = parts[0] if len(parts) > 1 else ''
+                        if src_p and src_p not in in_use_addrs:
+                            in_use_addrs[src_p] = cai_in_use_internal_addresses(
+                                os.path.join(cai_dir, f"cai_resources_{src_p}.txt"))
+                        nm_ = re.search(r'^\s*name\s*=\s*"([^"]+)"', content, re.M)
+                        if nm_ and nm_.group(1) in in_use_addrs.get(src_p, set()):
+                            self.org_logger.info(
+                                f"      スキップ（src で使用中の内部 IP 予約。"
+                                f"Step 5 が VM 側で予約し直す）: {active_rel}"
+                            )
+                            self.stats.incr("skipped")
+                            continue
+
+                    # 3.9. 移行範囲の絞り込み（steps.bulk_export.resource_types）。
+                    #    利用者が「Cloud Run や GKE は移さない」等を選べるようにする。
+                    #    全リソース型が対象外のファイルだけ落とす（1 つでも対象の型が
+                    #    残るなら安全側でコピーする）。GKE 移行手順 note を出す前に
+                    #    判定する（除外したクラスタの手順を出さないため）。
+                    rt_reason = resource_type_filter_reason(
+                        tf_resource_types(content), rt_include, rt_exclude)
+                    if rt_reason:
+                        self.org_logger.info(
+                            f"      スキップ（{rt_reason}）: {active_rel}")
+                        self.stats.incr("skipped")
+                        continue
+
+                    # GKE クラスタは構成のみ複製する方針のため、ワークロード・PV の
+                    # 移行（Backup for GKE の backup/restore）が別途必要になる。
+                    # クラスタごとに DIFF.md へ手順を「要対応」で載せる（ルール:
+                    # ツールが対象外とした手動移行は DIFF に必ず手順つきで出す）。
+                    if 'resource "google_container_cluster"' in content:
+                        self._add_customize_note("gke_backup_restore", content, rel)
 
                     # 4.5. flatten で同居する resource ラベルの重複を一意化。
                     #    bulk-export はラベルをリソース名だけから作るため、同名
@@ -4480,6 +6153,13 @@ resource "google_container_cluster" "mock_cluster" {{
                 except Exception as e:
                     self.org_logger.error(f"    HCL カスタマイズ失敗 {raw_path}: {e}")
                     sys.exit(1)
+
+        # 同一ルート内の subnetwork URL 参照を terraform 参照へ書き換える。
+        # **全ファイル書き出し後**に走らせること: ラベルは dedupe で改名されうるので、
+        # 確定後の active を読まないと存在しないラベルを指してしまう。
+        if not self.dry_run:
+            self._rewrite_subnet_refs_in_active(active_dir)
+            self._rewrite_resource_refs_in_active(active_dir)
 
         # 手動対応・確認注記を active/<src>/.customize_notes.json に永続化する。
         # skip_on_run で customize を飛ばす `make run` でも Step 99 が DIFF.md に
@@ -4565,7 +6245,10 @@ resource "google_container_cluster" "mock_cluster" {{
             self.org_logger.info(
                 f"      provider 廃止ブロックを除去: {name} ({rel})"
             )
-        if 'resource "google_compute_backend_service"' in content:
+        # region 版 (google_compute_region_backend_service) も同じ iap ブロックを持つ。
+        # 完全一致文字列だと region 版が素通りして plan が Missing required argument
+        # で落ちる。
+        if re.search(r'resource "google_compute(_region)?_backend_service"', content):
             content, n = ensure_hcl_block_arg(content, "iap", "enabled = true")
             if n:
                 self.org_logger.info(
@@ -4590,6 +6273,146 @@ resource "google_container_cluster" "mock_cluster" {{
             self.org_logger.info(
                 f"      cluster_ipv4_cidr を除去（ip_allocation_policy と排他）: {rel}"
             )
+        # provider 既定の deletion_protection = true を dst 側で false に倒す。
+        # export が明示していれば触らない（src の意図が入っている）。
+        for tf_type in _DELETION_PROTECTION_DEFAULT_TRUE_TYPES:
+            if f'resource "{tf_type}"' not in content:
+                continue
+            content, added = ensure_tf_resource_arg(
+                content, tf_type, "deletion_protection = false")
+            for label in added:
+                self.org_logger.info(
+                    f"      deletion_protection=false を補完（provider 既定 true だと"
+                    f" 失敗時に replace できず詰む）: {tf_type}.{label} ({rel})"
+                )
+                self._add_customize_note("deletion_protection", content, rel)
+
+        # GKE: Backup for GKE のエージェントを dst 側で有効化する。
+        # 本ツールはクラスタ構成しか複製せず、ワークロード / PV は Backup for GKE の
+        # restore で戻す前提（DIFF に手順を出す）。エージェントは **復元先クラスタにも
+        # 必須**（addonsConfig.gkeBackupAgentConfig.enabled: true）だが、src で無効なら
+        # export も false になり、そのままだと restore できないクラスタが出来上がる。
+        # 「dst が緩くなる」変更ではなく（バックアップ機能の追加）、移行のゴールに
+        # 必要なので true に倒す。src 側の有効化は read-only のため利用者の手動作業。
+        if 'resource "google_container_cluster"' in content:
+            content, n_bk = ensure_hcl_block_arg(
+                content, "gke_backup_agent_config", "enabled = true")
+            if n_bk:
+                self.org_logger.info(
+                    f"      gke_backup_agent_config.enabled=true を補完"
+                    f"（Backup for GKE の restore に必須）: {rel}"
+                )
+            elif re.search(r'gke_backup_agent_config\s*\{\s*\n\s*enabled\s*=\s*false',
+                           content):
+                content = re.sub(
+                    r'(gke_backup_agent_config\s*\{\s*\n\s*enabled\s*=\s*)false',
+                    r'\1true', content)
+                self.org_logger.info(
+                    f"      gke_backup_agent_config.enabled を false→true に変更"
+                    f"（Backup for GKE の restore に必須）: {rel}"
+                )
+            if 'gke_backup_agent_config' not in content:
+                # addons_config ごと無いクラスタ（最小構成）にも足す。
+                content, n_add = ensure_tf_resource_arg(
+                    content, "google_container_cluster",
+                    "addons_config {\n    gke_backup_agent_config {\n"
+                    "      enabled = true\n    }\n  }")
+                if n_add:
+                    self.org_logger.info(
+                        f"      addons_config.gke_backup_agent_config を追加"
+                        f"（Backup for GKE の restore に必須）: {rel}"
+                    )
+
+        # GKE: 別リソースの google_container_node_pool で運用するクラスタには
+        # `initial_node_count` と `remove_default_node_pool` が必要。GKE API は
+        # 「ノードプール 0 個のクラスタ」を作れないため、export のままだと
+        # initial_node_count=0 で送られ
+        # `Cluster.initial_node_count must be greater than zero` の 400 になる
+        # （regression: my-argolis の 2 クラスタ）。provider ドキュメントの定石
+        # どおり「最小の既定プールを作って即削除」する形に補う（既定プールを
+        # 残すと、別リソース側の同名 default-pool 作成が 409 になる）。
+        # 対象外: inline `node_pool {}` を持つクラスタ（既定プールが要る）と
+        # Autopilot（ノード管理は GKE 側。remove_default_node_pool は
+        # enable_autopilot と ConflictsWith）。
+        if ('resource "google_container_cluster"' in content
+                and not re.search(r'^\s*node_pool\s*\{', content, re.M)
+                and not re.search(r'^\s*enable_autopilot\s*=\s*true', content, re.M)):
+            content, added_c = ensure_tf_resource_arg(
+                content, "google_container_cluster", "initial_node_count = 1")
+            content, added_r = ensure_tf_resource_arg(
+                content, "google_container_cluster",
+                "remove_default_node_pool = true")
+            for label in sorted(set(added_c) | set(added_r)):
+                self.org_logger.info(
+                    f"      initial_node_count=1 / remove_default_node_pool=true を"
+                    f"補完（別リソースの node_pool で運用するため）: "
+                    f"google_container_cluster.{label} ({rel})"
+                )
+
+        # GKE: node pool は create 時に `initial_node_count` と `node_count` を
+        # **両方指定できない**（`Cannot set both initial_node_count and node_count
+        # on node pool ...`）。export は両方出す。org のノード数を引き継ぐのは
+        # `node_count`（現在の管理台数）なので、そちらを残して initial 側を落とす。
+        # クラスタ本体の initial_node_count（remove_default_node_pool 用）は対象外。
+        if ('resource "google_container_node_pool"' in content
+                and 'resource "google_container_cluster"' not in content
+                and re.search(r'^\s*node_count\s*=', content, re.M)
+                and re.search(r'^\s*initial_node_count\s*=', content, re.M)):
+            content = re.sub(r'^\s*initial_node_count\s*=[^\n]*\n', '', content,
+                             flags=re.M)
+            self.org_logger.info(
+                f"      node pool の initial_node_count を除去"
+                f"（node_count と排他。台数は node_count が引き継ぐ）: {rel}"
+            )
+
+        # GKE: node pool の network_config は `pod_range`（既存 secondary range を
+        # 名前で参照）と `pod_ipv4_cidr_block`（新規レンジを作るときの CIDR）が
+        # 対になっている。provider の定義上 **pod_ipv4_cidr_block は
+        # create_pod_range = true のときだけ有効**で、export は両方出すため、
+        # そのままだと「既存レンジ参照」なのに CIDR も送られて曖昧になる。
+        # GKE が subnet に作った range は subnet の .tf ごと dst に複製されるので、
+        # 名前参照を残して CIDR を落とす（クラスタ側 ip_allocation_policy と同じ判断）。
+        if ('resource "google_container_node_pool"' in content
+                and re.search(r'^\s*pod_range\s*=\s*"', content, re.M)
+                and not re.search(r'^\s*create_pod_range\s*=\s*true', content, re.M)
+                and re.search(r'^\s*pod_ipv4_cidr_block\s*=', content, re.M)):
+            content = re.sub(r'^\s*pod_ipv4_cidr_block\s*=[^\n]*\n', '', content,
+                             flags=re.M)
+            self.org_logger.info(
+                f"      node pool の pod_ipv4_cidr_block を除去"
+                f"（pod_range で既存レンジを参照するため）: {rel}"
+            )
+
+        # GKE: ノードプールの version 固定は master 版と食い違うと
+        # 「Node version must be <= master version」で落ちる。クラスタ側の
+        # node_version を除去して release_channel 追従にしたのと揃え、
+        # ノードプールも master 版に追従させる（未指定 = master と同版）。
+        if 'resource "google_container_node_pool"' in content and \
+                re.search(r'^\s*version\s*=\s*"', content, re.M):
+            content = re.sub(r'^\s*version\s*=\s*"[^"]*"[^\n]*\n', '', content,
+                             flags=re.M)
+            self.org_logger.info(
+                f"      node pool の version を除去（master 版に追従させる）: {rel}"
+            )
+
+        # GKE: node_version は create 時に min_master_version と同値でなければ
+        # ならない（provider の検証）。export は現在のノード版だけを出すことが
+        # あり（min_master_version 無し）、そのままだと
+        # 「node_version and min_master_version must be set to equivalent values
+        # on create」で apply 前に落ちる。版は release_channel（export 済み）に
+        # 追従させるのが最も堅いので、同値でない node_version は除去する
+        # （min_master_version 側は残す）。
+        if 'resource "google_container_cluster"' in content:
+            nv = re.search(r'^\s*node_version\s*=\s*"([^"]+)"', content, re.M)
+            mm = re.search(r'^\s*min_master_version\s*=\s*"([^"]+)"', content, re.M)
+            if nv and (not mm or mm.group(1) != nv.group(1)):
+                content = re.sub(r'^\s*node_version\s*=[^\n]*\n', '', content,
+                                 flags=re.M)
+                self.org_logger.info(
+                    f"      node_version を除去（min_master_version と同値必須。"
+                    f"dst は release channel に追従）: {rel}"
+                )
+
         # GKE: ip_allocation_policy は「subnet の secondary range を名前で参照する
         # モード」と「CIDR を指定して自動作成させるモード」が排他で、
         # *_secondary_range_name は cluster/services **両方の** *_ipv4_cidr_block と
@@ -4615,12 +6438,16 @@ resource "google_container_cluster" "mock_cluster" {{
         content から拾う（プロジェクト ID 置換済みなので dst 側の値になる）。"""
         nm = re.search(r'\bname\s*=\s*"([^"]+)"', content)
         pm = re.search(r'\bproject\s*=\s*"([^"]+)"', content)
-        self._customize_notes.append({
+        note = {
             "kind": kind,
             "src_dir": rel.split(os.sep)[0] if os.sep in rel else "",
             "resource": nm.group(1) if nm else "?",
             "project": pm.group(1) if pm else "?",
-        })
+        }
+        # 同一内容は 1 行にまとめる（name を持たないリソースは resource="?" に
+        # 潰れるため、そのまま積むと同じ行が件数分並んで DIFF が読めなくなる）。
+        if note not in self._customize_notes:
+            self._customize_notes.append(note)
 
     def _skip_reason_for_file(self, content: str) -> Optional[str]:
         """Terraform で作成不能 / 管理不能なリソースを含むファイルはスキップ理由を返す。
@@ -4667,12 +6494,43 @@ resource "google_container_cluster" "mock_cluster" {{
         if 'resource "google_bigquery_table"' in content:
             return "BQ table は Step6 (data_sync) が bq cp で作成するため除外"
 
+        # public DNS ゾーンはドメインがグローバル一意で、同一ドメインのゾーンは
+        # 「reserved or registered already / prohibited by policy」の 400 で
+        # 別プロジェクトに作れないことがある（regression: kawanos.demo.altostrat.com）。
+        # 作れたとしても NS 委任は src ゾーンを向いたままで dst ゾーンは機能しない。
+        # ドメイン委任の切替は利用者の判断が要るため skip + DIFF 要対応。
+        # private ゾーン（VPC スコープ）は複製可能なので対象外。
+        if 'resource "google_dns_managed_zone"' in content and \
+                not re.search(r'^\s*visibility\s*=\s*"private"', content, re.M):
+            return "public DNS ゾーン（ドメインはグローバル一意。委任切替は手動）"
+
+        # ドット入り（ドメイン形式）バケットはドメイン検証済み TLD 配下でないと
+        # 作成できない（400: contains a '.' but is not under a recognized TLD）。
+        # 特に *.appspot.com（GCR レイヤー / GAE staging）は Google 管理の
+        # システムバケットで別プロジェクトへの複製自体が不可能。
+        # data_sync (_sync_gcs) の同種 skip と同じ扱い（rename_rules.gcs.overrides で
+        # ドット無しの dst 名を指定すれば data_sync が作成 + 同期する）。
+        if 'resource "google_storage_bucket"' in content:
+            m = re.search(r'^\s*name\s*=\s*"([^"]+)"', content, re.M)
+            if m and '.' in m.group(1):
+                return (f"ドット入り（ドメイン形式）バケット {m.group(1)} は"
+                        f"dst に作成不可")
+
         # self-managed SSL 証明書は秘密鍵を API からエクスポートできず、
         # provider スキーマ上 private_key 必須のため apply 不能。dst で鍵を持つ
         # 利用者が手動作成するしかない（DIFF に要対応として出る）。
         # Google-managed 証明書 (google_compute_managed_ssl_certificate) は別型で対象外。
         if 'resource "google_compute_ssl_certificate"' in content:
             return "self-managed SSL 証明書（秘密鍵は export 不能。dst で手動作成が必要）"
+
+        # Container Analysis の occurrence は「過去ビルドの来歴・署名」レコードで、
+        # インフラ構成ではない。参照する note（`built-by-cloud-build` 等）は
+        # Cloud Build が自プロジェクトに作るため dst には存在せず、apply が
+        # `note with ID "..." for project "<dst>" does not exist` の 404 で失敗する
+        # （regression: my-argolis）。署名鍵も Google 管理プロジェクトを指しており
+        # 複製不能。dst で再ビルドすれば同種の occurrence が自動生成される。
+        if 'resource "google_container_analysis_occurrence"' in content:
+            return "Container Analysis occurrence（参照先 note は dst に存在せず作成不能）"
 
         # NAT 用に自動払い出しされる外部 IP は手動作成できない。
         if 'resource "google_compute_address"' in content and \
@@ -4698,6 +6556,23 @@ resource "google_container_cluster" "mock_cluster" {{
             m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
             if m and is_gke_managed_name(m.group(1)):
                 return f"GKE 自動生成リソース（dst クラスタが再生成）: {m.group(1)}"
+
+        # k8s Service (type=LoadBalancer) が作る LB リソースは名前が hex UID
+        # （a<31hex>）で接頭辞判定に掛からないが、description に kubernetes.io の
+        # 所有者マーカーを必ず持つ。落とさないと、参照先の k8s-* health check だけが
+        # 上の接頭辞判定で除外され、target pool / forwarding rule が宙ぶらりんの
+        # 参照を抱えて apply が 404 になる（regression: my-argolis の
+        # a0cb2a...）。forwarding rule は名前接頭辞では判定しない
+        # （利用者の LB を誤って落とさない。マーカーがある場合のみ除外）。
+        if has_k8s_owner_marker(content):
+            for rtype in _GKE_MANAGED_TF_RESOURCE_TYPES + (
+                    "google_compute_forwarding_rule",):
+                if f'resource "{rtype}"' in content:
+                    m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+                    return (
+                        f"k8s(GKE) 管理リソース（kubernetes.io マーカー。"
+                        f"dst クラスタが再生成）: {m.group(1) if m else rtype}"
+                    )
 
         # スナップショット / イメージは移行モデルでは terraform で作らない。
         # snapshot は dst に存在しないディスクを source にしており、image はその
@@ -4728,17 +6603,23 @@ resource "google_container_cluster" "mock_cluster" {{
         )
 
     def _strip_reserved_ip(self, content: str) -> str:
-        """google_compute_address / global_address の固定 IP 指定を外し自動採番にする。
+        """外部アドレスの固定 IP 指定だけを外し自動採番にする。
 
-        src の予約 IP（実務上は内部 IP が中心。例: 10.x.x.x）は dst プロジェクトに割り当て
-        られていないため、そのまま作成すると "IP address is not allocated" で失敗する。
-        `address = "<ip>"` 行を削除して GCP に新しい IP を採番させる。dst で内部 IP が src と
-        変わるため、IP 直書きの設定（/etc/hosts、FW ルールの IP 条件等）は移行後に壊れ得る
-        （既知の制約。ISSUES.md ISSUE-05 で preserve オプション化を検討中・未実装）。
-        `address_type` 行は別物なので消さない。
+        - **外部** IP（EXTERNAL / 指定なし）は Google 採番のグローバル資源で、
+          src と同じ値を dst で確保できないため `address = "<ip>"` を外す。
+        - **内部**（`address_type = "INTERNAL"`。subnet 予約 / PSA レンジ）は
+          **元 IP を必ず残す**。subnet は同じ CIDR で dst に複製されるので元 IP は
+          有効であり、剥がすと自動採番がサブネット最若 IP（.2 など）を掴んで
+          **Step 5 が復元する VM の IP を横取りする**（regression: 複製した
+          svc1-fix1 が 10.100.1.2 を自動採番で確保し、iam-vm の復元が
+          「IP already used / reserved by another project」で失敗した）。
+          そもそも予約の意味は「その IP を押さえること」なので、値を変えた複製は
+          取り置きとして機能しない。
         """
         if ('resource "google_compute_address"' not in content
                 and 'resource "google_compute_global_address"' not in content):
+            return content
+        if re.search(r'^\s*address_type\s*=\s*"INTERNAL"', content, re.M):
             return content
         out: List[str] = []
         for line in content.split('\n'):
@@ -5058,17 +6939,23 @@ resource "google_container_cluster" "mock_cluster" {{
         失敗は WARNING のみで `stats.failed` に積まない（本当に必要な API なら
         terraform 側が本来のエラーで止めるので二重報告しない）。
         """
-        cfg = self.config.get('steps', {}).get('enable_apis', {})
+        steps = self.config.get('steps', {})
+        cfg = steps.get('enable_apis', {})
         if not isinstance(cfg, dict):
             cfg = {}
         skip = set(_DST_API_SKIP) | {
             str(s or "").strip() for s in (cfg.get('skip_apis') or [])
             if str(s or "").strip()
         }
-        want = set(_BASE_DST_APIS)
-        from_tf = tf_required_apis(proj_dir) if proj_dir else []
-        want |= set(from_tf)
+        # `.tf` 由来の API は enable_apis ステップの拡張機能なので off-switch に従う。
+        # ただし基盤 API（CRM / ServiceUsage / IAM）は enable_apis 導入前から Step 4 が
+        # 無条件で有効化していた必須品なので、enabled: false でも skip_apis でも外さない
+        # （外せると terraform が一切動かない dst を「設定どおり」に作ってしまう）。
+        want: Set[str] = set()
+        if step_enabled(steps, 'enable_apis') and proj_dir:
+            want |= set(tf_required_apis(proj_dir))
         want -= skip
+        want |= set(_BASE_DST_APIS)
 
         have = self._list_enabled_services(dst_proj, "dst", dst_sa)
         # 一覧が取れないときは全部 enable する（enable 自体は冪等）。
@@ -5081,10 +6968,15 @@ resource "google_container_cluster" "mock_cluster" {{
         )
         failed = self._enable_apis_on_dst(dst_proj, dst_sa, missing)
         enabled_now = [a for a in missing if a not in failed]
-        if enabled_now:
+        # wait_seconds は enabled: false のとき validate_steps_config を通らない
+        # （検査は有効ステップのみ）ので、ここでは型不正でも落ちない形で読む。
+        # 0 は「待たない」（テンプレート記載どおり。0 で _wait_for_apis_enabled を
+        # 呼ぶと必ず「timeout 内に確認できませんでした」の偽警告になる）。
+        wait_sec = coerce_nonneg_int(cfg.get('wait_seconds', 120), 120)
+        if enabled_now and wait_sec > 0:
             self._wait_for_apis_enabled(
                 dst_proj, dst_sa, enabled_now,
-                timeout_sec=int(cfg.get('wait_seconds', 120)), interval_sec=8,
+                timeout_sec=wait_sec, interval_sec=8,
             )
         if failed:
             self.dst_logger.warning(
@@ -5115,7 +7007,7 @@ resource "google_container_cluster" "mock_cluster" {{
         while time.monotonic() < deadline:
             try:
                 res = subprocess.run(
-                    f"gcloud services list --enabled --project={dst_proj} "
+                    f"gcloud services list --enabled --project={dst_proj} --quiet "
                     f"--format='value(config.name)'",
                     shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, env=env, timeout=30,
@@ -5203,22 +7095,25 @@ resource "google_container_cluster" "mock_cluster" {{
             if addr.startswith("google_project_iam_custom_role.") and "##" in imp_id:
                 proj, role = imp_id.split("##", 1)
                 imp_id = f"projects/{proj}/roles/{role}"
-            rc, _o, err = self._sa_preflight_run(
+            rc, out, err = self._sa_preflight_run(
                 f"terraform -chdir={proj_dir} import -input=false -lock=false "
                 f"'{addr}' '{imp_id}'"
             )
             if rc == 0:
                 imported += 1
                 continue
-            # "Resource already managed by Terraform" は state に既にあるだけなので無視
-            low = (err or "").lower()
-            if "already managed by terraform" in low or "resource address" in low and "already" in low:
+            # stderr / stdout どちらに出るかは provider 依存なので両方を見る。
+            kind = import_error_kind(f"{err or ''}\n{out or ''}")
+            if kind == "already":
+                # state に取り込み済みなだけ。無視。
                 skipped_already += 1
                 continue
-            # 存在しないリソースの import は無視（dst にまだ無いだけ＝apply で作成）
-            if "cannot import non-existent remote object" in low or "status code: 404" in low:
+            if kind == "missing":
+                # リモートに実体が無いだけ（apply が作成する）。無視。
                 continue
-            failed.append((addr, imp_id, (err or "").strip().splitlines()[-1] if err else ""))
+            # 理由は先頭の意味のある行を出す（terraform のエラー枠は末尾が
+            # 空行で終わるため、末尾行だと空文字になり原因が読めない）。
+            failed.append((addr, imp_id, _first_meaningful_line(err, out)))
         self.dst_logger.info(
             f"    取り込み結果: 成功={imported} 件 / 既存スキップ={skipped_already} 件 / 失敗={len(failed)} 件"
         )
@@ -5336,7 +7231,11 @@ resource "google_container_cluster" "mock_cluster" {{
         # GKE が同等ルールを作り直す。src のルールはクラスタ固有ハッシュを含む
         # target tag を参照しており、dst に持ち込んでも効かない（＝ FW を緩めない）。
         # pre-flight より前に落として、gke 専用 network の存在確認も省く。
-        gke_rules = [r for r in rules if is_gke_managed_name(r.get('name'))]
+        # 判定は名前接頭辞ではなく is_gke_managed_fw_rule（description の
+        # kubernetes.io マーカー + GKE 本体ルールの構造判定）。接頭辞だけだと
+        # `k8s-nodeport-allow` のような利用者ルール（DENY かもしれない）まで
+        # 落とし、dst が src より緩くなる。
+        gke_rules = [r for r in rules if is_gke_managed_fw_rule(r)]
         if gke_rules:
             names = ", ".join(r.get('name', '?') for r in gke_rules)
             self.dst_logger.warning(
@@ -5345,7 +7244,7 @@ resource "google_container_cluster" "mock_cluster" {{
             )
             for _ in gke_rules:
                 self.stats.incr("skipped")
-            rules = [r for r in rules if not is_gke_managed_name(r.get('name'))]
+            rules = [r for r in rules if not is_gke_managed_fw_rule(r)]
 
         # Pre-flight: 参照される dst ネットワークが本当に存在するか一度だけ確認する。
         # _replicate_host_networks() は Step 4.5 冒頭で呼ばれているはずだが、何らかの
@@ -6658,6 +8557,10 @@ resource "google_container_cluster" "mock_cluster" {{
             self.dst_logger.warning("  対象プロジェクトがありません。スキップします")
             return
 
+        # Cloud Run サービス個別の公開設定（allUsers → run.invoker）を先に複製する。
+        # SA 複製の対象有無に関わらず必要なので、早期 return より前に呼ぶ。
+        self._sync_run_service_invokers()
+
         src_policies = self._fetch_src_iam_policies()
         grants, warnings = build_iam_replication_plan(
             src_policies, proj_map, self._iam_excluded_sa_emails())
@@ -6767,6 +8670,104 @@ resource "google_container_cluster" "mock_cluster" {{
             f"  IAM 複製: 付与 {len(applied)} 件 / 候補 {len(grants)} 件"
         )
         self._warn_high_privilege_grants(applied)
+
+    def _sync_run_service_invokers(self):
+        """Cloud Run サービス個別の公開設定（allUsers 等 → run.invoker）を複製する。
+
+        「未認証アクセスを許可」は**サービスリソース個別の IAM** で、bulk-export
+        （IAM を出力しない）にも project IAM 複製にも乗らないため、放置すると
+        src では公開のサービスが dst では認証必須になる（regression: any-method-api）。
+        allUsers / allAuthenticatedUsers の invoker だけを忠実複製し、付与したら
+        末尾に警告でまとめて見せる（roles/owner の複製と同じ「忠実再現 + 警告」方針）。
+        dst に同名サービスがまだ無い場合（bulk-export 未出力の www-1 等）は
+        スキップ + WARNING（作成後の再実行で付与される）。soft fail。
+        """
+        pairs = list(self._iter_project_pairs())
+        applied: List[Tuple[str, str, str, str]] = []  # (dst_proj, svc, region, member)
+        applied_lock = threading.Lock()
+
+        def worker(item):
+            src_proj, dst_proj, src_sa, dst_sa = item
+            rc, out, err = self._soft_run(
+                f"gcloud run services list --project={src_proj} "
+                f"--format=json --quiet",
+                "src", self.org_logger, impersonate_sa=src_sa, timeout=300,
+                skip_on_dry_run=False,
+            )
+            if rc != 0:
+                if not is_api_disabled_error(f"{err or ''}\n{out or ''}"):
+                    self.dst_logger.warning(
+                        f"  [Run IAM] {src_proj}: サービス一覧を取得できませんでした: "
+                        f"{_first_meaningful_line(err, out)}"
+                    )
+                return
+            for name, region in parse_run_services_list(out):
+                rc_p, pol, err_p = self._soft_run(
+                    f"gcloud run services get-iam-policy {name} --region={region} "
+                    f"--project={src_proj} --format=json --quiet",
+                    "src", self.org_logger, impersonate_sa=src_sa, timeout=120,
+                    skip_on_dry_run=False,
+                )
+                if rc_p != 0:
+                    self.dst_logger.warning(
+                        f"  [Run IAM] {src_proj}/{name}: IAM ポリシーを取得できません"
+                        f"でした: {_first_meaningful_line(err_p, pol)}"
+                    )
+                    continue
+                members = run_service_public_invoker_members(pol)
+                if not members:
+                    continue
+                # dst に同名サービスが無ければ付与できない（bulk-export 未出力の
+                # サービス等）。dry_run は「付与予定」を出すため存在すると見なす。
+                if not self.dry_run:
+                    rc_d, out_d, _ed = self._soft_run(
+                        f"gcloud run services describe {name} --region={region} "
+                        f"--project={dst_proj} --format='value(metadata.name)' --quiet",
+                        "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=120,
+                    )
+                    if rc_d != 0 or not (out_d or "").strip():
+                        self.dst_logger.warning(
+                            f"  [Run IAM] {dst_proj}/{name} が dst に無いため公開設定"
+                            f"（{', '.join(members)} → run.invoker）を付与できません。"
+                            f" サービス作成後に make run を再実行してください"
+                        )
+                        continue
+                for m in members:
+                    rc_a, out_a, err_a = self._soft_run(
+                        f"gcloud run services add-iam-policy-binding {name} "
+                        f"--region={region} --project={dst_proj} "
+                        f"--member={m} --role=roles/run.invoker --quiet",
+                        "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=180,
+                    )
+                    if rc_a == 0:
+                        if not self.mock and not self.dry_run:
+                            self.stats.incr("executed")
+                        with applied_lock:
+                            applied.append((dst_proj, name, region, m))
+                    else:
+                        self.dst_logger.warning(
+                            f"  [Run IAM] {dst_proj}/{name}: {m} の付与に失敗: "
+                            f"{_first_meaningful_line(err_a, out_a)}。手動で: "
+                            f"gcloud run services add-iam-policy-binding {name} "
+                            f"--region={region} --project={dst_proj} "
+                            f"--member={m} --role=roles/run.invoker"
+                        )
+
+        self._parallel_for_each(pairs, worker, "run-invoker")
+        if not applied:
+            return
+        # 公開＝インターネットに開くことなので、何を開いたか必ずまとめて見せる。
+        self.dst_logger.warning(
+            f"  ⚠ [Run IAM] 公開アクセスを src と同じに複製しました "
+            f"({len(applied)} 件)。不要なら取り消してください:"
+        )
+        for dst_proj, name, region, m in sorted(applied):
+            self.dst_logger.warning(
+                f"      {dst_proj}/{name} ({region}): {m} → roles/run.invoker"
+                f"  取消: gcloud run services remove-iam-policy-binding {name} "
+                f"--region={region} --project={dst_proj} --member={m} "
+                f"--role=roles/run.invoker"
+            )
 
     def _warn_high_privilege_grants(self, applied: List[Dict[str, Any]]):
         """owner 等の超高権限ロールを付与した場合、最後にまとめて警告する。
@@ -7083,6 +9084,7 @@ resource "google_container_cluster" "mock_cluster" {{
     # ============================================================
     def step_data_sync(self):
         pairs = list(self._iter_project_pairs())
+        # AR イメージは Step 3.7（terraform より前）で複製済み。ここでは扱わない。
         log_stage_header(self.dst_logger, 6, "データ同期 (GCS / BigQuery)", len(pairs))
 
         rename_gcs = self.config.get('rename_rules', {}).get('gcs', {})
@@ -7181,6 +9183,277 @@ resource "google_container_cluster" "mock_cluster" {{
             )
 
         self._parallel_for_each(buckets, bucket_worker, "gcs-rsync")
+
+    # ============================================================
+    # Step 3.7: Artifact Registry イメージ複製（terraform より前）
+    # ============================================================
+    def step_artifact_registry(self):
+        """src の AR イメージを dst に複製する（Step 4 の前に必ず実行する）。
+
+        **Step 4 より前でなければならない**: Cloud Run は
+        `image = "...@sha256:<digest>"` を **revision 作成時に解決する**ため、
+        イメージが dst に無いと terraform apply が
+        `Error code 5, message: Image '...' not found.` で失敗する
+        （regression: my-argolis の Cloud Run 3 件。Step 6 data_sync に置いていたため
+        apply の後になっていて永久に間に合わなかった）。
+
+        dst リポジトリは通常 terraform (Step 4) が作るが、ここが先に走るので
+        `_sync_artifact_registry` 側で無ければ作る（冪等）。terraform は
+        `# terraform import` コメント経由で既存リポジトリを adopt する。
+
+        設定は data_sync 配下（`steps.data_sync.artifact_registry`）のまま。
+        実行位置だけが前倒しされている。
+        """
+        pairs = list(self._iter_project_pairs())
+        log_stage_header(
+            self.dst_logger, 37,
+            "Artifact Registry イメージ複製 (terraform より前に実施)", len(pairs),
+        )
+        cfg = (self.config.get('steps', {}).get('data_sync', {}) or {}).get(
+            'artifact_registry', {})
+        if isinstance(cfg, dict) and cfg.get('enabled') is False:
+            self.dst_logger.info("  artifact_registry.enabled=false のためスキップ")
+            self.dst_logger.info("  ✓ Step 3.7 完了")
+            return
+
+        # 1. 列挙フェーズ: プロジェクト単位で並列に走査し、複製対象を flat に集める。
+        work: List[Dict[str, Any]] = []
+        work_lock = threading.Lock()
+
+        def collect(item):
+            src_proj, dst_proj, src_sa, dst_sa = item
+            self.dst_logger.info(f"  → {src_proj} → {dst_proj}")
+            items = self._collect_ar_copy_work(src_proj, dst_proj, src_sa, dst_sa)
+            if items:
+                with work_lock:
+                    work.extend(items)
+
+        self._parallel_for_each(pairs, collect, "ar-list")
+        if not work:
+            self.dst_logger.info("  複製対象イメージなし")
+            self.dst_logger.info("  ✓ Step 3.7 完了")
+            return
+        if not shutil.which("docker") and not self.mock:
+            self.dst_logger.warning(
+                f"  docker が PATH にありません。イメージ {len(work)} 件の複製を"
+                f"スキップします（Cloud Run 等が digest 固定でイメージを参照している"
+                f"場合は手動複製が必要: docker pull <src> && docker tag ... && docker push ...）"
+            )
+            return
+
+        # 2. docker 認証: ~/.docker/config.json への書き込みは並列安全でないため、
+        #    コピー開始前に対象ホスト分を直列でまとめて済ませる。
+        for host in sorted({it["dst_pkg"].split("/", 1)[0] for it in work}):
+            self._soft_run(
+                f"gcloud auth configure-docker {host} --quiet",
+                "dst", self.dst_logger, timeout=120,
+            )
+
+        # 3. コピーフェーズ: 全プロジェクト・全リポジトリのイメージを
+        #    flat な単位で並列コピー（プロジェクト間の直列待ちを無くす）。
+        self.dst_logger.info(
+            f"  複製対象: {len(work)} イメージ (parallel_jobs={self.parallel_jobs})"
+        )
+        self._parallel_for_each(
+            work, lambda it: self._copy_ar_image(it, it.get("dst_sa")), "ar-copy",
+        )
+        self.dst_logger.info("  ✓ Step 3.7 完了")
+
+    def _collect_ar_copy_work(self, src_proj, dst_proj, src_sa, dst_sa
+                              ) -> List[Dict[str, Any]]:
+        """src の AR (DOCKER) を走査し、複製すべきイメージ item のリストを返す。
+
+        実コピーはしない（列挙 + dst リポジトリの補完作成のみ）。呼び出し側が
+        全プロジェクト分を集めて **flat な (project × repo × image) 単位で**
+        並列コピーする（プロジェクトごとに直列だと parallel_jobs が
+        1 リポジトリ内でしか効かず、小さいリポジトリの間で遊んでしまう）。
+
+        soft fail に徹する（`stats.failed` に積まない）: イメージが無くて困るのは
+        参照している側で、そちらが本来のエラーで気付かせてくれる。
+        """
+        cfg = (self.config.get('steps', {}).get('data_sync', {}) or {}).get(
+            'artifact_registry', {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        skip_repos = {str(r).strip() for r in (cfg.get('skip_repos') or []) if str(r).strip()}
+
+        # src の一覧取得は soft fail に徹する（`stats.failed` に積まない）。
+        # AR を使っていない src では API 自体が無効で 403 になるが、それは
+        # 「対象なし」であって移行の失敗ではない（regression: AR 未使用の
+        # サービスプロジェクト 2 件で `make run` が exit 1 になっていた）。
+        rc, repos_out, repos_err = self._soft_run(
+            f"gcloud artifacts repositories list --project={src_proj} "
+            f"--format=json --quiet",
+            "src", self.org_logger, impersonate_sa=src_sa, timeout=300,
+            skip_on_dry_run=False,
+        )
+        if rc != 0:
+            detail = f"{repos_err or ''}\n{repos_out or ''}"
+            if is_api_disabled_error(detail):
+                self.dst_logger.info(
+                    f"    src '{src_proj}' は Artifact Registry API が無効"
+                    f"（= AR 未使用）。複製対象なし"
+                )
+            else:
+                self.dst_logger.warning(
+                    f"    AR リポジトリ一覧を取得できませんでした ({src_proj}): "
+                    f"{_first_meaningful_line(repos_err, repos_out)}"
+                )
+            return []
+        repos = parse_ar_repositories(repos_out)
+        if not repos:
+            self.dst_logger.info(f"    {src_proj}: DOCKER リポジトリ無し")
+            return []
+
+        work: List[Dict[str, Any]] = []
+        for repo in repos:
+            if repo["repo"] in skip_repos:
+                self.dst_logger.info(
+                    f"    skip_repos 指定によりスキップ: {repo['repo']}")
+                self.stats.incr("skipped")
+                continue
+            loc, name = repo["location"], repo["repo"]
+            host = f"{loc}-docker.pkg.dev"
+            src_path = f"{host}/{src_proj}/{name}"
+            rc_i, images_json, images_err = self._soft_run(
+                f"gcloud artifacts docker images list {src_path} "
+                f"--include-tags --format=json --quiet",
+                "src", self.org_logger, impersonate_sa=src_sa, timeout=600,
+                skip_on_dry_run=False,
+            )
+            if rc_i != 0:
+                self.dst_logger.warning(
+                    f"    {src_path}: イメージ一覧を取得できませんでした: "
+                    f"{_first_meaningful_line(images_err, images_json)}"
+                )
+                continue
+            plan = build_ar_image_copy_plan(images_json, src_proj, dst_proj)
+            if not plan:
+                self.dst_logger.info(f"    {src_path}: イメージ 0 件")
+                continue
+            # dst リポジトリは Terraform が作る想定。取りこぼし時のみ補う（冪等）。
+            if not self._gcloud_exists(
+                f"gcloud artifacts repositories describe {name} "
+                f"--location={loc} --project={dst_proj} --format='value(name)' --quiet",
+                dst_sa,
+            ):
+                rc_c, out_c, err_c = self._soft_run(
+                    f"gcloud artifacts repositories create {name} "
+                    f"--repository-format=docker --location={loc} "
+                    f"--project={dst_proj} --quiet",
+                    "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=300,
+                )
+                if rc_c != 0:
+                    self.dst_logger.warning(
+                        f"    dst リポジトリ {name} を作成できませんでした: "
+                        f"{_first_meaningful_line(err_c, out_c)}"
+                    )
+                    continue
+            # dst の既存 digest を**リポジトリ単位で 1 回だけ**取得して差分を出す。
+            # 従来はイメージごとに describe（1 件 1 API 呼び出し）していて、
+            # 再実行時に件数分の往復が積み上がっていた。
+            have: Set[str] = set()
+            rc_d, out_d, _e = self._soft_run(
+                f"gcloud artifacts docker images list "
+                f"{host}/{dst_proj}/{name} --format='value(version)' --quiet",
+                "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=600,
+                skip_on_dry_run=False,
+            )
+            if rc_d == 0:
+                have = {ln.strip() for ln in (out_d or "").splitlines()
+                        if _AR_DIGEST_RE.match(ln.strip())}
+            already = [e for e in plan if e["digest"] in have]
+            todo = [e for e in plan if e["digest"] not in have]
+            for _ in already:
+                self.stats.incr("skipped")
+            self.dst_logger.info(
+                f"    {src_path}: イメージ {len(plan)} 件"
+                f"（既存 {len(already)} 件 / 複製対象 {len(todo)} 件）"
+            )
+            for e in todo:
+                e["dst_sa"] = dst_sa
+            work.extend(todo)
+        return work
+
+    def _copy_ar_image(self, item: Dict[str, Any], dst_sa: Optional[str]):
+        """イメージ 1 件を docker pull → tag → push で複製し digest を検証する。"""
+        src_ref, dst_pkg = item["src_ref"], item["dst_pkg"]
+        digest, tags = item["digest"], item["tags"]
+        # 既存 digest の除外は _collect_ar_copy_work がリポジトリ単位の一括 list で
+        # 済ませている（ここで 1 件ずつ describe すると再実行時に件数分の API 往復
+        # が積み上がる）。
+        rc, out, err = self._soft_run(
+            f"docker pull {src_ref}", "dst", self.dst_logger,
+            impersonate_sa=dst_sa, timeout=1800,
+        )
+        if rc != 0:
+            detail = f"{err or ''}\n{out or ''}".lower()
+            # Cloud Build が生成する SLSA provenance / SBOM 等の attestation は
+            # 実イメージと同列の digest として AR に並ぶが、実行可能イメージでは
+            # なく（config が application/vnd.oci.empty.v1+json）、docker では
+            # 構造的に pull できない。Cloud Run 等が参照するのは実イメージの
+            # digest なので複製不要 = 失敗ではなくスキップ。
+            if "unsupported media type" in detail:
+                self.dst_logger.info(
+                    f"      非イメージ成果物（attestation/SBOM 等）のためスキップ: "
+                    f"{src_ref}"
+                )
+                self.stats.incr("skipped")
+                return
+            self.dst_logger.warning(
+                f"      ✗ pull 失敗 {src_ref}: {_first_meaningful_line(err, out)}"
+            )
+            return
+        # push には tag が要る。src に tag が無いイメージ（digest 参照専用）は
+        # 複製自体は必要なので、digest 由来の一意なタグを合成して push する。
+        push_tags = tags or [f"migrated-{digest.split(':', 1)[1][:12]}"]
+        pushed = False
+        for tag in push_tags:
+            dst_tagged = f"{dst_pkg}:{tag}"
+            rc_t, _o, _e = self._soft_run(
+                f"docker tag {src_ref} {dst_tagged}", "dst", self.dst_logger,
+                impersonate_sa=dst_sa, timeout=300,
+            )
+            if rc_t != 0:
+                continue
+            rc_p, out_p, err_p = self._soft_run(
+                f"docker push {dst_tagged}", "dst", self.dst_logger,
+                impersonate_sa=dst_sa, timeout=1800,
+            )
+            if rc_p == 0:
+                pushed = True
+                if not self.mock and not self.dry_run:
+                    self.stats.incr("executed")
+            else:
+                self.dst_logger.warning(
+                    f"      ✗ push 失敗 {dst_tagged}: "
+                    f"{_first_meaningful_line(err_p, out_p)}"
+                )
+        # ローカルのディスクを食い続けないよう後片付け（失敗は無視）。
+        self._soft_run(f"docker image rm -f {src_ref}", "dst", self.dst_logger,
+                       impersonate_sa=dst_sa, timeout=300)
+        if not pushed:
+            return
+        # mock / dry-run では `_gcloud_exists` が常に False（作成パスを通すため）なので、
+        # digest 検証をそのまま走らせると必ず「digest が変わりました」の誤警告になる。
+        if self.mock or self.dry_run:
+            self.dst_logger.info(f"      ✓ 複製予定 {dst_pkg}@{digest[:19]}…")
+            return
+        # docker は index → 単一プラットフォームへ落とす等で digest が変わりうる。
+        # Cloud Run は digest 固定参照なので、変わっていたら必ず知らせる。
+        if self._gcloud_exists(
+            f"gcloud artifacts docker images describe {dst_pkg}@{digest} "
+            f"--format='value(image_summary.digest)' --quiet",
+            dst_sa,
+        ):
+            self.dst_logger.info(f"      ✓ 複製 {dst_pkg}@{digest[:19]}…")
+            return
+        self.dst_logger.warning(
+            f"      ⚠ {dst_pkg}: push できましたが digest が変わりました"
+            f"（元: {digest}）。Cloud Run 等の `@sha256:` 固定参照は解決できません。"
+            f" digest を保持するには crane/gcrane で複製してください:"
+            f" `gcrane cp {src_ref} {dst_pkg}`"
+        )
 
     def _sync_bq(self, src_proj, dst_proj, src_sa, dst_sa):
         self.dst_logger.info("  [BQ] BigQuery 同期")
@@ -7384,6 +9657,15 @@ def main():
         help="SA 事前チェックの続行確認 ([y/N]) を自動承認する（非対話 / CI 用）",
     )
     parser.add_argument(
+        "--skip-on-run", action="store_true", dest="skip_on_run", default=None,
+        help="bulk_export.skip_on_run を今回だけ有効にする（config より優先）",
+    )
+    parser.add_argument(
+        "--no-skip-on-run", action="store_false", dest="skip_on_run",
+        help="bulk_export.skip_on_run を今回だけ無効にする＝export/customize を必ず再実行"
+             "（config より優先。make run SKIP_ON_RUN=0）",
+    )
+    parser.add_argument(
         "--clean-state", action="append", metavar="PROJECT_ID",
         help="指定プロジェクトの terraform 生成物 (active/raw) と state だけ削除して終了。"
              "src / dst どちらの ID でも可。複数指定可",
@@ -7399,6 +9681,7 @@ def main():
         verbose_override=args.verbose,
         mock_override=args.mock,
         auto_approve=args.yes,
+        skip_on_run_override=args.skip_on_run,
     )
     orchestrator.execute()
     if orchestrator.stats.failed > 0:
