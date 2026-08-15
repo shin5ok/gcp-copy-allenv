@@ -21,8 +21,9 @@ URL map / target proxy と `k8s1-*` の NEG 等）を Terraform 複製の対象�
   複製されないため、コピー先に別途用意が必要**
 - 利用者が自分で作った LB（名前が `gke-`/`k8s-` で始まるだけのもの含む）は
   従来どおり複製されます。
-- 既にこのエラーに当たっている場合は `make run SKIP_ON_RUN=0` で customize を
-  再実行してください（前回作成された `k8s1-*` NEG は terraform が自動削除します）。
+- **`SKIP_ON_RUN=1`（既存の `terraform/active` を再利用する実行）でも除外が効きます**。
+  除外は適用直前にも実行されるため、コピー元の再エクスポートは不要です
+  （前回作成された `k8s1-*` NEG は terraform が自動削除します）。
 
 あわせて「**Backup for GKE の restore で再生成されるものはコピーしない**」方針で
 複製対象を総点検し、次も対象外にしました:
@@ -33,6 +34,8 @@ URL map / target proxy と `k8s1-*` の NEG 等）を Terraform 複製の対象�
 - **`gkegw1-*` の firewall ルール**（Gateway コントローラ生成。restore 後に再作成）
 - **Backup for GKE の backup plan / restore plan**（DIFF.md の手順で手動作成する
   移行用リソースのため、src にあっても複製しません）
+- **Cloud DNS for GKE のクラスタゾーン**（`gke-<クラスタ>-<ハッシュ>-dns` / `-rp`。
+  コピー先クラスタが自分のハッシュで作り直します）
 - `pvc-<uuid>` の PV ディスクは従来から複製対象外です（実データは Backup for GKE の
   volume restore がコピー先に新規ディスクとして作成します）
 
