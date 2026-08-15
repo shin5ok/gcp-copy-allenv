@@ -41,6 +41,7 @@ from scripts.sync_env import (
     is_gke_lb_controller_name,
     is_k8s_provisioned_name,
     is_k8s_lb_resource_name,
+    gke_managed_tf_skip_reason,
     import_error_kind,
     coerce_nonneg_int,
     is_api_disabled_error,
@@ -4735,6 +4736,97 @@ class TestBackupForGkeRestoredResourcesExcluded:
             "state": "", "ip_address": "",
         })
         assert c["level"] == "action"
+
+
+class TestPurgeGkeManagedTfFiles:
+    """apply 直前の最終防衛線（skip_on_run で customize を飛ばしても
+    k8s 由来リソースを active/ に残さない）。"""
+
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        return o
+
+    def _root(self, temp_dir, files):
+        root = os.path.join(temp_dir, "active", "src1")
+        os.makedirs(root, exist_ok=True)
+        for name, body in files.items():
+            with open(os.path.join(root, name), "w", encoding="utf-8") as f:
+                f.write(body)
+        return root
+
+    GW_BES = (
+        'resource "google_compute_backend_service" "gw" {\n'
+        '  health_checks = ["https://www.googleapis.com/compute/v1/projects/p'
+        '/global/healthChecks/gkegw1-gqew-default-frontend-80-22d1h872r781"]\n'
+        '  name          = "gkegw1-gqew-default-frontend-80-22d1h872r781"\n'
+        '}\n'
+    )
+    USER_BES = (
+        'resource "google_compute_backend_service" "svc" {\n'
+        '  name = "notify-api"\n'
+        '}\n'
+    )
+    NEG = (
+        'resource "google_compute_network_endpoint_group" "neg" {\n'
+        '  name = "k8s1-c9376336-default-frontend-80-d7863a45"\n'
+        '}\n'
+    )
+
+    def test_stale_gke_files_are_removed_user_files_kept(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir, {
+            "gw_bes.tf": self.GW_BES,
+            "neg.tf": self.NEG,
+            "user_bes.tf": self.USER_BES,
+            "cluster.tf": ('resource "google_container_cluster" "c" {\n'
+                           '  name = "my-cluster"\n}\n'),
+        })
+        assert o._purge_gke_managed_tf_files(root) == 2
+        left = sorted(os.listdir(root))
+        assert left == ["cluster.tf", "user_bes.tf"]
+
+    def test_clean_root_is_untouched(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir, {"user_bes.tf": self.USER_BES})
+        assert o._purge_gke_managed_tf_files(root) == 0
+        assert os.listdir(root) == ["user_bes.tf"]
+
+    def test_non_tf_files_and_missing_dir_are_safe(self, temp_dir):
+        o = self._setup(temp_dir)
+        root = self._root(temp_dir, {"notes.txt": self.GW_BES})
+        assert o._purge_gke_managed_tf_files(root) == 0
+        assert os.listdir(root) == ["notes.txt"]
+        assert o._purge_gke_managed_tf_files(
+            os.path.join(temp_dir, "no-such-dir")) == 0
+
+    def test_shared_rule_with_customize(self, temp_dir):
+        # customize (Step 3) と purge (Step 4) が同じ判定を使っていること
+        o = self._setup(temp_dir)
+        for body in (self.GW_BES, self.NEG):
+            assert gke_managed_tf_skip_reason(body)
+            assert o._skip_reason_for_file(body) == gke_managed_tf_skip_reason(body)
+        assert gke_managed_tf_skip_reason(self.USER_BES) is None
+
+    def test_gke_cloud_dns_zone_is_excluded(self, temp_dir):
+        o = self._setup(temp_dir)
+        zone = ('resource "google_dns_managed_zone" "z" {\n'
+                '  name     = "gke-my-cluster-2f1a3b4c-dns"\n'
+                '  dns_name = "cluster.local."\n}\n')
+        reason = gke_managed_tf_skip_reason(zone)
+        assert reason and "Cloud DNS for GKE" in reason
+        # 利用者の gke- 始まりゾーンは残す（hash 構造を満たさない）
+        user_zone = ('resource "google_dns_managed_zone" "z" {\n'
+                     '  name       = "gke-internal-zone"\n'
+                     '  dns_name   = "internal.example.com."\n'
+                     '  visibility = "private"\n}\n')
+        assert gke_managed_tf_skip_reason(user_zone) is None
+        assert o._skip_reason_for_file(user_zone) is None
 
 
 class TestIsGkeManagedFwRule:

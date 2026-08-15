@@ -1035,6 +1035,104 @@ def is_k8s_provisioned_name(name: Optional[str]) -> bool:
     return bool(name) and bool(_K8S_PROVISIONED_NAME_RE.match(str(name)))
 
 
+# Cloud DNS for GKE がクラスタごとに作る managed zone:
+#   gke-<cluster>-<hash>-dns（正引き） / gke-<cluster>-<hash>-rp（逆引き）
+# 利用者が `gke-` 始まりのゾーンを作ることはありうるので、hash 構造との AND で判定する。
+_GKE_DNS_ZONE_NAME_RE = re.compile(r'^gke-.+-[0-9a-f]{8,}-(dns|rp)$')
+
+
+def gke_managed_tf_skip_reason(content: str) -> Optional[str]:
+    """HCL が「GKE / k8s コントローラが作った GCP リソース」ならスキップ理由を返す。
+
+    **原則**: クラスタ内 k8s オブジェクトに由来して GKE が自動生成した GCP リソースは
+    本ツールでコピーせず、dst では Backup for GKE の restore（または再デプロイ）で
+    コントローラに作り直させる。src の名前にはクラスタ固有ハッシュ / UID が入るため
+    同名複製は無意味で、参照先だけが除外されると apply が 404 で失敗する。
+
+    純粋関数。`_skip_reason_for_file`（Step 3 customize）と
+    `_purge_gke_managed_tf_files`（Step 4 apply 直前の最終防衛線）の**両方**が使う。
+    customize を飛ばす経路（skip_on_run）では Step 3 を通らないため、判定を
+    customize 側だけに置くと古い active/ がそのまま apply されて同じ 404 が再発する
+    （regression: skip_on_run=true の make run で gkegw1-* が残り続けた）。
+    """
+    content = content or ""
+
+    # GKE ノード関連の派生リソース（instance template / MIG / autoscaler /
+    # health check / target pool / route / FW）。名前接頭辞で判定する。
+    for rtype in _GKE_MANAGED_TF_RESOURCE_TYPES:
+        if f'resource "{rtype}"' not in content:
+            continue
+        m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+        if m and is_gke_managed_name(m.group(1)):
+            return f"GKE 自動生成リソース（dst クラスタが再生成）: {m.group(1)}"
+
+    # k8s Service (type=LoadBalancer) が作る LB リソースは名前が hex UID
+    # （a<31hex>）で接頭辞判定に掛からないが、description に kubernetes.io の
+    # 所有者マーカーを必ず持つ。落とさないと、参照先の k8s-* health check だけが
+    # 上の接頭辞判定で除外され、target pool / forwarding rule が宙ぶらりんの
+    # 参照を抱えて apply が 404 になる（regression: my-argolis の
+    # a0cb2a...）。forwarding rule は名前接頭辞では判定しない
+    # （利用者の LB を誤って落とさない。マーカーがある場合のみ除外）。
+    if has_k8s_owner_marker(content):
+        for rtype in _GKE_MANAGED_TF_RESOURCE_TYPES + (
+                "google_compute_forwarding_rule",):
+            if f'resource "{rtype}"' in content:
+                m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+                return (
+                    f"k8s(GKE) 管理リソース（kubernetes.io マーカー。"
+                    f"dst クラスタが再生成）: {m.group(1) if m else rtype}"
+                )
+
+    # GKE Gateway（gkegw1-）/ NEG（k8s1-）/ Ingress GLBC（k8s-be- 等）の各
+    # コントローラが作る LB 一式（backend service / URL map / target proxy /
+    # forwarding rule / NEG）。参照先の health check は上の接頭辞判定で除外
+    # 済みのため、これらを残すと宙ぶらりんの URL 参照で apply が毎回 404 に
+    # なる（regression: my-argolis の gkegw1-gqew-* BackendService が
+    # 除外済み healthChecks/gkegw1-* を参照して notFound）。dst では
+    # Backup for GKE で Gateway / HTTPRoute / Service を復元すれば
+    # コントローラが dst クラスタのハッシュ名で再作成する。
+    # 判定は所有者マーカーまたはコントローラ固有の狭い接頭辞のみ
+    # （広い gke-/k8s- では判定しない = 利用者 LB を誤除外しない）。
+    for rtype in _GKE_GATEWAY_TF_RESOURCE_TYPES:
+        if f'resource "{rtype}"' not in content:
+            continue
+        m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+        nm = m.group(1) if m else None
+        if (has_gke_gateway_marker(content) or has_k8s_owner_marker(content)
+                or is_gke_lb_controller_name(nm)):
+            return (f"GKE Gateway/Ingress/NEG コントローラ管理の LB リソース"
+                    f"（dst クラスタが再生成）: {nm or rtype}")
+
+    # GKE ManagedCertificate コントローラが発行する Google-managed 証明書
+    # （mcrt-<uuid>）。Backup for GKE で ManagedCertificate オブジェクトを
+    # 復元すれば dst で発行し直される（発行は DNS が dst LB を向いてから
+    # 完了する）。利用者作成の managed cert は mcrt-uuid 命名でないので残す。
+    if 'resource "google_compute_managed_ssl_certificate"' in content:
+        m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+        if m and is_k8s_provisioned_name(m.group(1)):
+            return (f"GKE ManagedCertificate の発行物"
+                    f"（restore 後に dst で再発行）: {m.group(1)}")
+
+    # Cloud DNS for GKE がクラスタ用に作る managed zone（gke-<cluster>-<hash>-dns/-rp）。
+    # dst クラスタが自分のハッシュで作り直すため複製不要（残すと src クラスタ名の
+    # ゾーンが dst VPC に孤児として残る）。
+    if 'resource "google_dns_managed_zone"' in content:
+        m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+        if m and _GKE_DNS_ZONE_NAME_RE.match(m.group(1)):
+            return (f"Cloud DNS for GKE のクラスタゾーン"
+                    f"（dst クラスタが再生成）: {m.group(1)}")
+
+    # Backup for GKE の backup/restore plan は移行手順そのもの（DIFF の
+    # gke_backup_restore 注記に従って利用者が src/dst に手動作成する）。
+    # 複製すると手順との二重管理になり、cluster 参照も文字列 URL のため
+    # クラスタより先に apply されると 404 になる。
+    if ('resource "google_gke_backup_backup_plan"' in content
+            or 'resource "google_gke_backup_restore_plan"' in content):
+        return ("Backup for GKE の plan（DIFF の gke_backup_restore 手順で"
+                "手動作成。自動複製しない）")
+    return None
+
+
 # GKE 本体が作る classic FW ルール名: gke-<cluster>-<8hex>-<suffix>
 # （vms / all / master / exkubelet / inkubelet 等。suffix は増えるので固定しない）。
 # こちらは description マーカーを持たないため構造で判定する。
@@ -6804,68 +6902,9 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
         # 作り直すため複製不要。src の名前にはクラスタ固有ハッシュが入っており、
         # dst に持ち込むと衝突 / 無効参照になる。
         # google_container_cluster / node_pool は対象外（＝ GKE 構成そのものは複製する）。
-        for rtype in _GKE_MANAGED_TF_RESOURCE_TYPES:
-            if f'resource "{rtype}"' not in content:
-                continue
-            m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
-            if m and is_gke_managed_name(m.group(1)):
-                return f"GKE 自動生成リソース（dst クラスタが再生成）: {m.group(1)}"
-
-        # k8s Service (type=LoadBalancer) が作る LB リソースは名前が hex UID
-        # （a<31hex>）で接頭辞判定に掛からないが、description に kubernetes.io の
-        # 所有者マーカーを必ず持つ。落とさないと、参照先の k8s-* health check だけが
-        # 上の接頭辞判定で除外され、target pool / forwarding rule が宙ぶらりんの
-        # 参照を抱えて apply が 404 になる（regression: my-argolis の
-        # a0cb2a...）。forwarding rule は名前接頭辞では判定しない
-        # （利用者の LB を誤って落とさない。マーカーがある場合のみ除外）。
-        if has_k8s_owner_marker(content):
-            for rtype in _GKE_MANAGED_TF_RESOURCE_TYPES + (
-                    "google_compute_forwarding_rule",):
-                if f'resource "{rtype}"' in content:
-                    m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
-                    return (
-                        f"k8s(GKE) 管理リソース（kubernetes.io マーカー。"
-                        f"dst クラスタが再生成）: {m.group(1) if m else rtype}"
-                    )
-
-        # GKE Gateway（gkegw1-）/ NEG（k8s1-）/ Ingress GLBC（k8s-be- 等）の各
-        # コントローラが作る LB 一式（backend service / URL map / target proxy /
-        # forwarding rule / NEG）。参照先の health check は上の接頭辞判定で除外
-        # 済みのため、これらを残すと宙ぶらりんの URL 参照で apply が毎回 404 に
-        # なる（regression: my-argolis の gkegw1-gqew-* BackendService が
-        # 除外済み healthChecks/gkegw1-* を参照して notFound）。dst では
-        # Backup for GKE で Gateway / HTTPRoute / Service を復元すれば
-        # コントローラが dst クラスタのハッシュ名で再作成する。
-        # 判定は所有者マーカーまたはコントローラ固有の狭い接頭辞のみ
-        # （広い gke-/k8s- では判定しない = 利用者 LB を誤除外しない）。
-        for rtype in _GKE_GATEWAY_TF_RESOURCE_TYPES:
-            if f'resource "{rtype}"' not in content:
-                continue
-            m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
-            nm = m.group(1) if m else None
-            if (has_gke_gateway_marker(content) or has_k8s_owner_marker(content)
-                    or is_gke_lb_controller_name(nm)):
-                return (f"GKE Gateway/Ingress/NEG コントローラ管理の LB リソース"
-                        f"（dst クラスタが再生成）: {nm or rtype}")
-
-        # GKE ManagedCertificate コントローラが発行する Google-managed 証明書
-        # （mcrt-<uuid>）。Backup for GKE で ManagedCertificate オブジェクトを
-        # 復元すれば dst で発行し直される（発行は DNS が dst LB を向いてから
-        # 完了する）。利用者作成の managed cert は mcrt-uuid 命名でないので残す。
-        if 'resource "google_compute_managed_ssl_certificate"' in content:
-            m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
-            if m and is_k8s_provisioned_name(m.group(1)):
-                return (f"GKE ManagedCertificate の発行物"
-                        f"（restore 後に dst で再発行）: {m.group(1)}")
-
-        # Backup for GKE の backup/restore plan は移行手順そのもの（DIFF の
-        # gke_backup_restore 注記に従って利用者が src/dst に手動作成する）。
-        # 複製すると手順との二重管理になり、cluster 参照も文字列 URL のため
-        # クラスタより先に apply されると 404 になる。
-        if ('resource "google_gke_backup_backup_plan"' in content
-                or 'resource "google_gke_backup_restore_plan"' in content):
-            return ("Backup for GKE の plan（DIFF の gke_backup_restore 手順で"
-                    "手動作成。自動複製しない）")
+        gke_reason = gke_managed_tf_skip_reason(content)
+        if gke_reason:
+            return gke_reason
 
         # スナップショット / イメージは移行モデルでは terraform で作らない。
         # snapshot は dst に存在しないディスクを source にしており、image はその
@@ -7102,6 +7141,52 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
         self._parallel_for_each(project_dirs, worker, "tf-plan")
         self.dst_logger.info("  ✓ Step 4 完了")
 
+    def _purge_gke_managed_tf_files(self, proj_dir: str) -> int:
+        """Terraform ルート直下から GKE / k8s 管理リソースの .tf を削除する。
+
+        「k8s 由来の GCP リソースはコピーせず Backup for GKE の restore で
+        コントローラに作り直させる」原則を **apply 経路で保証する**ための最終防衛線。
+        customize (Step 3) は skip_on_run でスキップされうるので、そこだけに
+        置くと古い active/ が素通りする。判定は `gke_managed_tf_skip_reason()` に
+        集約（customize と同じルール = 二重メンテにならない）。
+
+        削除するのは terraform が読むルート直下の .tf のみ（terraform は
+        サブディレクトリを再帰しない）。dry_run でも削除する:
+        `make plan` の plan 結果を `make run` がそのまま使うため、ここで消さないと
+        plan と apply で対象がずれる。
+        """
+        try:
+            names = sorted(os.listdir(proj_dir))
+        except OSError:
+            return 0
+        removed = 0
+        for name in names:
+            if not name.endswith(".tf"):
+                continue
+            path = os.path.join(proj_dir, name)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+            except OSError:
+                continue
+            reason = gke_managed_tf_skip_reason(content)
+            if not reason:
+                continue
+            try:
+                os.remove(path)
+            except OSError as e:
+                self.dst_logger.warning(f"    GKE 管理 .tf の削除に失敗: {name}: {e}")
+                continue
+            removed += 1
+            self.dst_logger.info(f"    除外（{reason}）: {name}")
+        if removed:
+            self.dst_logger.warning(
+                f"    GKE / k8s コントローラ管理の .tf を {removed} 件除外しました"
+                f"（Backup for GKE の restore で dst クラスタが再生成します）: "
+                f"{os.path.basename(proj_dir)}"
+            )
+        return removed
+
     def _terraform_one_project(self, proj_dir: str, proj_map: Dict[str, str],
                                 sa_map: Dict[str, Optional[str]]):
         self.dst_logger.info(f"  → Terraform ルート: {proj_dir}")
@@ -7117,6 +7202,12 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
             self.stats.incr("failed")
             self.stats.add_failure(f"TF Apply {os.path.basename(proj_dir)}", msg)
             return
+        # GKE / k8s コントローラが作った GCP リソースの .tf が残っていれば apply
+        # 直前に落とす（最終防衛線）。Step 3 customize でも落としているが、
+        # skip_on_run=true は customize ごとスキップして**古い active/ をそのまま
+        # 再利用する**ため、判定が customize 側だけだと修正後も同じ 404 が出続ける
+        # （regression: gkegw1-* BackendService が除外済み health check を参照）。
+        self._purge_gke_managed_tf_files(proj_dir)
         # dst プロジェクトが前回と変わった（= 別環境への移行）場合、前回の
         # terraform.tfstate は旧プロジェクトのリソースを指したままで、import が
         # 「既に state にある」と誤判定し、plan で新プロジェクトへ再作成 → 既存と
