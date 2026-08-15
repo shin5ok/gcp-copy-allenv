@@ -5,6 +5,42 @@
 
 ---
 
+## 2026-08-16 — GKE Gateway が作る LB を複製対象外に（apply 404 の修正）
+
+GKE Gateway コントローラが自動生成する LB 一式（`gkegw1-*` の backend service /
+URL map / target proxy と `k8s1-*` の NEG 等）を Terraform 複製の対象外にしました。
+
+これまでは参照先の health check（`gkegw1-*`）だけが除外され、残った backend service が
+`healthChecks/gkegw1-... was not found` の 404 で **`make run` が毎回失敗**していました。
+
+- コピー先ではワークロード復元（Backup for GKE）後に Gateway コントローラが LB を
+  再作成するため、複製しなくても機能は失われません。
+- DIFF.md に Gateway ごとの「確認」注記を出します:
+  **① LB の IP は新規払い出しになるため DNS の切替が必要**
+  **② Certificate Manager の certificate map / SSL 証明書はクラスタ外リソースで
+  複製されないため、コピー先に別途用意が必要**
+- 利用者が自分で作った LB（名前が `gke-`/`k8s-` で始まるだけのもの含む）は
+  従来どおり複製されます。
+- 既にこのエラーに当たっている場合は `make run SKIP_ON_RUN=0` で customize を
+  再実行してください（前回作成された `k8s1-*` NEG は terraform が自動削除します）。
+
+あわせて「**Backup for GKE の restore で再生成されるものはコピーしない**」方針で
+複製対象を総点検し、次も対象外にしました:
+
+- **`mcrt-<uuid>` の Google-managed 証明書**（GKE ManagedCertificate コントローラの
+  発行物。restore 後に dst で発行し直されます。利用者作成の managed 証明書は
+  従来どおり複製されます）
+- **`gkegw1-*` の firewall ルール**（Gateway コントローラ生成。restore 後に再作成）
+- **Backup for GKE の backup plan / restore plan**（DIFF.md の手順で手動作成する
+  移行用リソースのため、src にあっても複製しません）
+- `pvc-<uuid>` の PV ディスクは従来から複製対象外です（実データは Backup for GKE の
+  volume restore がコピー先に新規ディスクとして作成します）
+
+注意: **Filestore の PV データは Backup for GKE の volume backup 対象外**（PD のみ）
+です。Filestore を使っている場合のデータ移行は手動になります。
+
+---
+
 ## 2026-08-16 — Artifact Registry のイメージ複製を短縮
 
 イメージ複製（Step 3.7）に時間がかかる場合の短縮手段を 2 つ用意しました。

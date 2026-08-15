@@ -164,6 +164,17 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
     "gkehub.googleapis.com/Feature":          None,
     "gkehub.googleapis.com/Fleet":            None,
     "gkehub.googleapis.com/Membership":       None,
+    # --- gkebackup (Backup for GKE。DIFF の gke_backup_restore 手順で利用者が
+    #     手動作成する移行用リソースそのもの。src の plan を複製すると手順と
+    #     二重管理になるため自動複製しない。customize 側も .tf を skip する) ---
+    "gkebackup.googleapis.com/BackupPlan":     None,
+    "gkebackup.googleapis.com/Backup":         None,
+    "gkebackup.googleapis.com/VolumeBackup":   None,
+    "gkebackup.googleapis.com/RestorePlan":    None,
+    "gkebackup.googleapis.com/Restore":        None,
+    "gkebackup.googleapis.com/VolumeRestore":  None,
+    "gkebackup.googleapis.com/BackupChannel":  None,
+    "gkebackup.googleapis.com/RestoreChannel": None,
     # --- storage / bigquery ---
     "storage.googleapis.com/Bucket":          "data_sync",             # terraform で作成、data_sync で内容コピー
     "bigquery.googleapis.com/Dataset":        "data_sync",
@@ -862,6 +873,40 @@ _GKE_MANAGED_TF_RESOURCE_TYPES = (
     "google_compute_firewall",
 )
 
+# GKE Gateway コントローラ（gkegw1-）/ NEG コントローラ（k8s1-）/ Ingress GLBC
+# （k8s-be- 等）が自動生成する LB リソース型。_GKE_MANAGED_TF_RESOURCE_TYPES と
+# 分けているのは、これらの型に gke-/k8s- の広い接頭辞判定を使うと利用者 LB を
+# 誤除外しうるため（forwarding_rule を接頭辞判定させないのと同じ理由）。判定は
+# コントローラ固有の狭い接頭辞（_GKE_LB_CONTROLLER_NAME_PREFIXES）または
+# description の所有者マーカーに限定する。
+# 残すと、参照先の health check（gkegw1-* 等は上の型リスト + 接頭辞で除外済み）
+# への URL 参照が宙ぶらりんになり apply が毎回 404 で失敗する
+# （regression: my-argolis の gkegw1-gqew-* BackendService）。
+_GKE_GATEWAY_TF_RESOURCE_TYPES = (
+    "google_compute_backend_service",
+    "google_compute_region_backend_service",
+    "google_compute_url_map",
+    "google_compute_region_url_map",
+    "google_compute_target_http_proxy",
+    "google_compute_region_target_http_proxy",
+    "google_compute_target_https_proxy",
+    "google_compute_region_target_https_proxy",
+    "google_compute_forwarding_rule",
+    "google_compute_global_forwarding_rule",
+    "google_compute_network_endpoint_group",
+)
+
+# LB 系コントローラ専用の機械命名接頭辞（利用者が使う余地がほぼ無いものだけ）。
+#   gkegw1-  : Gateway コントローラ（backend service は description を持たない
+#              ため接頭辞でしか判定できない）
+#   k8s1-    : NEG コントローラ / k8s2- : Ingress GLBC v2
+#   k8s-be-/um-/tp-/tps-/fw-/fws- : Ingress GLBC v1 の各リソース
+# 広い gke-/k8s- は入れない（gke-admin-lb のような利用者リソースを誤除外しない）。
+_GKE_LB_CONTROLLER_NAME_PREFIXES = (
+    "gkegw1-", "k8s1-", "k8s2-",
+    "k8s-be-", "k8s-um-", "k8s-tp-", "k8s-tps-", "k8s-fw-", "k8s-fws-",
+)
+
 # CAI 上で GKE が自動生成する派生 compute アセット。名前が gke-*/k8s-* なら
 # DIFF.md では「参考」扱いにする（dst クラスタが再生成するため実害なし）。
 _GKE_DERIVED_ASSET_TYPES = frozenset({
@@ -876,6 +921,12 @@ _GKE_DERIVED_ASSET_TYPES = frozenset({
     "compute.googleapis.com/HttpHealthCheck",
     "compute.googleapis.com/HealthCheck",
     "compute.googleapis.com/Autoscaler",
+    # GKE Gateway コントローラが作る LB 一式（gkegw1-*）。dst で Gateway /
+    # HTTPRoute を復元すればコントローラが再生成する
+    "compute.googleapis.com/BackendService",
+    "compute.googleapis.com/UrlMap",
+    "compute.googleapis.com/TargetHttpProxy",
+    "compute.googleapis.com/TargetHttpsProxy",
     # GKE の Pod range に対応して自動作成される internal range 表現
     "networkconnectivity.googleapis.com/InternalRange",
 })
@@ -921,7 +972,8 @@ def is_gke_managed_name(name: Optional[str]) -> bool:
 # （`a<31hex>`）で接頭辞判定に掛からないリソースはこれで判定する。
 # HCL 上はエスケープ済み（description = "{\"kubernetes.io/service-name\":...}"）。
 _K8S_OWNER_MARKER_RE = re.compile(
-    r'^\s*description\s*=\s*".*kubernetes\.io/(service-name|service-ip|cluster-id)',
+    r'^\s*description\s*=\s*".*kubernetes\.io/'
+    r'(service-name|service-ip|cluster-id|ingress-name)',
     re.M,
 )
 
@@ -937,6 +989,50 @@ def has_k8s_owner_marker(content: str) -> bool:
 def is_k8s_lb_resource_name(name: Optional[str]) -> bool:
     """名前が k8s LB リソースの UID 由来命名（a+32hex）なら True。"""
     return bool(name) and bool(_K8S_LB_NAME_RE.match(str(name)))
+
+
+# GKE Gateway コントローラが url map / target proxy の description に書く
+# 所有者マーカー。HCL 上はエスケープ済み:
+#   description = "{\"k8sResource\":\"/namespaces/<ns>/gateways/<gw>\",\"k8sCluster\":...}"
+# backend service には description が無いため、そちらは接頭辞判定
+# （_GKE_LB_CONTROLLER_NAME_PREFIXES）が頼り。
+_K8S_GATEWAY_MARKER_RE = re.compile(
+    r'^\s*description\s*=\s*".*k8sResource.*k8sCluster', re.M)
+
+# NEG コントローラが zonal NEG の description に書く所有者マーカー:
+#   {"cluster-uid":"...","namespace":"...","service-name":"...","port":"80"}
+_K8S_NEG_MARKER_RE = re.compile(
+    r'^\s*description\s*=\s*".*cluster-uid.*service-name', re.M)
+
+
+def has_gke_gateway_marker(content: str) -> bool:
+    """description に GKE Gateway / NEG コントローラの所有者マーカーがあれば True。"""
+    c = content or ""
+    return bool(_K8S_GATEWAY_MARKER_RE.search(c) or _K8S_NEG_MARKER_RE.search(c))
+
+
+def is_gke_lb_controller_name(name: Optional[str]) -> bool:
+    """名前が LB 系コントローラの機械命名（狭い接頭辞 / a+32hex）なら True。"""
+    if not name:
+        return False
+    return str(name).startswith(_GKE_LB_CONTROLLER_NAME_PREFIXES) or \
+        is_k8s_lb_resource_name(name)
+
+
+# k8s コントローラが動的プロビジョニングで作るリソースの機械命名
+# （<接頭辞>-<k8s オブジェクトの UID>）。UID は必ず uuid 形式なので厳密照合できる。
+#   pvc-<uuid>  : PD CSI ドライバが作る PersistentVolume のディスク
+#                 （Backup for GKE の volume restore が dst で新規作成する）
+#   mcrt-<uuid> : ManagedCertificate コントローラが発行する Google-managed 証明書
+#                 （ManagedCertificate オブジェクトの復元で dst が発行し直す）
+# 利用者が uuid 付きでこの命名をすることは無いため、接頭辞 + uuid の AND で判定する。
+_K8S_PROVISIONED_NAME_RE = re.compile(
+    r'^(pvc|mcrt)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
+
+def is_k8s_provisioned_name(name: Optional[str]) -> bool:
+    """名前が k8s の動的プロビジョニング命名（pvc-/mcrt- + uuid）なら True。"""
+    return bool(name) and bool(_K8S_PROVISIONED_NAME_RE.match(str(name)))
 
 
 # GKE 本体が作る classic FW ルール名: gke-<cluster>-<8hex>-<suffix>
@@ -966,6 +1062,12 @@ def is_gke_managed_fw_rule(rule: Dict[str, Any]) -> bool:
     if 'kubernetes.io/' in (rule.get('description') or ''):
         return True
     name = rule.get('name') or ''
+    # Gateway コントローラの L7 ルール（gkegw1-gqew-l7-<network>-global）は
+    # description が "Ingress L7 firewall rule" 固定でマーカーも hex 構造も
+    # 持たない。gkegw1- はコントローラ専用接頭辞なので接頭辞だけで判定してよい
+    # （利用者命名と衝突しない。広い gke-/k8s- とは違う）。
+    if name.startswith("gkegw1-"):
+        return True
     return bool(_GKE_CORE_FW_NAME_RE.match(name)) or bool(_K8S_FW_NAME_RE.match(name))
 
 
@@ -1282,6 +1384,19 @@ def classify_missing_asset(
             "Secret 作成時に `gcloud secrets versions add <name> --data-file=-` で"
             "値を投入する（値の転記はツール対象外 = 秘密情報を自動で写さない）。",
             priority=2)
+
+    # GKE ManagedCertificate コントローラが発行する Google-managed 証明書
+    # （mcrt-<uuid>）。ManagedCertificate オブジェクトを Backup for GKE で
+    # 復元すればコントローラが dst で発行し直す。利用者の証明書は対象外
+    # （mcrt-uuid 命名でなければ従来どおり action / ssl_certificate 注記）。
+    if (atype == "compute.googleapis.com/SslCertificate"
+            and is_k8s_provisioned_name(short)):
+        return ref(
+            "GKE ManagedCertificate コントローラが発行した Google-managed 証明書。"
+            "Backup for GKE の restore で ManagedCertificate オブジェクトを戻せば "
+            "dst で発行し直される（DNS が dst の LB IP を向いてから完了する）。",
+            "restore 後に `kubectl get managedcertificate` で Active を確認。",
+            priority=3)
 
     if atype in _GKE_DERIVED_ASSET_TYPES and (
             is_gke_managed_name(short) or is_k8s_lb_resource_name(short)):
@@ -2688,6 +2803,20 @@ def customize_note_row(note: Dict[str, str]) -> Tuple[str, str, str, str]:
             "oauth2_client_id が src ORG の OAuth クライアントを指したままの可能性もある",
             f"dst で IAP 不要なら: `gcloud compute backend-services update {res}"
             f" --global --iap=disabled --project={proj}`",
+        )
+    if kind == "gke_gateway":
+        return (
+            "確認",
+            f"GKE Gateway `{res}` の LB 一式（{proj}）",
+            "gkegw1-* の backend service / URL map / target proxy / health check は "
+            "GKE Gateway コントローラの自動生成リソース。名前にクラスタ固有ハッシュが"
+            "入り dst クラスタは再利用しないため、LB 一式ごと複製対象外にした"
+            "（残すと除外済み health check への参照が宙ぶらりんになり apply が 404）",
+            "Backup for GKE の restore（要対応の項参照）で Gateway / HTTPRoute を"
+            "戻せばコントローラが dst 側で再作成する。確認: ① LB の IP は新規"
+            "払い出しのため DNS レコードを dst の IP へ切替 ② Certificate Manager の "
+            "certificate map / SSL 証明書はクラスタ外リソースで複製されないため "
+            "dst に用意し、Gateway 側の参照（annotation）を確認",
         )
     # 未知 kind は握り潰さず確認として出す（登録漏れに気付けるように）
     return ("確認", f"{kind}: {res}（{proj}）", "詳細は実行ログを参照", "-")
@@ -4431,6 +4560,18 @@ resource "google_container_cluster" "mock_cluster" {{
   location = "asia-northeast1-a"
 }}
 """
+        # Gateway コントローラ生成の LB リソース（description の無い backend
+        # service = 接頭辞でしか判定できない代表例）が active に出ないことを
+        # make mock で確認できるようにする。除外が壊れると、除外済み health
+        # check への宙ぶらりん参照ごと active に残る。
+        gke_gw_hcl = f"""
+# {_MOCK_TF_MARK}
+resource "google_compute_backend_service" "mock_gkegw_backend" {{
+  name          = "gkegw1-mock-default-gw-80-abcd1234efgh"
+  project       = "{proj_id}"
+  health_checks = ["https://www.googleapis.com/compute/v1/projects/{proj_id}/global/healthChecks/gkegw1-mock-default-gw-80-abcd1234efgh"]
+}}
+"""
         try:
             with open(os.path.join(proj_dir, "google_compute_instance.tf"), "w", encoding="utf-8") as f:
                 f.write(vm_hcl)
@@ -4440,6 +4581,8 @@ resource "google_container_cluster" "mock_cluster" {{
                 f.write(gke_template_hcl)
             with open(os.path.join(proj_dir, "google_container_cluster.tf"), "w", encoding="utf-8") as f:
                 f.write(cluster_hcl)
+            with open(os.path.join(proj_dir, "google_compute_backend_service.tf"), "w", encoding="utf-8") as f:
+                f.write(gke_gw_hcl)
         except Exception as e:
             self.org_logger.error(f"  [MOCK] ダミー TF 書き出し失敗: {e}")
 
@@ -6182,6 +6325,16 @@ resource "google_container_cluster" "mock_cluster" {{
                         elif ('resource "google_storage_bucket"' in content
                               and "ドット入り" in (skip_reason or "")):
                             self._add_customize_note("dotted_bucket", content, rel)
+                        elif ("k8sResource" in content
+                              and has_gke_gateway_marker(content)):
+                            # Gateway 1 つにつき 1 行に畳む（proxy / url map の
+                            # 複数ファイルが同じ Gateway を指すため、resource を
+                            # 個別リソース名でなく Gateway パスで上書きする）
+                            gw = re.search(
+                                r'\\"k8sResource\\":\\"([^"\\]+)', content)
+                            self._add_customize_note(
+                                "gke_gateway", content, rel,
+                                resource=gw.group(1) if gw else None)
                         self.org_logger.info(f"      スキップ（{skip_reason}）: {active_rel}")
                         continue
 
@@ -6530,16 +6683,19 @@ resource "google_container_cluster" "mock_cluster" {{
                     )
         return content
 
-    def _add_customize_note(self, kind: str, content: str, rel: str):
+    def _add_customize_note(self, kind: str, content: str, rel: str,
+                            resource: Optional[str] = None):
         """customize の補正/スキップ注記を積む（DIFF.md 掲載用。ルールはモジュール
         コメント `_CUSTOMIZE_NOTES_FILE` 参照）。resource 名と project は補正後の
-        content から拾う（プロジェクト ID 置換済みなので dst 側の値になる）。"""
+        content から拾う（プロジェクト ID 置換済みなので dst 側の値になる）。
+        resource= 指定時はそちらを優先する（複数ファイルが同じ論理対象
+        （例: Gateway）を指すとき、下の重複排除で 1 行に畳むため）。"""
         nm = re.search(r'\bname\s*=\s*"([^"]+)"', content)
         pm = re.search(r'\bproject\s*=\s*"([^"]+)"', content)
         note = {
             "kind": kind,
             "src_dir": rel.split(os.sep)[0] if os.sep in rel else "",
-            "resource": nm.group(1) if nm else "?",
+            "resource": resource or (nm.group(1) if nm else "?"),
             "project": pm.group(1) if pm else "?",
         }
         # 同一内容は 1 行にまとめる（name を持たないリソースは resource="?" に
@@ -6671,6 +6827,45 @@ resource "google_container_cluster" "mock_cluster" {{
                         f"k8s(GKE) 管理リソース（kubernetes.io マーカー。"
                         f"dst クラスタが再生成）: {m.group(1) if m else rtype}"
                     )
+
+        # GKE Gateway（gkegw1-）/ NEG（k8s1-）/ Ingress GLBC（k8s-be- 等）の各
+        # コントローラが作る LB 一式（backend service / URL map / target proxy /
+        # forwarding rule / NEG）。参照先の health check は上の接頭辞判定で除外
+        # 済みのため、これらを残すと宙ぶらりんの URL 参照で apply が毎回 404 に
+        # なる（regression: my-argolis の gkegw1-gqew-* BackendService が
+        # 除外済み healthChecks/gkegw1-* を参照して notFound）。dst では
+        # Backup for GKE で Gateway / HTTPRoute / Service を復元すれば
+        # コントローラが dst クラスタのハッシュ名で再作成する。
+        # 判定は所有者マーカーまたはコントローラ固有の狭い接頭辞のみ
+        # （広い gke-/k8s- では判定しない = 利用者 LB を誤除外しない）。
+        for rtype in _GKE_GATEWAY_TF_RESOURCE_TYPES:
+            if f'resource "{rtype}"' not in content:
+                continue
+            m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+            nm = m.group(1) if m else None
+            if (has_gke_gateway_marker(content) or has_k8s_owner_marker(content)
+                    or is_gke_lb_controller_name(nm)):
+                return (f"GKE Gateway/Ingress/NEG コントローラ管理の LB リソース"
+                        f"（dst クラスタが再生成）: {nm or rtype}")
+
+        # GKE ManagedCertificate コントローラが発行する Google-managed 証明書
+        # （mcrt-<uuid>）。Backup for GKE で ManagedCertificate オブジェクトを
+        # 復元すれば dst で発行し直される（発行は DNS が dst LB を向いてから
+        # 完了する）。利用者作成の managed cert は mcrt-uuid 命名でないので残す。
+        if 'resource "google_compute_managed_ssl_certificate"' in content:
+            m = re.search(r'\bname\s*=\s*"([^"]+)"', content)
+            if m and is_k8s_provisioned_name(m.group(1)):
+                return (f"GKE ManagedCertificate の発行物"
+                        f"（restore 後に dst で再発行）: {m.group(1)}")
+
+        # Backup for GKE の backup/restore plan は移行手順そのもの（DIFF の
+        # gke_backup_restore 注記に従って利用者が src/dst に手動作成する）。
+        # 複製すると手順との二重管理になり、cluster 参照も文字列 URL のため
+        # クラスタより先に apply されると 404 になる。
+        if ('resource "google_gke_backup_backup_plan"' in content
+                or 'resource "google_gke_backup_restore_plan"' in content):
+            return ("Backup for GKE の plan（DIFF の gke_backup_restore 手順で"
+                    "手動作成。自動複製しない）")
 
         # スナップショット / イメージは移行モデルでは terraform で作らない。
         # snapshot は dst に存在しないディスクを source にしており、image はその

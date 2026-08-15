@@ -37,6 +37,9 @@ from scripts.sync_env import (
     is_gke_managed_name,
     is_gke_managed_fw_rule,
     has_k8s_owner_marker,
+    has_gke_gateway_marker,
+    is_gke_lb_controller_name,
+    is_k8s_provisioned_name,
     is_k8s_lb_resource_name,
     import_error_kind,
     coerce_nonneg_int,
@@ -4503,6 +4506,235 @@ class TestK8sLbResourcesSkipped:
             '}\n'
         )
         assert o._skip_reason_for_file(content) is None
+
+
+class TestGkeGatewayLbSkipped:
+    """GKE Gateway（gkegw1-）/ NEG（k8s1-）/ Ingress の LB 一式の除外
+    （regression: gkegw1-* BackendService が除外済み health check を参照して
+    apply が 404）。"""
+
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    # description の無い Gateway backend service（接頭辞でしか判定できない）
+    GW_BES = (
+        'resource "google_compute_backend_service" "gkegw1_gqew_default_frontend_80" {\n'
+        '  health_checks = ["https://www.googleapis.com/compute/v1/projects/p'
+        '/global/healthChecks/gkegw1-gqew-default-frontend-80-22d1h872r781"]\n'
+        '  name          = "gkegw1-gqew-default-frontend-80-22d1h872r781"\n'
+        '}\n'
+    )
+    # Gateway マーカー付き target proxy（k8sResource / k8sCluster）
+    GW_PROXY = (
+        'resource "google_compute_target_https_proxy" "gw" {\n'
+        '  description = "{\\"k8sResource\\":\\"/namespaces/default/gateways/'
+        'frontend-gateway\\",\\"k8sCluster\\":\\"/projects/1234/locations/z/'
+        'clusters/c\\"}"\n'
+        '  name        = "gkegw1-gqew-default-frontend-gateway-e9l16e32yk1z"\n'
+        '}\n'
+    )
+    # NEG コントローラのマーカー付き zonal NEG
+    NEG = (
+        'resource "google_compute_network_endpoint_group" "neg" {\n'
+        '  description = "{\\"cluster-uid\\":\\"adeef402\\",\\"namespace\\":'
+        '\\"default\\",\\"service-name\\":\\"frontend\\",\\"port\\":\\"80\\"}"\n'
+        '  name        = "k8s1-c9376336-default-frontend-80-d7863a45"\n'
+        '}\n'
+    )
+
+    def test_gateway_backend_service_without_description_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        reason = o._skip_reason_for_file(self.GW_BES)
+        assert reason and "gkegw1-gqew-default-frontend-80" in reason
+
+    def test_gateway_marker_proxy_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        assert o._skip_reason_for_file(self.GW_PROXY)
+
+    def test_gateway_marker_wins_even_without_known_prefix(self, temp_dir):
+        # 命名規約が変わってもマーカーで落とせること
+        o = self._setup(temp_dir)
+        content = self.GW_PROXY.replace(
+            "gkegw1-gqew-default-frontend-gateway-e9l16e32yk1z", "future-name")
+        assert o._skip_reason_for_file(content)
+
+    def test_neg_with_cluster_uid_marker_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        assert o._skip_reason_for_file(self.NEG)
+
+    def test_ingress_v1_backend_with_owner_marker_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_compute_backend_service" "be" {\n'
+            '  description = "{\\"kubernetes.io/service-name\\":\\"default/web\\"}"\n'
+            '  name        = "k8s-be-30080--0123456789abcdef"\n'
+            '}\n'
+        )
+        assert o._skip_reason_for_file(content)
+
+    def test_user_backend_service_is_kept(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_compute_backend_service" "svc" {\n'
+            '  name = "notify-api"\n'
+            '}\n'
+        )
+        assert o._skip_reason_for_file(content) is None
+
+    def test_user_lb_with_broad_gke_prefix_is_kept(self, temp_dir):
+        # 広い gke-/k8s- 接頭辞では落とさない（利用者 LB の誤除外防止）
+        o = self._setup(temp_dir)
+        for name in ("gke-admin-lb", "k8s-nodeport-um"):
+            content = (
+                f'resource "google_compute_url_map" "u" {{\n'
+                f'  name = "{name}"\n'
+                f'}}\n'
+            )
+            assert o._skip_reason_for_file(content) is None, name
+
+    def test_marker_helpers(self):
+        assert has_gke_gateway_marker(self.GW_PROXY)
+        assert has_gke_gateway_marker(self.NEG)
+        assert not has_gke_gateway_marker(
+            'resource "google_compute_url_map" "u" {\n'
+            '  description = "my url map"\n  name = "user-lb"\n}\n')
+        assert is_gke_lb_controller_name("gkegw1-gqew-default-frontend-80-x")
+        assert is_gke_lb_controller_name("k8s1-c9376336-default-frontend-80-x")
+        assert is_gke_lb_controller_name("k8s2-um-abcd-default-web-efgh")
+        assert not is_gke_lb_controller_name("gke-admin-lb")
+        assert not is_gke_lb_controller_name("k8s-nodeport-um")
+        assert not is_gke_lb_controller_name(None)
+
+    def test_gateway_note_row_is_confirmation(self):
+        kind, what, why, how = customize_note_row({
+            "kind": "gke_gateway",
+            "resource": "/namespaces/default/gateways/frontend-gateway",
+            "project": "dst-p"})
+        assert kind == "確認"
+        assert "/namespaces/default/gateways/frontend-gateway" in what
+        assert "DNS" in how and "certificate map" in how
+
+    def test_note_resource_override_collapses_files(self, temp_dir):
+        # http/https proxy + url map が同じ Gateway を指す → 1 行に畳む
+        o = self._setup(temp_dir)
+        o._customize_notes = []
+        for fn in ("a.tf", "b.tf", "c.tf"):
+            o._add_customize_note(
+                "gke_gateway", self.GW_PROXY, f"my-argolis/{fn}",
+                resource="/namespaces/default/gateways/frontend-gateway")
+        assert len(o._customize_notes) == 1
+        assert o._customize_notes[0]["resource"] == \
+            "/namespaces/default/gateways/frontend-gateway"
+
+
+class TestBackupForGkeRestoredResourcesExcluded:
+    """Backup for GKE の restore で dst に再生成 / 再発行されるリソースを
+    本ツールが複製しないこと（複製して失敗もしないこと）。"""
+
+    PVC_UUID = "pvc-adeef402-e422-4da2-a370-a94a60b1a471"
+    MCRT_UUID = "mcrt-adeef402-e422-4da2-a370-a94a60b1a471"
+
+    def _setup(self, temp_dir):
+        cfg = _full_config(temp_dir)
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        return o
+
+    def test_provisioned_name_detection(self):
+        assert is_k8s_provisioned_name(self.PVC_UUID)
+        assert is_k8s_provisioned_name(self.MCRT_UUID)
+        # uuid 無しの利用者命名は対象外
+        assert not is_k8s_provisioned_name("pvc-mydisk")
+        assert not is_k8s_provisioned_name("mcrt-test")
+        assert not is_k8s_provisioned_name(None)
+
+    def test_pvc_disk_is_excluded_from_terraform(self, temp_dir):
+        # ディスクは種別を問わず Step 5 管理として skip される（PV の実データは
+        # Backup for GKE の volume restore が dst で新規ディスクとして作る）
+        o = self._setup(temp_dir)
+        content = (
+            f'resource "google_compute_disk" "d" {{\n'
+            f'  name = "{self.PVC_UUID}"\n'
+            f'}}\n'
+        )
+        assert o._skip_reason_for_file(content)
+
+    def test_mcrt_managed_cert_is_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            f'resource "google_compute_managed_ssl_certificate" "c" {{\n'
+            f'  name = "{self.MCRT_UUID}"\n'
+            f'}}\n'
+        )
+        reason = o._skip_reason_for_file(content)
+        assert reason and "ManagedCertificate" in reason
+
+    def test_user_managed_cert_is_kept(self, temp_dir):
+        o = self._setup(temp_dir)
+        content = (
+            'resource "google_compute_managed_ssl_certificate" "c" {\n'
+            '  name = "my-web-cert"\n'
+            '}\n'
+        )
+        assert o._skip_reason_for_file(content) is None
+
+    def test_gke_backup_plans_are_skipped(self, temp_dir):
+        o = self._setup(temp_dir)
+        for rtype in ("google_gke_backup_backup_plan",
+                      "google_gke_backup_restore_plan"):
+            content = (
+                f'resource "{rtype}" "p" {{\n'
+                f'  name = "my-plan"\n'
+                f'}}\n'
+            )
+            reason = o._skip_reason_for_file(content)
+            assert reason and "Backup for GKE" in reason, rtype
+
+    def test_gateway_l7_fw_rule_is_managed(self):
+        # description が固定文言でマーカー無し・hex 構造無しの Gateway L7 ルール
+        assert is_gke_managed_fw_rule({
+            "name": "gkegw1-gqew-l7-vpc-0-global",
+            "description": "Ingress L7 firewall rule"})
+        # 利用者ルールは従来どおり残す
+        assert not is_gke_managed_fw_rule({"name": "gke-admin-bastion"})
+        assert not is_gke_managed_fw_rule({"name": "k8s-nodeport-allow"})
+
+    def test_gkebackup_assets_are_intentionally_uncovered(self):
+        for atype in ("gkebackup.googleapis.com/BackupPlan",
+                      "gkebackup.googleapis.com/RestorePlan",
+                      "gkebackup.googleapis.com/Backup"):
+            assert atype in _ASSET_COVERAGE and _ASSET_COVERAGE[atype] is None
+
+    def test_mcrt_cert_missing_is_reference(self):
+        c = classify_missing_asset({
+            "asset_type": "compute.googleapis.com/SslCertificate",
+            "short_name": self.MCRT_UUID,
+            "full_name": f"//compute.googleapis.com/.../{self.MCRT_UUID}",
+            "location": "global", "coverage_step": "terraform_apply",
+            "reason": "bulk-export が出力しなかった",
+            "state": "", "ip_address": "",
+        })
+        assert c["level"] == "reference" and c["priority"] == 3
+
+    def test_user_cert_missing_stays_action(self):
+        c = classify_missing_asset({
+            "asset_type": "compute.googleapis.com/SslCertificate",
+            "short_name": "my-web-cert",
+            "full_name": "//compute.googleapis.com/.../my-web-cert",
+            "location": "global", "coverage_step": "terraform_apply",
+            "reason": "bulk-export が出力しなかった",
+            "state": "", "ip_address": "",
+        })
+        assert c["level"] == "action"
 
 
 class TestIsGkeManagedFwRule:
