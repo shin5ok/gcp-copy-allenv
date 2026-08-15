@@ -40,9 +40,12 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 - [ ] Python 3.13 以上 / `uv` がインストール済み
 - [ ] `gcloud` / `bq` / `terraform` が PATH に通っている
 - [ ] `bulk_export` を有効化する場合は `gcloud components install config-connector` 済み
-- [ ] **`gcrane`（推奨）または `docker`**（Artifact Registry のイメージ複製に使用。
-      どちらも無いと警告を出してスキップし、Cloud Run が `Image ... not found` で失敗します。
-      gcrane の方が速く digest も保たれます → [イメージ複製を速くする](#-イメージ複製を速くする)）
+- [ ] **`gcrane`**（`data_sync` 有効時は**必須**。Artifact Registry のイメージ複製に使用。
+      **無いと実行前チェックでエラー停止します**。`crane` でも可。`docker` は代替になりません
+      → [イメージ複製に gcrane が必須な理由](#-イメージ複製に-gcrane-が必須な理由)）
+      ```bash
+      go install github.com/google/go-containerregistry/cmd/gcrane@latest
+      ```
 
 #### B. 認証
 - [ ] `gcloud auth login` と `gcloud auth application-default login`（ADC）でログイン済み
@@ -93,16 +96,16 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
   ```bash
   gcloud components install config-connector
   ```
-- **`gcrane`（推奨）/ `crane` / `docker`**（`data_sync` 有効時に**実質必須**）:
-  Step 3.7 のコンテナイメージ複製で使用します（`gcloud` にイメージコピー機能が無いため）。
-  **`gcrane` → `crane` → `docker` の順に、PATH にあるものを自動で使います。**
+- **`gcrane`**（`data_sync` 有効時は**必須**）: Step 3.7 のコンテナイメージ複製で使用します
+  （`gcloud` にイメージコピー機能が無いため）。`crane` でも構いません。
   ```bash
   go install github.com/google/go-containerregistry/cmd/gcrane@latest
+  # バイナリ配布: https://github.com/google/go-containerregistry/releases
   ```
-  どれも未導入の場合は警告を出してスキップしますが、Cloud Run はイメージを digest 固定で
-  参照するため **Step 4 の apply が `Image ... not found` で失敗します**。
-  docker しか無い場合も動きますが、マルチアーキイメージで digest が変わりうる点に注意
-  （詳細は [イメージ複製を速くする](#-イメージ複製を速くする)）。
+  **どちらも無い場合は実行前チェックがエラーで停止します**（`make plan` でも検出）。
+  **`docker` は代替になりません** — 理由は
+  [イメージ複製に gcrane が必須な理由](#-イメージ複製に-gcrane-が必須な理由) を参照。
+  イメージ複製が不要なら `steps.data_sync.artifact_registry.enabled: false` にしてください。
 
 > ✅ **実行前の自動チェック（fail-fast）**
 > `make plan` / `make run` / `make mock` は開始時に下記を検証し、不備があれば
@@ -112,7 +115,8 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 >   設定不備（`vpc_sc` の `billing_project` / `access_policy` / `perimeter` 空、`rename_rules.gcs.method` 不正、
 >   `gce_snapshot.max_age_days` が非正、`bulk_export.resource_types` / `export_resource_types` の
 >   書式誤り（Terraform 型と KRM Kind の取り違え）、`storage_path` が `gs://` でない など）。
-> - **CLI 前提チェック**: 有効ステップが使う `gcloud` / `terraform` / `bq` / `config-connector` の存在。
+> - **CLI 前提チェック**: 有効ステップが使う `gcloud` / `terraform` / `bq` / `config-connector` /
+>   **`gcrane`**（イメージ複製。`crane` でも可）の存在。
 > - **SA 事前チェック**: 借用 SA の実在・借用可否と代表権限（src=読取 / dst=書込）。代表値の検証で、全リソース種は網羅しません。
 > - **コピー先プロジェクトの実在チェック**: 全 dst を `projects describe` し、ACTIVE でなければ
 >   何も書き込まずに停止して `make projects` を案内します（config の dst を新 ID に変えたまま
@@ -321,8 +325,9 @@ cp dst/config.yaml.template dst/config.yaml
     ```
     - イメージは**同じ digest** で複製します。Cloud Run は `image = "...@sha256:<digest>"` で
       固定参照するため、digest が変わると参照が解決できません。
-    - **`gcrane` があれば優先して使います**（無ければ `crane` → `docker` の順）。
-      理由は [イメージ複製を速くする](#-イメージ複製を速くする) を参照。
+    - 複製には **`gcrane`（または `crane`）が必須**です。無い場合は実行前チェックが
+      エラーで停止します。理由は
+      [イメージ複製に gcrane が必須な理由](#-イメージ複製に-gcrane-が必須な理由) を参照。
     - 既に同じ digest があるイメージは再送しません（2 回目以降はほぼ即完了）。
     - **コピー先 SA にコピー元の `roles/artifactregistry.reader` が必要**です
       （`make bootstrap-cross-project` が付与。既存環境では再実行してください）。
@@ -571,14 +576,10 @@ graph LR
 > `google_container_node_pool` 側の同名プール作成が 409 になるためで、
 > **一時的な既定プールを作って即削除し、実プールは別リソースとして作る**という Terraform の定石です。
 
-#### 🚀 イメージ複製を速くする
+#### 🚀 イメージ複製に gcrane が必須な理由
 
-Artifact Registry の複製（Step 3.7）は、リポジトリの履歴が長いと件数が膨らみます。
-短縮する手段は 2 つあり、**どちらも「コピー先の動作に必要なイメージ」は落としません**。
-
-**1. `gcrane` を入れる（設定不要・最優先）**
-
-`gcrane` / `crane` が PATH にあれば自動的にそちらを使います（無ければ `docker`）。
+イメージ複製（Step 3.7）には **`gcrane`（または `crane`）が必要**です。無い場合は
+**実行前チェックがエラーで停止**します（`docker` があっても代替になりません）。
 
 | | docker | gcrane / crane |
 |---|---|---|
@@ -586,16 +587,24 @@ Artifact Registry の複製（Step 3.7）は、リポジトリの履歴が長い
 | コピー先に既にあるレイヤ | 再送する | **blob mount で再送しない** |
 | マルチアーキイメージ | 単一プラットフォームに落ちて **digest が変わることがある** | マニフェストリストごと転送し **digest を保つ** |
 
-digest が変わると実害が 2 つ出ます。**Cloud Run の `@sha256:` 固定参照が解決できなくなる**のと、
-**再実行時に「コピー先に既にある」と判定されず毎回同じイメージを再送し続ける**ことです
-（docker 利用時は起動時に警告を出します）。
+digest が変わると実害が 2 つ出ます。
+
+1. **Cloud Run の `@sha256:` 固定参照が解決できなくなる**（`Image ... not found`）
+2. **再実行時に「コピー先に既にある」と判定されず、毎回同じイメージを再送し続ける**
+
+実際に docker 経路では一部のイメージで digest が変わっていたため、docker は使わない方針に
+変更しました（`gcrane` → `crane` の順に PATH を見ます）。
 
 ```bash
 go install github.com/google/go-containerregistry/cmd/gcrane@latest
 # または https://github.com/google/go-containerregistry/releases からバイナリを取得
 ```
 
-**2. `scope: tagged` で過去ビルドを除外する**
+> 💡 **どこに入れるか**: `make run` を実行するマシンです（レジストリ間の転送を中継します）。
+> イメージ複製自体が不要なら `steps.data_sync.artifact_registry.enabled: false` にすれば
+> このチェックは行われません。
+
+#### 📉 複製するイメージを減らす: `scope: tagged`
 
 Cloud Build は push のたびに tag を新しいイメージへ移すため、**tag の無い digest =
 新しいビルドに置き換えられた過去ビルド**です。実測では 87 件中 **64 件（74%）** が

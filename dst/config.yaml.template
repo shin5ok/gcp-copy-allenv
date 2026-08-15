@@ -308,17 +308,17 @@ steps:
   data_sync:
     enabled: true
     # [オプション] Artifact Registry のコンテナイメージ複製（同一 digest で複製）。
-    # gcloud にイメージコピー機能が無いため、gcrane → crane → docker の順に
-    # PATH にあるものを使う（どれも無ければ警告を出してスキップ）。
     # dst SA に src の roles/artifactregistry.reader が必要
     # （make bootstrap-cross-project が付与）。
     #
-    # ⚡ gcrane の導入を推奨: レジストリ間で直接転送するのでローカルにイメージを
-    #    落とさず、dst に既にあるレイヤも再送しない。docker の pull → push は
-    #    マルチアーキイメージを単一プラットフォームに落として **digest が変わる**
-    #    ことがあり、そうなると Cloud Run の @sha256: 固定参照が解決できず、
-    #    再実行時も「既存」と判定されずに毎回再送される。
+    # ⚠️ gcrane（または crane）が **必須**。無いと実行前チェックがエラーで止まる。
     #      go install github.com/google/go-containerregistry/cmd/gcrane@latest
+    #    docker は代替にならない: pull → push はマルチアーキイメージを単一
+    #    プラットフォームに落として **digest が変わる**ことがあり、そうなると
+    #    Cloud Run の @sha256: 固定参照が解決できず、再実行時も「既存」と
+    #    判定されずに毎回再送される。gcrane はレジストリ間で直接転送するので
+    #    digest が保たれ、dst に既にあるレイヤも再送しない。
+    #    イメージ複製自体が不要なら enabled: false にすればチェックも行われない。
     #
     # scope: 複製する digest の範囲。
     #   all    … 全 digest（既定）。移行範囲を勝手に狭めない安全側。

@@ -10,9 +10,20 @@
 イメージ複製（Step 3.7）に時間がかかる場合の短縮手段を 2 つ用意しました。
 **どちらもコピー先の動作に必要なイメージは落としません。**
 
-### 1. `gcrane` があれば自動的に使います（設定不要）
+### 1. `gcrane` が必須になりました（**要対応**）
 
-`gcrane` → `crane` → `docker` の順に、PATH にあるものを使います。
+イメージ複製に **`gcrane`（または `crane`）が必要**になり、無い場合は
+**実行前チェックがエラーで停止**します（`make plan` でも検出）。
+
+```bash
+go install github.com/google/go-containerregistry/cmd/gcrane@latest
+# バイナリ配布: https://github.com/google/go-containerregistry/releases
+```
+
+`make run` を実行するマシンに入れてください。イメージ複製自体が不要な場合は
+`steps.data_sync.artifact_registry.enabled: false` にすればチェックされません。
+
+**`docker` は代替になりません**（従来のフォールバックは廃止しました）。
 
 | | docker | gcrane / crane |
 |---|---|---|
@@ -22,11 +33,7 @@
 
 **docker で digest が変わると実害が 2 つ出ます。** Cloud Run の `@sha256:` 固定参照が
 解決できなくなるのと、再実行時に「コピー先に既にある」と判定されず**毎回同じイメージを
-再送し続ける**ことです。docker を使う場合は起動時に警告を出すようにしました。
-
-```bash
-go install github.com/google/go-containerregistry/cmd/gcrane@latest
-```
+再送し続ける**ことです。実際に一部のイメージで発生していたため、docker 経路は廃止しました。
 
 ### 2. `scope: tagged` で過去ビルドを除外できます（任意）
 
