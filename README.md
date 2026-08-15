@@ -40,8 +40,9 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 - [ ] Python 3.13 以上 / `uv` がインストール済み
 - [ ] `gcloud` / `bq` / `terraform` が PATH に通っている
 - [ ] `bulk_export` を有効化する場合は `gcloud components install config-connector` 済み
-- [ ] **`docker`**（Artifact Registry のイメージ複製に使用。未導入なら警告を出してスキップし、
-      Cloud Run が `Image ... not found` で失敗します）
+- [ ] **`gcrane`（推奨）または `docker`**（Artifact Registry のイメージ複製に使用。
+      どちらも無いと警告を出してスキップし、Cloud Run が `Image ... not found` で失敗します。
+      gcrane の方が速く digest も保たれます → [イメージ複製を速くする](#-イメージ複製を速くする)）
 
 #### B. 認証
 - [ ] `gcloud auth login` と `gcloud auth application-default login`（ADC）でログイン済み
@@ -92,10 +93,16 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
   ```bash
   gcloud components install config-connector
   ```
-- **`docker`**（`data_sync` 有効時に**実質必須**）: Step 3.7 のコンテナイメージ複製で使用します。
-  `gcloud` にイメージコピー機能が無いため docker CLI で `pull` → `tag` → `push` します。
-  未導入の場合は警告を出してスキップしますが、Cloud Run はイメージを digest 固定で参照するため
-  **Step 4 の apply が `Image ... not found` で失敗します**。
+- **`gcrane`（推奨）/ `crane` / `docker`**（`data_sync` 有効時に**実質必須**）:
+  Step 3.7 のコンテナイメージ複製で使用します（`gcloud` にイメージコピー機能が無いため）。
+  **`gcrane` → `crane` → `docker` の順に、PATH にあるものを自動で使います。**
+  ```bash
+  go install github.com/google/go-containerregistry/cmd/gcrane@latest
+  ```
+  どれも未導入の場合は警告を出してスキップしますが、Cloud Run はイメージを digest 固定で
+  参照するため **Step 4 の apply が `Image ... not found` で失敗します**。
+  docker しか無い場合も動きますが、マルチアーキイメージで digest が変わりうる点に注意
+  （詳細は [イメージ複製を速くする](#-イメージ複製を速くする)）。
 
 > ✅ **実行前の自動チェック（fail-fast）**
 > `make plan` / `make run` / `make mock` は開始時に下記を検証し、不備があれば
@@ -310,10 +317,12 @@ cp dst/config.yaml.template dst/config.yaml
         artifact_registry:
           enabled: true            # 省略時も有効。false でイメージ複製のみ無効化
           skip_repos: []           # 複製しないリポジトリ名
+          scope: all               # all（既定・全 digest）| tagged（tag 付きのみ）
     ```
     - イメージは**同じ digest** で複製します。Cloud Run は `image = "...@sha256:<digest>"` で
       固定参照するため、digest が変わると参照が解決できません。
-      複製後に digest を検証し、変わっていれば警告と `gcrane cp` での再実行手順を案内します。
+    - **`gcrane` があれば優先して使います**（無ければ `crane` → `docker` の順）。
+      理由は [イメージ複製を速くする](#-イメージ複製を速くする) を参照。
     - 既に同じ digest があるイメージは再送しません（2 回目以降はほぼ即完了）。
     - **コピー先 SA にコピー元の `roles/artifactregistry.reader` が必要**です
       （`make bootstrap-cross-project` が付与。既存環境では再実行してください）。
@@ -561,6 +570,54 @@ graph LR
 > GKE API は「ノードプール 0 個のクラスタ」を作れない一方、既定プールを残すと
 > `google_container_node_pool` 側の同名プール作成が 409 になるためで、
 > **一時的な既定プールを作って即削除し、実プールは別リソースとして作る**という Terraform の定石です。
+
+#### 🚀 イメージ複製を速くする
+
+Artifact Registry の複製（Step 3.7）は、リポジトリの履歴が長いと件数が膨らみます。
+短縮する手段は 2 つあり、**どちらも「コピー先の動作に必要なイメージ」は落としません**。
+
+**1. `gcrane` を入れる（設定不要・最優先）**
+
+`gcrane` / `crane` が PATH にあれば自動的にそちらを使います（無ければ `docker`）。
+
+| | docker | gcrane / crane |
+|---|---|---|
+| 転送経路 | pull で全レイヤをローカルに落としてから push | **レジストリ間で直接転送**（ローカルに落とさない） |
+| コピー先に既にあるレイヤ | 再送する | **blob mount で再送しない** |
+| マルチアーキイメージ | 単一プラットフォームに落ちて **digest が変わることがある** | マニフェストリストごと転送し **digest を保つ** |
+
+digest が変わると実害が 2 つ出ます。**Cloud Run の `@sha256:` 固定参照が解決できなくなる**のと、
+**再実行時に「コピー先に既にある」と判定されず毎回同じイメージを再送し続ける**ことです
+（docker 利用時は起動時に警告を出します）。
+
+```bash
+go install github.com/google/go-containerregistry/cmd/gcrane@latest
+# または https://github.com/google/go-containerregistry/releases からバイナリを取得
+```
+
+**2. `scope: tagged` で過去ビルドを除外する**
+
+Cloud Build は push のたびに tag を新しいイメージへ移すため、**tag の無い digest =
+新しいビルドに置き換えられた過去ビルド**です。実測では 87 件中 **64 件（74%）** が
+これに該当しました。
+
+```yaml
+steps:
+  data_sync:
+    artifact_registry:
+      scope: tagged     # 既定は all（全 digest を複製）
+```
+
+- **`.tf` が digest 固定で参照しているイメージは、tag が無くても必ず複製します。**
+  Step 3.7 は Step 3（Terraform コード生成）の後に走るので、`active/<src>/*.tf` から
+  「これから apply される内容が必要とする digest」を正確に引けます。
+  よって **`tagged` にしても Step 4 の apply が `Image ... not found` で落ちることはありません**。
+- 除外した件数はログに出ます（黙って減らしません）。
+- 既定を `all` にしているのは、下記を失うためです。**該当するなら `all` のままにしてください**:
+  - **Cloud Run で過去リビジョンへ戻す**操作（コピー先に古い digest が無くなる）
+  - **GKE のワークロード**が tag 無し digest を固定参照している場合
+    （本ツールはクラスタ構成のみコピーするため、Pod の image 参照は `.tf` から引けません。
+    Backup for GKE で復元するワークロードが該当します）
 
 #### 自動ではコピーされないもの（`DIFF.md` の「要対応」に手順つきで出ます）
 

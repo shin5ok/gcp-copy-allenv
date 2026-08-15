@@ -5,6 +5,51 @@
 
 ---
 
+## 2026-08-16 — Artifact Registry のイメージ複製を短縮
+
+イメージ複製（Step 3.7）に時間がかかる場合の短縮手段を 2 つ用意しました。
+**どちらもコピー先の動作に必要なイメージは落としません。**
+
+### 1. `gcrane` があれば自動的に使います（設定不要）
+
+`gcrane` → `crane` → `docker` の順に、PATH にあるものを使います。
+
+| | docker | gcrane / crane |
+|---|---|---|
+| 転送 | pull で全レイヤをローカルに落としてから push | レジストリ間で直接転送 |
+| コピー先に既にあるレイヤ | 再送する | 再送しない |
+| マルチアーキイメージ | **digest が変わることがある** | digest を保つ |
+
+**docker で digest が変わると実害が 2 つ出ます。** Cloud Run の `@sha256:` 固定参照が
+解決できなくなるのと、再実行時に「コピー先に既にある」と判定されず**毎回同じイメージを
+再送し続ける**ことです。docker を使う場合は起動時に警告を出すようにしました。
+
+```bash
+go install github.com/google/go-containerregistry/cmd/gcrane@latest
+```
+
+### 2. `scope: tagged` で過去ビルドを除外できます（任意）
+
+```yaml
+steps:
+  data_sync:
+    artifact_registry:
+      scope: tagged     # 既定は all（従来どおり全 digest を複製）
+```
+
+Cloud Build は push のたびに tag を新しいイメージへ移すため、**tag の無い digest は
+新しいビルドに置き換えられた過去ビルド**です。実測では **87 件中 64 件（74%）** が該当しました。
+
+- **`.tf` が digest 固定で参照しているイメージは、tag が無くても必ず複製します**。
+  そのため `tagged` にしても Terraform の適用が `Image ... not found` で失敗することはありません。
+- 除外した件数はログに出ます。
+- **既定は `all`（従来どおり）です。** `tagged` にすると、Cloud Run で過去リビジョンへ戻す操作と、
+  GKE ワークロードが tag 無し digest を固定参照している場合の復元ができなくなります。
+  該当する場合は `all` のままにしてください。
+- 綴り誤り（`scope: tag` 等）は実行前にエラーで停止します。
+
+---
+
 ## 2026-08-15 — 予約 IP の扱いを修正 / 複製できないリソースを整理（`make run` 失敗 0 件を達成）
 
 `make run` を最後まで失敗なく完走させるための修正です。

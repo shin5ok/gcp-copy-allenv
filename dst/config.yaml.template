@@ -308,12 +308,32 @@ steps:
   data_sync:
     enabled: true
     # [オプション] Artifact Registry のコンテナイメージ複製（同一 digest で複製）。
-    # docker CLI を使用（gcloud にイメージコピー機能が無いため）。docker が無ければ
-    # 警告を出してスキップする。dst SA に src の roles/artifactregistry.reader が必要
+    # gcloud にイメージコピー機能が無いため、gcrane → crane → docker の順に
+    # PATH にあるものを使う（どれも無ければ警告を出してスキップ）。
+    # dst SA に src の roles/artifactregistry.reader が必要
     # （make bootstrap-cross-project が付与）。
+    #
+    # ⚡ gcrane の導入を推奨: レジストリ間で直接転送するのでローカルにイメージを
+    #    落とさず、dst に既にあるレイヤも再送しない。docker の pull → push は
+    #    マルチアーキイメージを単一プラットフォームに落として **digest が変わる**
+    #    ことがあり、そうなると Cloud Run の @sha256: 固定参照が解決できず、
+    #    再実行時も「既存」と判定されずに毎回再送される。
+    #      go install github.com/google/go-containerregistry/cmd/gcrane@latest
+    #
+    # scope: 複製する digest の範囲。
+    #   all    … 全 digest（既定）。移行範囲を勝手に狭めない安全側。
+    #   tagged … tag の付いた digest だけ。Cloud Build は push のたびに tag を
+    #            新しいイメージへ移すので、**tag 無し = 置き換えられた過去ビルド**。
+    #            実測で 87 件中 64 件（74%）を削減できた。
+    #            **`.tf` が digest 固定で参照するイメージは tag が無くても必ず複製する**
+    #            ので、tagged にしても Step 4 の apply が Image not found で落ちることはない。
+    #            失うのは「Cloud Run で過去リビジョンへ戻す」操作と、GKE ワークロードが
+    #            tag 無し digest を固定参照している場合の復元（Pod の image 参照は
+    #            クラスタ構成のみコピーする方針上 .tf から引けないため）。該当するなら all のまま。
     # artifact_registry:
     #   enabled: true
     #   skip_repos: []
+    #   scope: all
 
   # [Step 7] 作成した dst プロジェクトを既存の VPC Service Controls ペリメタへ追加
   # org は一切触らない: アクセスポリシー / ペリメタ自体の作成・削除は行わず、
