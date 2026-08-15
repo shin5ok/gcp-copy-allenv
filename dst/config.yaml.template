@@ -182,6 +182,55 @@ steps:
     # 用途: 前回 make run で生成済みの active を、同じ dst の次回 run で再利用したいとき。
     skip_on_run: false
 
+    # [オプション] 移行範囲の選択（Terraform パイプライン Step 3/4 のみに効く）。
+    # bulk-export が出力するリソース型（google_ で始まる Terraform 型名、fnmatch の
+    # ワイルドカード可）を include（ホワイトリスト）/ exclude（ブラックリスト）で絞る。
+    # 未指定 = 全部移行（従来どおり）。除外した型の欠落は DIFF.md で
+    # 「参考 P3（設定で除外）」に分類され、要対応には出ません。
+    # gcloud ベースのステップ（FW / GCE 復元 / IAM / データ同期 / AR イメージ）は
+    # 従来どおり各 steps.*.enabled で制御します。
+    # 例1: GCE と VPC 関連だけ移行する
+    # resource_types:
+    #   include:
+    #     - "google_compute_*"
+    #     - "google_service_account"
+    # 例2: Cloud Run / Artifact Registry / GKE / monitoring を移行しない
+    # resource_types:
+    #   exclude:
+    #     - "google_cloud_run_*"
+    #     - "google_artifact_registry_*"
+    #     - "google_container_*"
+    #     - "google_monitoring_*"
+
+    # [オプション] bulk-export（CAI エクスポート）自体の規模・再試行の調整。
+    # リソース数が多い src では config-connector の内部タイムアウト（30 分・延長不可）で
+    # `Error executing export:: ... error waiting for operation:` が発生する。
+    # 対策は「エクスポートする量を減らす」こと。
+    #
+    # export_resource_types: エクスポート対象を **KRM Kind** で絞る。
+    #   "auto" … src が対応する Kind を実機から取得して全指定する（推奨）。
+    #            一覧は GCP リソースの Kind のみなので **クラスタ内の k8s オブジェクトが
+    #            自動的に対象外**になり（Backup for GKE の担当）、移行範囲は変わらない。
+    #            Kind を明示すると gcloud が別経路を使うため、タイムアウトの原因である
+    #            「30 分待ちの操作」自体が発生しない。
+    #   明示リスト … `gcloud beta resource-config list-resource-types --project=<src>` の
+    #            Kind 名（大文字始まり）。上の resource_types（Terraform 型）とは別物。
+    # export_resource_types: "auto"
+    # export_resource_types:
+    #   - "ComputeInstance"
+    #   - "ComputeNetwork"
+    #
+    # storage_path: CAI エクスポート先の GCS パス（省略時は一時バケットを毎回自動作成）。
+    #   export_resource_types とは併用不可（gcloud 仕様。併用時は Kind 絞り込みを優先）。
+    #   **書き出し先の指定でありキャッシュではない**（前回結果は再利用されず、
+    #   タイムアウト対策にもならない。一時バケット作成を省く用途）。
+    # storage_path: "gs://my-bucket/prefix"
+    #
+    # 再試行。タイムアウト起因の失敗に短間隔で再試行しても同じ待ちを繰り返すだけなので、
+    # 既定は「2 回 / 180 秒間隔」に抑えてある。
+    # retries: 2
+    # retry_wait_seconds: 180
+
   # [Step 4] dst へIaCでの再現 (Terraform適用)
   terraform_apply:
     enabled: true
@@ -236,8 +285,17 @@ steps:
     enabled: true
 
   # [Step 6] データの移行 (GCS, BigQueryなど)
+  # ※ Artifact Registry のイメージ複製だけは Terraform より前（Step 3.7）に実行される。
+  #    Cloud Run が image を digest 固定で参照するため、apply 後では間に合わないため。
   data_sync:
     enabled: true
+    # [オプション] Artifact Registry のコンテナイメージ複製（同一 digest で複製）。
+    # docker CLI を使用（gcloud にイメージコピー機能が無いため）。docker が無ければ
+    # 警告を出してスキップする。dst SA に src の roles/artifactregistry.reader が必要
+    # （make bootstrap-cross-project が付与）。
+    # artifact_registry:
+    #   enabled: true
+    #   skip_repos: []
 
   # [Step 7] 作成した dst プロジェクトを既存の VPC Service Controls ペリメタへ追加
   # org は一切触らない: アクセスポリシー / ペリメタ自体の作成・削除は行わず、
