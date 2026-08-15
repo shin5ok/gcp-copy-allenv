@@ -34,6 +34,16 @@ global:
   # 人間が理解しやすい実行目的の補足説明がログに詳細に出力されます。
   verbose_logging: true
 
+  # Mock モード (デフォルト: false)
+  # true の場合、外部コマンド (gcloud / terraform / bq / docker) を一切実行せず、
+  # ダミーデータで一連の流れだけをシミュレートします (GCP 未接続でも動く)。
+  #
+  # ⚠️ 通常は **この値を書かず、`make mock` を使ってください**。
+  #    `make mock` はコマンドラインの --mock でこの値を上書きします。
+  #    ここに true を書いたまま忘れると、`make run` が Mock モードで走り
+  #    「成功したのに dst に何も作られていない」状態になります (dry_run と同種の事故)。
+  # mock: false
+
 # ------------------------------------------------------------------------------
 # 1.5. 事前準備設定 (Provisioning / Bootstrap Settings)
 # ------------------------------------------------------------------------------
@@ -136,6 +146,13 @@ rename_rules:
 # 4. ステップ制御 (Step Control)
 # ------------------------------------------------------------------------------
 # 各手順の実行有無 (enabled) および個別設定を行います。
+#
+# ■ enabled を省略した場合の既定値はステップごとに違います
+#   - enable_apis / iam_sync / network_firewall … 既定 **true**
+#     (設定を書かなくても動く。後から追加したステップで、キーの無い既存 config でも
+#      有効になるようにしてある。無効化したいときだけ enabled: false を明記する)
+#   - 上記以外のステップ … 既定 **false**
+#     (キーごと消すと「黙ってスキップ」になります。無効化の意図が無いなら消さないこと)
 steps:
   # [Step 1] Cloud Asset Inventory (CAI) での現状確認
   cai_scan:
@@ -237,6 +254,7 @@ steps:
 
   # [Step 4.5] host project のファイアウォールルール・ポリシーを dst に複製
   # bulk-export は network_firewall_policy を出力しないため gcloud で直接同期する
+  # このキー自体を書かなくても有効（設定不要で動く）。無効化したいときだけ false。
   network_firewall:
     enabled: true
     # Secure tag (tagValues/<数値ID>) は ORG スコープの permanent ID で、
