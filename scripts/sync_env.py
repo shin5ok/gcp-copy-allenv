@@ -114,6 +114,8 @@ _MOCK_KNOWN_PATTERNS = (
     "docker tag",
     "docker push",
     "docker image rm",
+    "gcrane cp",
+    "crane cp",
     "bq ls",
     "bq show",
     "bq mk",
@@ -2123,6 +2125,71 @@ def build_ar_image_copy_plan(
     return plan
 
 
+# `steps.data_sync.artifact_registry.scope` に指定できる値。
+#   all    … 全 digest を複製（既定。移行範囲を勝手に狭めない安全側）
+#   tagged … tag の付いた digest だけ複製。**ただし .tf が digest 固定で参照する
+#            ものは tag の有無に関わらず必ず含める**（含めないと Step 4 の apply が
+#            `Image ... not found` で落ちる）
+_AR_SCOPES = ("all", "tagged")
+
+# `image = "<repo>@sha256:<64hex>"` 等、HCL 内の digest 固定参照。
+# リソース型に依存しない（Cloud Run v1/v2・Job・Functions gen2 いずれも拾う）。
+_TF_IMAGE_DIGEST_RE = re.compile(r'@(sha256:[0-9a-f]{64})')
+
+
+def tf_referenced_image_digests(tf_dir: Optional[str]) -> Set[str]:
+    """Terraform ルート直下の `.tf` が digest 固定で参照するイメージ digest を集める。
+
+    Step 3.7 は Step 3（bulk_export + customize）の**後**に走るので、この時点の
+    `active/<src>/*.tf` は「これから apply される内容」そのもの。ここから引いた
+    digest 集合は **apply が必要とする最小集合と完全に一致する**ため、これさえ
+    複製すれば `scope` をどれだけ絞っても Step 4 は落ちない。
+
+    走査は Terraform ルート直下のみ（terraform 自体がサブディレクトリを再帰
+    しないので customize 後の active は平坦）。
+    """
+    found: Set[str] = set()
+    if not tf_dir or not os.path.isdir(tf_dir):
+        return found
+    for fn in sorted(os.listdir(tf_dir)):
+        if not fn.endswith(".tf"):
+            continue
+        try:
+            with open(os.path.join(tf_dir, fn), encoding="utf-8") as f:
+                found.update(_TF_IMAGE_DIGEST_RE.findall(f.read()))
+        except OSError:
+            continue
+    return found
+
+
+def filter_ar_plan_by_scope(
+    plan: List[Dict[str, Any]], scope: Optional[str],
+    keep_digests: Optional[Set[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """複製プランを `scope` で絞る（純粋関数）。戻り値は (残す, 落とす)。
+
+    `tagged` は「tag 無し = 新しいビルドに tag を奪われた過去ビルド」を落とす。
+    Cloud Build は push のたびに tag を移すため、実測では **87 件中 64 件（74%）**
+    がこれに該当した。
+
+    ただし **`.tf` が参照する digest（keep_digests）は tag が無くても必ず残す**。
+    落とすと apply が `Image ... not found` で失敗する。判定材料が無い側（tag 無し
+    かつ参照も無い）だけを落とすので、誤って落としても壊れるのは「後から手動で
+    古い digest に戻す」操作だけになる。
+    """
+    if str(scope or "all").strip().lower() != "tagged":
+        return list(plan), []
+    keep = set(keep_digests or ())
+    kept: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
+    for e in plan:
+        if e.get("tags") or e.get("digest") in keep:
+            kept.append(e)
+        else:
+            dropped.append(e)
+    return kept, dropped
+
+
 # provider 既定で deletion_protection = true になり、**export には出てこない**型。
 # 既定 true のままだと、apply が途中で失敗して tainted になったリソースを
 # 次回 replace できず `cannot destroy service without setting
@@ -3258,6 +3325,20 @@ def validate_steps_config(config: Dict[str, Any]) -> List[str]:
                 errors.append(
                     f"steps.bulk_export.storage_path は gs:// で始まる GCS パスを"
                     f"指定してください（現在: '{sps}'）")
+
+    # --- Step 3.7: Artifact Registry イメージ複製 ---
+    # scope の綴り間違い（"tag" / "referenced" 等）を黙って "all" に倒すと
+    # 「絞ったつもりが全量」で気付けないため、実行前エラーにする。
+    if enabled('data_sync'):
+        ar = (steps.get('data_sync', {}) or {}).get('artifact_registry', {})
+        if isinstance(ar, dict):
+            sc = ar.get('scope')
+            if sc is not None:
+                scs = str(sc or '').strip().lower()
+                if scs and scs not in _AR_SCOPES:
+                    errors.append(
+                        f"steps.data_sync.artifact_registry.scope の '{sc}' は"
+                        f"未知の値です（指定できるのは {' / '.join(_AR_SCOPES)}）")
 
     # --- Step 7: VPC Service Controls ---
     # access-context-manager は --project を持たないため billing_project が無いと
@@ -9233,16 +9314,28 @@ resource "google_container_cluster" "mock_cluster" {{
             self.dst_logger.info("  複製対象イメージなし")
             self.dst_logger.info("  ✓ Step 3.7 完了")
             return
-        if not shutil.which("docker") and not self.mock:
+        tool = self._ar_copy_tool()
+        if not tool:
             self.dst_logger.warning(
-                f"  docker が PATH にありません。イメージ {len(work)} 件の複製を"
-                f"スキップします（Cloud Run 等が digest 固定でイメージを参照している"
-                f"場合は手動複製が必要: docker pull <src> && docker tag ... && docker push ...）"
+                f"  gcrane / crane / docker のいずれも PATH にありません。"
+                f"イメージ {len(work)} 件の複製をスキップします"
+                f"（Cloud Run 等が digest 固定でイメージを参照している場合は"
+                f"手動複製が必要: `gcrane cp <src> <dst>`）"
             )
             return
+        if tool == "docker":
+            self.dst_logger.warning(
+                "  gcrane / crane が PATH にありません。docker で複製しますが、"
+                "マルチアーキイメージは digest が変わることがあり "
+                "（Cloud Run の `@sha256:` 固定参照が解決できず、再実行時も"
+                "「既存」と判定されず毎回再送されます）。"
+                "gcrane の導入を推奨します: "
+                "https://github.com/google/go-containerregistry/tree/main/cmd/gcrane"
+            )
 
-        # 2. docker 認証: ~/.docker/config.json への書き込みは並列安全でないため、
+        # 2. レジストリ認証: ~/.docker/config.json への書き込みは並列安全でないため、
         #    コピー開始前に対象ホスト分を直列でまとめて済ませる。
+        #    crane も docker の資格情報ヘルパ設定を読むので gcrane 利用時も実施する。
         for host in sorted({it["dst_pkg"].split("/", 1)[0] for it in work}):
             self._soft_run(
                 f"gcloud auth configure-docker {host} --quiet",
@@ -9252,7 +9345,8 @@ resource "google_container_cluster" "mock_cluster" {{
         # 3. コピーフェーズ: 全プロジェクト・全リポジトリのイメージを
         #    flat な単位で並列コピー（プロジェクト間の直列待ちを無くす）。
         self.dst_logger.info(
-            f"  複製対象: {len(work)} イメージ (parallel_jobs={self.parallel_jobs})"
+            f"  複製対象: {len(work)} イメージ"
+            f" (tool={tool}, parallel_jobs={self.parallel_jobs})"
         )
         self._parallel_for_each(
             work, lambda it: self._copy_ar_image(it, it.get("dst_sa")), "ar-copy",
@@ -9276,6 +9370,12 @@ resource "google_container_cluster" "mock_cluster" {{
         if not isinstance(cfg, dict):
             cfg = {}
         skip_repos = {str(r).strip() for r in (cfg.get('skip_repos') or []) if str(r).strip()}
+        scope = str(cfg.get('scope') or 'all').strip().lower()
+        # `.tf` の digest 固定参照は scope に関わらず必ず複製する（落とすと
+        # Step 4 が `Image ... not found` で落ちる）。Step 3 の後に走るので
+        # active/<src> は「これから apply される内容」で確定している。
+        keep_digests = tf_referenced_image_digests(
+            os.path.join(self._tf_base_dir(), "active", src_proj))
 
         # src の一覧取得は soft fail に徹する（`stats.failed` に積まない）。
         # AR を使っていない src では API 自体が無効で 403 になるが、それは
@@ -9331,6 +9431,19 @@ resource "google_container_cluster" "mock_cluster" {{
             if not plan:
                 self.dst_logger.info(f"    {src_path}: イメージ 0 件")
                 continue
+            # scope による間引きは「黙って減らさない」= 落とした件数と理由を必ず出す。
+            plan, dropped = filter_ar_plan_by_scope(plan, scope, keep_digests)
+            if dropped:
+                for _ in dropped:
+                    self.stats.incr("skipped")
+                self.dst_logger.info(
+                    f"    {src_path}: scope=tagged により tag 無し {len(dropped)} 件を"
+                    f"除外（新しいビルドに tag を奪われた過去ビルド。"
+                    f"`.tf` が digest 固定で参照するものは除外していません）"
+                )
+            if not plan:
+                self.dst_logger.info(f"    {src_path}: 複製対象 0 件")
+                continue
             # dst リポジトリは Terraform が作る想定。取りこぼし時のみ補う（冪等）。
             if not self._gcloud_exists(
                 f"gcloud artifacts repositories describe {name} "
@@ -9375,10 +9488,36 @@ resource "google_container_cluster" "mock_cluster" {{
             work.extend(todo)
         return work
 
+    def _ar_copy_tool(self) -> Optional[str]:
+        """イメージ複製に使うツールを決める（gcrane > crane > docker）。
+
+        **gcrane / crane を優先する**理由:
+          - registry → registry で直接転送するのでローカルディスクを介さない
+            （docker は pull で全レイヤを一度ローカルに落とす）
+          - dst に既にあるレイヤは blob mount で再送されない
+          - **マニフェストリスト（マルチアーキ）ごと転送するので digest が変わらない**。
+            docker の pull → push は単一プラットフォームに落として digest が変わる
+            ことがあり、そうなると Cloud Run の `@sha256:` 固定参照が解決できない上、
+            「dst に既存」判定も一致しなくなって**毎回同じイメージを再コピー**する
+            （実測: gcf-artifacts の 4 件が毎回再送されていた）。
+        gcrane は Google 資格情報をそのまま使える AR/GCR 向けの crane。
+        どれも無ければ None（呼び出し側が WARNING + スキップ）。
+        """
+        if self.mock:
+            return "gcrane"
+        for tool in ("gcrane", "crane", "docker"):
+            if shutil.which(tool):
+                return tool
+        return None
+
     def _copy_ar_image(self, item: Dict[str, Any], dst_sa: Optional[str]):
-        """イメージ 1 件を docker pull → tag → push で複製し digest を検証する。"""
+        """イメージ 1 件を複製し digest を検証する（gcrane 優先 / docker は代替）。"""
         src_ref, dst_pkg = item["src_ref"], item["dst_pkg"]
         digest, tags = item["digest"], item["tags"]
+        tool = self._ar_copy_tool()
+        if tool in ("gcrane", "crane"):
+            self._copy_ar_image_with_crane(item, dst_sa, tool)
+            return
         # 既存 digest の除外は _collect_ar_copy_work がリポジトリ単位の一括 list で
         # 済ませている（ここで 1 件ずつ describe すると再実行時に件数分の API 往復
         # が積み上がる）。
@@ -9454,6 +9593,50 @@ resource "google_container_cluster" "mock_cluster" {{
             f" digest を保持するには crane/gcrane で複製してください:"
             f" `gcrane cp {src_ref} {dst_pkg}`"
         )
+
+    def _copy_ar_image_with_crane(
+        self, item: Dict[str, Any], dst_sa: Optional[str], tool: str,
+    ):
+        """gcrane / crane で registry → registry 複製する。
+
+        digest はそのまま保たれるので、docker 経路にあった「push できたが digest が
+        変わった」検証・警告は不要（変わらないことが保証される）。ローカルに
+        イメージを作らないので後片付けも要らない。
+        """
+        src_ref, dst_pkg = item["src_ref"], item["dst_pkg"]
+        digest, tags = item["digest"], item["tags"]
+        # 宛先はタグ参照で指定する（digest は内容から決まるので宛先には書けない）。
+        # tag が無い src（digest 参照専用）は docker 経路と同じ規則で合成する。
+        push_tags = tags or [f"migrated-{digest.split(':', 1)[1][:12]}"]
+        pushed = False
+        for tag in push_tags:
+            dst_tagged = f"{dst_pkg}:{tag}"
+            rc, out, err = self._soft_run(
+                f"{tool} cp {src_ref} {dst_tagged}", "dst", self.dst_logger,
+                impersonate_sa=dst_sa, timeout=1800,
+            )
+            if rc == 0:
+                pushed = True
+                if not self.mock and not self.dry_run:
+                    self.stats.incr("executed")
+                continue
+            detail = f"{err or ''}\n{out or ''}".lower()
+            # docker 経路と同じ扱い: attestation / SBOM は実行可能イメージでは
+            # ないので複製不要（失敗ではなくスキップ）。
+            if "unsupported media type" in detail:
+                self.dst_logger.info(
+                    f"      非イメージ成果物（attestation/SBOM 等）のためスキップ: "
+                    f"{src_ref}"
+                )
+                self.stats.incr("skipped")
+                return
+            self.dst_logger.warning(
+                f"      ✗ {tool} cp 失敗 {dst_tagged}: "
+                f"{_first_meaningful_line(err, out)}"
+            )
+        if pushed:
+            self.dst_logger.info(
+                f"      ✓ 複製 {dst_pkg}@{digest[:19]}… ({tool})")
 
     def _sync_bq(self, src_proj, dst_proj, src_sa, dst_sa):
         self.dst_logger.info("  [BQ] BigQuery 同期")

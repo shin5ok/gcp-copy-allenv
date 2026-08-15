@@ -58,6 +58,8 @@ from scripts.sync_env import (
     ensure_tf_resource_arg,
     parse_ar_repositories,
     build_ar_image_copy_plan,
+    filter_ar_plan_by_scope,
+    tf_referenced_image_digests,
     dedupe_tf_resource_labels,
     strip_hcl_blocks,
     customize_note_row,
@@ -4281,6 +4283,89 @@ class TestBuildArImageCopyPlan:
         assert len(plan) == 1
 
 
+class TestFilterArPlanByScope:
+    def _plan(self):
+        return [
+            {"digest": "sha256:" + "a" * 64, "tags": ["latest"]},
+            {"digest": "sha256:" + "b" * 64, "tags": []},
+            {"digest": "sha256:" + "c" * 64, "tags": []},
+        ]
+
+    def test_scope_all_keeps_everything(self):
+        for scope in (None, "", "all", "ALL"):
+            kept, dropped = filter_ar_plan_by_scope(self._plan(), scope)
+            assert len(kept) == 3 and dropped == []
+
+    def test_scope_tagged_drops_untagged(self):
+        kept, dropped = filter_ar_plan_by_scope(self._plan(), "tagged")
+        assert [e["tags"] for e in kept] == [["latest"]]
+        assert len(dropped) == 2
+
+    def test_tf_referenced_digest_survives_even_without_tag(self):
+        # .tf が digest 固定で参照するものを落とすと apply が Image not found で死ぬ
+        keep = {"sha256:" + "b" * 64}
+        kept, dropped = filter_ar_plan_by_scope(self._plan(), "tagged", keep)
+        assert {e["digest"] for e in kept} == {"sha256:" + "a" * 64, "sha256:" + "b" * 64}
+        assert [e["digest"] for e in dropped] == ["sha256:" + "c" * 64]
+
+    def test_unknown_scope_is_treated_as_all(self):
+        # 綴り誤りは validate_steps_config が実行前に弾く。ここでは全量維持（安全側）
+        kept, dropped = filter_ar_plan_by_scope(self._plan(), "referenced")
+        assert len(kept) == 3 and dropped == []
+
+    def test_input_plan_is_not_mutated(self):
+        plan = self._plan()
+        filter_ar_plan_by_scope(plan, "tagged")
+        assert len(plan) == 3
+
+
+class TestTfReferencedImageDigests:
+    def test_collects_digest_pinned_images(self, temp_dir):
+        d = os.path.join(temp_dir, "active")
+        os.makedirs(d)
+        with open(os.path.join(d, "run.tf"), "w") as f:
+            f.write(
+                'resource "google_cloud_run_v2_service" "s" {\n'
+                '  template { containers {\n'
+                f'    image = "asia-docker.pkg.dev/p/r/app@sha256:{"a" * 64}"\n'
+                '  } }\n}\n'
+            )
+        with open(os.path.join(d, "job.tf"), "w") as f:
+            f.write(f'image = "us-docker.pkg.dev/p/r/j@sha256:{"b" * 64}"\n')
+        # .tf 以外は読まない
+        with open(os.path.join(d, "notes.txt"), "w") as f:
+            f.write(f'@sha256:{"c" * 64}\n')
+        got = tf_referenced_image_digests(d)
+        assert got == {"sha256:" + "a" * 64, "sha256:" + "b" * 64}
+
+    def test_missing_dir_returns_empty(self, temp_dir):
+        assert tf_referenced_image_digests(os.path.join(temp_dir, "nope")) == set()
+        assert tf_referenced_image_digests(None) == set()
+
+
+class TestArScopeValidation:
+    def test_unknown_scope_is_rejected(self, temp_dir):
+        cfg = _full_config(temp_dir, steps={
+            "data_sync": {"enabled": True,
+                          "artifact_registry": {"scope": "referenced"}}})
+        errs = validate_steps_config(cfg)
+        assert any("artifact_registry.scope" in e for e in errs)
+
+    def test_valid_scopes_pass(self, temp_dir):
+        for scope in ("all", "tagged"):
+            cfg = _full_config(temp_dir, steps={
+                "data_sync": {"enabled": True,
+                              "artifact_registry": {"scope": scope}}})
+            assert not [e for e in validate_steps_config(cfg)
+                        if "artifact_registry" in e]
+
+    def test_disabled_step_is_not_checked(self, temp_dir):
+        cfg = _full_config(temp_dir, steps={
+            "data_sync": {"enabled": False,
+                          "artifact_registry": {"scope": "bogus"}}})
+        assert not [e for e in validate_steps_config(cfg) if "artifact_registry" in e]
+
+
 class TestArSyncGuards:
     def _orch(self, temp_dir, steps=None):
         cfg = _full_config(temp_dir, steps=steps or {})
@@ -4884,7 +4969,10 @@ class TestArAttestationSkip:
                 "dst_ref": "h/dst-p/r/app@sha256:" + "ee" * 32,
                 "digest": "sha256:" + "ee" * 32, "tags": []}
         before = o.stats.skipped
+        # 実行環境に gcrane があるかで経路が変わらないよう固定する
+        # （PATH 依存だと gcrane 導入済みのマシンでだけ落ちる）
         with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_ar_copy_tool", return_value="docker"), \
              patch.object(o, "_gcloud_exists", return_value=False):
             o._copy_ar_image(item, None)
 
@@ -4892,6 +4980,93 @@ class TestArAttestationSkip:
         assert o.stats.failed == 0
         # push まで進まない
         assert not any(c.startswith("docker push") for c in calls)
+
+    def test_crane_path_preserves_digest_and_skips_verification(self, temp_dir):
+        """gcrane は digest を保つので describe による検証も後片付けも不要。"""
+        from unittest.mock import patch
+        cfg = _full_config(temp_dir, steps={"data_sync": {"enabled": True}})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        calls = []
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300,
+                  skip_on_dry_run=True):
+            calls.append(cmd)
+            return 0, "", ""
+
+        item = {"src_ref": "h/src-p/r/app@sha256:" + "ee" * 32,
+                "dst_pkg": "h/dst-p/r/app",
+                "dst_ref": "h/dst-p/r/app@sha256:" + "ee" * 32,
+                "digest": "sha256:" + "ee" * 32, "tags": ["v1", "latest"]}
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_ar_copy_tool", return_value="gcrane"), \
+             patch.object(o, "_gcloud_exists", return_value=False) as ex:
+            o._copy_ar_image(item, None)
+
+        assert calls == ["gcrane cp h/src-p/r/app@sha256:" + "ee" * 32 + " h/dst-p/r/app:v1",
+                         "gcrane cp h/src-p/r/app@sha256:" + "ee" * 32 + " h/dst-p/r/app:latest"]
+        assert not any(c.startswith("docker") for c in calls)
+        ex.assert_not_called()   # digest は変わらないので検証しない
+        assert o.stats.failed == 0
+
+    def test_crane_path_synthesizes_tag_for_untagged_image(self, temp_dir):
+        from unittest.mock import patch
+        cfg = _full_config(temp_dir, steps={"data_sync": {"enabled": True}})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+        calls = []
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300,
+                  skip_on_dry_run=True):
+            calls.append(cmd)
+            return 0, "", ""
+
+        digest = "sha256:" + "ab" * 32
+        item = {"src_ref": f"h/src-p/r/app@{digest}", "dst_pkg": "h/dst-p/r/app",
+                "dst_ref": f"h/dst-p/r/app@{digest}", "digest": digest, "tags": []}
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_ar_copy_tool", return_value="gcrane"):
+            o._copy_ar_image(item, None)
+
+        short = digest.split(":", 1)[1][:12]
+        assert calls == [
+            f"gcrane cp h/src-p/r/app@{digest} h/dst-p/r/app:migrated-{short}"]
+
+    def test_crane_unsupported_media_type_is_info_skip(self, temp_dir):
+        from unittest.mock import patch
+        cfg = _full_config(temp_dir, steps={"data_sync": {"enabled": True}})
+        cfg["global"]["dry_run"] = False
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.dst_logger = logging.getLogger("test-dst")
+        o.org_logger = logging.getLogger("test-org")
+
+        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300,
+                  skip_on_dry_run=True):
+            return 1, "", "unsupported media type application/vnd.oci.empty.v1+json"
+
+        item = {"src_ref": "h/src-p/r/app@sha256:" + "ee" * 32,
+                "dst_pkg": "h/dst-p/r/app",
+                "dst_ref": "h/dst-p/r/app@sha256:" + "ee" * 32,
+                "digest": "sha256:" + "ee" * 32, "tags": []}
+        before = o.stats.skipped
+        with patch.object(o, "_soft_run", side_effect=_soft), \
+             patch.object(o, "_ar_copy_tool", return_value="gcrane"):
+            o._copy_ar_image(item, None)
+        assert o.stats.skipped == before + 1
+        assert o.stats.failed == 0
 
 
 class TestArCopyFlatParallel:
