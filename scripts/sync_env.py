@@ -110,10 +110,6 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud artifacts docker images list",
     "gcloud artifacts docker images describe",
     "gcloud auth configure-docker",
-    "docker pull",
-    "docker tag",
-    "docker push",
-    "docker image rm",
     "gcrane cp",
     "crane cp",
     "bq ls",
@@ -3522,6 +3518,7 @@ class MigrationOrchestrator:
         - config-connector … bulk_export (Step 3) の `gcloud ... bulk-export` が依存
         - terraform       … terraform_apply (Step 4)
         - bq              … data_sync (Step 6) の BigQuery 同期
+        - gcrane / crane  … artifact_registry (Step 3.7) のイメージ複製
         """
         if self.mock:
             self.org_logger.info("  [前提チェック] Mock モードのため外部コンポーネントのチェックをスキップ")
@@ -3535,7 +3532,12 @@ class MigrationOrchestrator:
         gcloud_steps = ("cai_scan", "enable_apis", "gce_snapshot", "bulk_export",
                         "gce_restore", "data_sync", "vpc_sc")
 
-        # (ツール名, 必要か, 不足時の説明)
+        # Step 3.7（AR イメージ複製）は data_sync 配下の設定で on/off する。
+        ar_cfg = (steps.get('data_sync', {}) or {}).get('artifact_registry', {})
+        ar_enabled = enabled("data_sync") and not (
+            isinstance(ar_cfg, dict) and ar_cfg.get('enabled') is False)
+
+        # (ツール名 or 代替候補のタプル, 必要か, 不足時の説明)
         required = [
             (
                 "gcloud",
@@ -3559,6 +3561,18 @@ class MigrationOrchestrator:
                 "BigQuery CLI（Google Cloud CLI に同梱）。"
                 "インストール: https://cloud.google.com/sdk/docs/install",
             ),
+            (
+                ("gcrane", "crane"),
+                ar_enabled,
+                "gcrane（または crane）。Step 3.7 の Artifact Registry イメージ複製に必須。"
+                "インストール: `go install "
+                "github.com/google/go-containerregistry/cmd/gcrane@latest`"
+                "（バイナリ: https://github.com/google/go-containerregistry/releases）。"
+                "docker は代替になりません: pull → push でマルチアーキイメージの "
+                "digest が変わり、Cloud Run の `@sha256:` 固定参照が解決できなくなる上、"
+                "再実行時も『コピー先に既にある』と判定されず毎回再送されます。"
+                "イメージ複製が不要なら steps.data_sync.artifact_registry.enabled: false",
+            ),
         ]
 
         missing: List[str] = []
@@ -3566,10 +3580,13 @@ class MigrationOrchestrator:
         for tool, needed, hint in required:
             if not needed:
                 continue
-            if shutil.which(tool) is None:
-                missing.append(f"{tool} … {hint}")
+            # 代替候補が複数あるものは「どれか 1 つあれば OK」
+            names = (tool,) if isinstance(tool, str) else tuple(tool)
+            found = next((n for n in names if shutil.which(n)), None)
+            if found is None:
+                missing.append(f"{' / '.join(names)} … {hint}")
             else:
-                ok.append(tool)
+                ok.append(found)
 
         if missing:
             print("=" * 60, file=sys.stderr)
@@ -9316,22 +9333,20 @@ resource "google_container_cluster" "mock_cluster" {{
             return
         tool = self._ar_copy_tool()
         if not tool:
+            # 実行前の check_prerequisites が同条件で止めるので通常は到達しない。
+            # スキップ（soft fail）にすると「イメージが無いまま apply して
+            # Image not found」になるだけなので、ここでは失敗として記録する。
             self.dst_logger.warning(
-                f"  gcrane / crane / docker のいずれも PATH にありません。"
-                f"イメージ {len(work)} 件の複製をスキップします"
-                f"（Cloud Run 等が digest 固定でイメージを参照している場合は"
-                f"手動複製が必要: `gcrane cp <src> <dst>`）"
+                f"  ✗ gcrane / crane が PATH にありません。"
+                f"イメージ {len(work)} 件を複製できません。"
+                f"インストール: `go install "
+                f"github.com/google/go-containerregistry/cmd/gcrane@latest`"
             )
+            self.stats.add_failure(
+                "AR イメージ複製",
+                f"gcrane / crane が未インストール（対象 {len(work)} 件）")
+            self.stats.incr("failed")
             return
-        if tool == "docker":
-            self.dst_logger.warning(
-                "  gcrane / crane が PATH にありません。docker で複製しますが、"
-                "マルチアーキイメージは digest が変わることがあり "
-                "（Cloud Run の `@sha256:` 固定参照が解決できず、再実行時も"
-                "「既存」と判定されず毎回再送されます）。"
-                "gcrane の導入を推奨します: "
-                "https://github.com/google/go-containerregistry/tree/main/cmd/gcrane"
-            )
 
         # 2. レジストリ認証: ~/.docker/config.json への書き込みは並列安全でないため、
         #    コピー開始前に対象ホスト分を直列でまとめて済ませる。
@@ -9489,124 +9504,47 @@ resource "google_container_cluster" "mock_cluster" {{
         return work
 
     def _ar_copy_tool(self) -> Optional[str]:
-        """イメージ複製に使うツールを決める（gcrane > crane > docker）。
+        """イメージ複製に使うツールを返す（gcrane 優先、無ければ crane）。
 
-        **gcrane / crane を優先する**理由:
-          - registry → registry で直接転送するのでローカルディスクを介さない
-            （docker は pull で全レイヤを一度ローカルに落とす）
-          - dst に既にあるレイヤは blob mount で再送されない
-          - **マニフェストリスト（マルチアーキ）ごと転送するので digest が変わらない**。
-            docker の pull → push は単一プラットフォームに落として digest が変わる
-            ことがあり、そうなると Cloud Run の `@sha256:` 固定参照が解決できない上、
-            「dst に既存」判定も一致しなくなって**毎回同じイメージを再コピー**する
-            （実測: gcf-artifacts の 4 件が毎回再送されていた）。
-        gcrane は Google 資格情報をそのまま使える AR/GCR 向けの crane。
-        どれも無ければ None（呼び出し側が WARNING + スキップ）。
+        **docker は使わない**。pull → push はマルチアーキイメージを単一
+        プラットフォームに落として **digest が変わる**ことがあり、そうなると
+        (1) Cloud Run の `@sha256:` 固定参照が解決できない
+        (2) 「dst に既存」判定も一致せず**毎回同じイメージを再送する**
+        （実測: gcf-artifacts の 4 件が毎回再送されていた）。
+        gcrane/crane は registry → registry でマニフェストリストごと転送するため
+        digest が保たれ、dst に既にあるレイヤも blob mount で再送されない。
+
+        どちらも無ければ None。実行前の `check_prerequisites` が同じ条件で
+        fail-fast するので通常ここには来ない（mock / チェック省略時の保険）。
         """
         if self.mock:
             return "gcrane"
-        for tool in ("gcrane", "crane", "docker"):
+        for tool in ("gcrane", "crane"):
             if shutil.which(tool):
                 return tool
         return None
 
     def _copy_ar_image(self, item: Dict[str, Any], dst_sa: Optional[str]):
-        """イメージ 1 件を複製し digest を検証する（gcrane 優先 / docker は代替）。"""
-        src_ref, dst_pkg = item["src_ref"], item["dst_pkg"]
-        digest, tags = item["digest"], item["tags"]
-        tool = self._ar_copy_tool()
-        if tool in ("gcrane", "crane"):
-            self._copy_ar_image_with_crane(item, dst_sa, tool)
-            return
-        # 既存 digest の除外は _collect_ar_copy_work がリポジトリ単位の一括 list で
-        # 済ませている（ここで 1 件ずつ describe すると再実行時に件数分の API 往復
-        # が積み上がる）。
-        rc, out, err = self._soft_run(
-            f"docker pull {src_ref}", "dst", self.dst_logger,
-            impersonate_sa=dst_sa, timeout=1800,
-        )
-        if rc != 0:
-            detail = f"{err or ''}\n{out or ''}".lower()
-            # Cloud Build が生成する SLSA provenance / SBOM 等の attestation は
-            # 実イメージと同列の digest として AR に並ぶが、実行可能イメージでは
-            # なく（config が application/vnd.oci.empty.v1+json）、docker では
-            # 構造的に pull できない。Cloud Run 等が参照するのは実イメージの
-            # digest なので複製不要 = 失敗ではなくスキップ。
-            if "unsupported media type" in detail:
-                self.dst_logger.info(
-                    f"      非イメージ成果物（attestation/SBOM 等）のためスキップ: "
-                    f"{src_ref}"
-                )
-                self.stats.incr("skipped")
-                return
-            self.dst_logger.warning(
-                f"      ✗ pull 失敗 {src_ref}: {_first_meaningful_line(err, out)}"
-            )
-            return
-        # push には tag が要る。src に tag が無いイメージ（digest 参照専用）は
-        # 複製自体は必要なので、digest 由来の一意なタグを合成して push する。
-        push_tags = tags or [f"migrated-{digest.split(':', 1)[1][:12]}"]
-        pushed = False
-        for tag in push_tags:
-            dst_tagged = f"{dst_pkg}:{tag}"
-            rc_t, _o, _e = self._soft_run(
-                f"docker tag {src_ref} {dst_tagged}", "dst", self.dst_logger,
-                impersonate_sa=dst_sa, timeout=300,
-            )
-            if rc_t != 0:
-                continue
-            rc_p, out_p, err_p = self._soft_run(
-                f"docker push {dst_tagged}", "dst", self.dst_logger,
-                impersonate_sa=dst_sa, timeout=1800,
-            )
-            if rc_p == 0:
-                pushed = True
-                if not self.mock and not self.dry_run:
-                    self.stats.incr("executed")
-            else:
-                self.dst_logger.warning(
-                    f"      ✗ push 失敗 {dst_tagged}: "
-                    f"{_first_meaningful_line(err_p, out_p)}"
-                )
-        # ローカルのディスクを食い続けないよう後片付け（失敗は無視）。
-        self._soft_run(f"docker image rm -f {src_ref}", "dst", self.dst_logger,
-                       impersonate_sa=dst_sa, timeout=300)
-        if not pushed:
-            return
-        # mock / dry-run では `_gcloud_exists` が常に False（作成パスを通すため）なので、
-        # digest 検証をそのまま走らせると必ず「digest が変わりました」の誤警告になる。
-        if self.mock or self.dry_run:
-            self.dst_logger.info(f"      ✓ 複製予定 {dst_pkg}@{digest[:19]}…")
-            return
-        # docker は index → 単一プラットフォームへ落とす等で digest が変わりうる。
-        # Cloud Run は digest 固定参照なので、変わっていたら必ず知らせる。
-        if self._gcloud_exists(
-            f"gcloud artifacts docker images describe {dst_pkg}@{digest} "
-            f"--format='value(image_summary.digest)' --quiet",
-            dst_sa,
-        ):
-            self.dst_logger.info(f"      ✓ 複製 {dst_pkg}@{digest[:19]}…")
-            return
-        self.dst_logger.warning(
-            f"      ⚠ {dst_pkg}: push できましたが digest が変わりました"
-            f"（元: {digest}）。Cloud Run 等の `@sha256:` 固定参照は解決できません。"
-            f" digest を保持するには crane/gcrane で複製してください:"
-            f" `gcrane cp {src_ref} {dst_pkg}`"
-        )
+        """イメージ 1 件を gcrane / crane で registry → registry 複製する。
 
-    def _copy_ar_image_with_crane(
-        self, item: Dict[str, Any], dst_sa: Optional[str], tool: str,
-    ):
-        """gcrane / crane で registry → registry 複製する。
-
-        digest はそのまま保たれるので、docker 経路にあった「push できたが digest が
-        変わった」検証・警告は不要（変わらないことが保証される）。ローカルに
-        イメージを作らないので後片付けも要らない。
+        digest はそのまま保たれるので「push できたが digest が変わった」検証は
+        不要（変わらないことが保証される）。ローカルにイメージを作らないので
+        後片付けも要らない。
         """
+        tool = self._ar_copy_tool()
+        if not tool:
+            # 通常は check_prerequisites が実行前に止めるので到達しない。
+            self.dst_logger.warning(
+                f"      ✗ gcrane / crane が見つからないため複製できません: "
+                f"{item.get('src_ref')}"
+            )
+            self.stats.add_failure("AR イメージ複製", "gcrane / crane が未インストール")
+            self.stats.incr("failed")
+            return
         src_ref, dst_pkg = item["src_ref"], item["dst_pkg"]
         digest, tags = item["digest"], item["tags"]
         # 宛先はタグ参照で指定する（digest は内容から決まるので宛先には書けない）。
-        # tag が無い src（digest 参照専用）は docker 経路と同じ規則で合成する。
+        # tag が無い src（digest 参照専用）は digest 由来の一意なタグを合成する。
         push_tags = tags or [f"migrated-{digest.split(':', 1)[1][:12]}"]
         pushed = False
         for tag in push_tags:

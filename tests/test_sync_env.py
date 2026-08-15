@@ -389,6 +389,44 @@ class TestCheckPrerequisites:
             o.check_prerequisites()
         assert ei.value.code == 1
 
+    def test_missing_gcrane_exits_when_ar_copy_enabled(self, temp_dir, monkeypatch):
+        # docker があっても代替にならない（digest が変わるため）
+        o = self._setup(temp_dir, data_sync={"enabled": True})
+        monkeypatch.setattr(
+            "scripts.sync_env.shutil.which",
+            lambda name: None if name in ("gcrane", "crane") else f"/usr/bin/{name}",
+        )
+        with pytest.raises(SystemExit) as ei:
+            o.check_prerequisites()
+        assert ei.value.code == 1
+
+    def test_crane_alone_satisfies_requirement(self, temp_dir, monkeypatch):
+        o = self._setup(temp_dir, data_sync={"enabled": True})
+        monkeypatch.setattr(
+            "scripts.sync_env.shutil.which",
+            lambda name: None if name == "gcrane" else f"/usr/bin/{name}",
+        )
+        o.check_prerequisites()  # crane があれば通る
+
+    def test_gcrane_not_required_when_ar_copy_disabled(self, temp_dir, monkeypatch):
+        o = self._setup(
+            temp_dir,
+            data_sync={"enabled": True, "artifact_registry": {"enabled": False}},
+        )
+        monkeypatch.setattr(
+            "scripts.sync_env.shutil.which",
+            lambda name: None if name in ("gcrane", "crane") else f"/usr/bin/{name}",
+        )
+        o.check_prerequisites()  # イメージ複製を切っていれば不要
+
+    def test_gcrane_not_required_when_data_sync_disabled(self, temp_dir, monkeypatch):
+        o = self._setup(temp_dir, cai_scan={"enabled": True})
+        monkeypatch.setattr(
+            "scripts.sync_env.shutil.which",
+            lambda name: None if name in ("gcrane", "crane") else f"/usr/bin/{name}",
+        )
+        o.check_prerequisites()
+
 
 # ============================================================
 # check_service_accounts: SA の実在・借用可否・代表権限を実行前に検証
@@ -4944,42 +4982,6 @@ class TestArAttestationSkip:
         assert "sha256:" + "11" * 32 not in digests
         assert "sha256:" + "22" * 32 in digests
         assert "sha256:" + "33" * 32 in digests
-
-    def test_unsupported_media_type_pull_is_info_skip(self, temp_dir):
-        from unittest.mock import patch
-        cfg = _full_config(temp_dir, steps={"data_sync": {"enabled": True}})
-        cfg["global"]["dry_run"] = False
-        path = os.path.join(temp_dir, "config.yaml")
-        _write_yaml(path, cfg)
-        o = MigrationOrchestrator(path)
-        o.load_config()
-        o.dst_logger = logging.getLogger("test-dst")
-        o.org_logger = logging.getLogger("test-org")
-        calls = []
-
-        def _soft(cmd, side, logger, impersonate_sa=None, timeout=300, skip_on_dry_run=True):
-            calls.append(cmd)
-            if cmd.startswith("docker pull"):
-                return 1, "", ("unsupported media type "
-                               "application/vnd.oci.empty.v1+json")
-            return 0, "", ""
-
-        item = {"src_ref": "h/src-p/r/app@sha256:" + "ee" * 32,
-                "dst_pkg": "h/dst-p/r/app",
-                "dst_ref": "h/dst-p/r/app@sha256:" + "ee" * 32,
-                "digest": "sha256:" + "ee" * 32, "tags": []}
-        before = o.stats.skipped
-        # 実行環境に gcrane があるかで経路が変わらないよう固定する
-        # （PATH 依存だと gcrane 導入済みのマシンでだけ落ちる）
-        with patch.object(o, "_soft_run", side_effect=_soft), \
-             patch.object(o, "_ar_copy_tool", return_value="docker"), \
-             patch.object(o, "_gcloud_exists", return_value=False):
-            o._copy_ar_image(item, None)
-
-        assert o.stats.skipped == before + 1
-        assert o.stats.failed == 0
-        # push まで進まない
-        assert not any(c.startswith("docker push") for c in calls)
 
     def test_crane_path_preserves_digest_and_skips_verification(self, temp_dir):
         """gcrane は digest を保つので describe による検証も後片付けも不要。"""
