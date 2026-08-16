@@ -50,6 +50,10 @@ _WRITE_VERBS = (
     # Artifact Registry イメージ複製で使う書込動詞。src 側で誤って実行されないよう
     # 拒否リストに入れる（copy は将来 gcloud に生えた場合の保険）。
     "copy", "push", "tag", "rmi",
+    # Cloud Run / Cloud Functions 複製 (Step 4.7) で使う書込動詞。
+    # `replace` は既に上にあるが `deploy` は無かった。src 側で
+    # `gcloud run deploy` / `gcloud functions deploy` が走ると src を壊すため追加。
+    "deploy",
 )
 
 # Mock モード時に「分かっている」と判定するコマンド先頭パターン。
@@ -100,6 +104,13 @@ _MOCK_KNOWN_PATTERNS = (
     "gcloud run services get-iam-policy",
     "gcloud run services describe",
     "gcloud run services add-iam-policy-binding",
+    "gcloud run services replace",
+    "gcloud run jobs list",
+    "gcloud run jobs describe",
+    "gcloud run jobs replace",
+    "gcloud functions list",
+    "gcloud functions describe",
+    "gcloud functions deploy",
     "gcloud iam service-accounts create",
     "gcloud projects get-iam-policy",
     "gcloud projects add-iam-policy-binding",
@@ -199,7 +210,9 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
     # --- secret / functions / build（export されない = 欠落は要対応で出る） ---
     "secretmanager.googleapis.com/Secret":        "terraform_apply",
     "secretmanager.googleapis.com/SecretVersion": "terraform_apply",  # classify で Secret 本体へ集約
-    "cloudfunctions.googleapis.com/Function":     "terraform_apply",
+    # Step 4.7 serverless_sync が gen1/gen2 ともソース zip から dst で再ビルドする。
+    # 複製できなかったものは同ステップが DIFF 注記（要対応）に出す。
+    "cloudfunctions.googleapis.com/Function":     "serverless_sync",
     "cloudbuild.googleapis.com/BuildTrigger":     "terraform_apply",
     "cloudbuild.googleapis.com/GlobalTriggerSettings": None,  # プロジェクト設定シングルトン。作成不可
     # --- dataplex / servicedirectory（大半は自動生成。classify で判定） ---
@@ -228,9 +241,11 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
     "dns.googleapis.com/ManagedZone":        "terraform_apply",  # public は customize が skip + DIFF 要対応
     "dns.googleapis.com/ResourceRecordSet":  None,               # zone とセットで手動移行（委任切替が要る）
     # --- cloud run ---
-    # bulk-export はリージョンによって取りこぼす（regression: us-central1 の
-    # www-1 / test-1 が未出力）。欠落は DIFF 要対応で手動作成を案内する。
-    "run.googleapis.com/Service":  "terraform_apply",
+    # bulk-export は Cloud Run を **一切出力しない**（gcloud の asset type → KRM
+    # 変換テーブルに run.googleapis.com/Service が無く、--resource-types 経路の
+    # CAI list で落ちる）。Step 4.7 serverless_sync が Knative YAML で複製する。
+    # 複製できなかったサービスは同ステップが DIFF 注記（要対応）に出す。
+    "run.googleapis.com/Service":  "serverless_sync",
     "run.googleapis.com/Revision": None,   # リビジョン履歴。デプロイで再生成される
     # --- iam ---
     "iam.googleapis.com/Role":                "terraform_apply",       # bulk-export が custom role を出力
@@ -256,6 +271,10 @@ _ASSET_COVERAGE: Dict[str, Optional[str]] = {
 # （手動対応不要）。DIFF.md からは除外し件数だけ集計する。
 _AUTO_HANDLED_STEPS = frozenset({
     "gce_restore", "network_firewall", "data_sync", "enable_apis",
+    # Step 4.7。複製できたサービスは DIFF に出さず、複製を見送ったものは
+    # 同ステップが `.serverless_notes.json` に要対応の注記を残す
+    # （= 「全部自動」ではなく「全部どちらかで可視化される」ので auto 扱いでよい）。
+    "serverless_sync",
 })
 
 
@@ -1448,9 +1467,12 @@ def classify_missing_asset(
     if (atype == "cloudfunctions.googleapis.com/Function"
             and run_service_names and short in run_service_names):
         return ref(
-            "gen2 Cloud Functions。実体は同名の Cloud Run サービス"
-            "（別行の run.googleapis.com/Service）で、二重計上を避けるため集約。",
-            "Cloud Run サービス側の行に従って対応する。",
+            "gen2 Cloud Functions。実体は Cloud Run サービスで、二重計上を"
+            "避けるため集約。Step 4.7 (serverless_sync) は gen2 Function の実体を "
+            "Run として複製しない（Function ではない Run サービスが dst に生えて"
+            "トリガーと管理単位を失うため）。",
+            "DIFF の注記セクションに出る同名 Cloud Run サービスの要対応"
+            "（`gcloud functions deploy` の手順）に従う。",
             priority=1)
 
     # Dataplex Universal Catalog のシステム EntryGroup（@bigquery / @storage 等）は
@@ -1892,6 +1914,13 @@ _SRC_PERMS_BY_STEP = {
     # roles/viewer に含まれるが、bootstrap_cross_project.sh の絞ったカスタムロール
     # (migrationSrcReader) を使う場合は明示付与が要るため preflight で検査する。
     "iam_sync":         ("resourcemanager.projects.getIamPolicy",),
+    # serverless_sync (`run.services.list` / `.get`) は **あえて入れない**。
+    # 既定 true のステップなので、ここに入れると Cloud Run を使っていない移行でも
+    # 権限が要求され、`bootstrap_cross_project.sh` の絞ったカスタムロール
+    # (migrationSrcReader) を使う既存環境は bootstrap 再実行まで全体が止まる。
+    # `serviceusage.services.list` (enable_apis) と同じ扱いで、無ければ
+    # step_serverless_sync が「一覧取得に失敗 → WARNING + スキップ」に倒す
+    # （bootstrap 側の CUSTOM_PERMS には追加済み）。
 }
 _DST_BASELINE_PERMS = ("resourcemanager.projects.get",)
 _DST_PERMS_BY_STEP = {
@@ -1908,6 +1937,11 @@ _DST_PERMS_BY_STEP = {
     # 権限の有無は step_iam_sync が dst プロジェクト単位で確認し、
     # 無ければ「スキップ + 手動コマンド案内」に倒す。
     "iam_sync":         ("iam.serviceAccounts.create",),
+    # serverless_sync (`run.services.create` 等) も src 側と同じ理由で入れない。
+    # 既定 true のため、Cloud Run を使わない移行まで dst SA に run 権限を要求して
+    # しまう。実行 SA 指定に要る `iam.serviceAccounts.actAs` は SA リソース側の
+    # 権限で project 単位の testIamPermissions では判定できないので、
+    # いずれも不足していれば `replace` が本来のエラーで教えてくれる方に倒す。
 }
 
 # `*_impersonate_service_account` 未指定でローカル認証 (gcloud のアクティブ
@@ -1945,13 +1979,30 @@ _SRC_DANGEROUS_PERMS = (
 )
 
 
+# src からローカルへの GCS ダウンロードだけを許可する例外パターン。
+# フラグを除いたトークン列に対して照合する（`is_src_read_only` 内で使用）。
+# **コピー先が `gs://` でないこと**が read-only である根拠なので、この条件を
+# 緩めてはいけない（緩めると src バケットへの書き込みが素通りする）。
+_SRC_GCS_DOWNLOAD_RE = re.compile(
+    r'^gcloud storage cp gs://\S+ (?!gs://)\S+$')
+
+
 def is_src_read_only(cmd: str) -> bool:
     """src 側に対して安全（read-only）なコマンドかを判定する。
 
     判定ロジック:
-    - コマンド中に書き込み動詞（_WRITE_VERBS）が単語境界で出現したら NG。
+    - コマンド中に書き込み動詞（_WRITE_VERBS）がサブコマンド位置で出現したら NG。
       ただしフラグ値（例: `--format=value(creationTimestamp)`）に動詞が
       含まれるケースを誤検知しないよう、`--` で始まる引数は除外して判定する。
+
+    動詞の境界は `\b` ではなく「**左に `-` . / : @ が無い**」で判定する。
+    gcloud のサブコマンドは必ず空白区切りのトークン先頭に現れるため、
+    ハイフン等の**後ろ**に来た動詞はリソース名の一部であって動詞ではない
+    （regression: AR の既定リポジトリ `cloud-run-source-deploy` が `deploy` に
+    誤マッチし、read-only の `artifacts docker images list` が拒否された）。
+    逆に**右**のハイフンは許す: `attach-disk` / `add-iam-policy-binding` /
+    `create-with-container` のように、動詞が接頭辞になる実在の書込サブコマンドを
+    取り逃さないため。
     """
     # `--xxx=yyy` および `--xxx yyy` の値部分は除外して動詞検査する
     tokens = []
@@ -1962,8 +2013,14 @@ def is_src_read_only(cmd: str) -> bool:
             continue
         tokens.append(tok)
     body = " ".join(tokens)
+    # 明示的な例外: GCS からの**ダウンロード**（コピー先がローカルパス）は read-only。
+    # Step 4.7 が Cloud Functions のソース zip を src から読むのに要る。
+    # `cp` は書込動詞なので、宛先が `gs://` でないことを構文で確認して許可する
+    # （`cp <local> gs://src/...` と `cp gs://a gs://b` は引き続き拒否される）。
+    if _SRC_GCS_DOWNLOAD_RE.match(body):
+        return True
     for verb in _WRITE_VERBS:
-        if re.search(rf"\b{re.escape(verb)}\b", body):
+        if re.search(rf"(?<![\w\-./:@]){re.escape(verb)}(?![\w./:@])", body):
             return False
     return True
 
@@ -2009,6 +2066,9 @@ _STEP_DST_APIS: Dict[str, Tuple[str, ...]] = {
     "gce_restore":      ("compute.googleapis.com",),
     "iam_sync":         ("iam.googleapis.com",),
     "data_sync":        ("storage.googleapis.com", "bigquery.googleapis.com"),
+    # Functions の deploy は dst で Cloud Build が走り、成果物を AR に置く。
+    "serverless_sync":  ("run.googleapis.com", "cloudfunctions.googleapis.com",
+                         "cloudbuild.googleapis.com", "artifactregistry.googleapis.com"),
 }
 
 # src で有効でも dst には複製しない API。追加は steps.enable_apis.skip_apis でも可能。
@@ -2527,6 +2587,713 @@ def run_service_public_invoker_members(text: Optional[str]) -> List[str]:
     return sorted(members)
 
 
+# ---------------------------------------------------------------------------
+# Cloud Run サービス複製 (Step 4.7 / serverless_sync) の純粋関数
+# ---------------------------------------------------------------------------
+# bulk-export (config-connector) は Cloud Run を **1 件も出力しない**。
+# gcloud の asset type → KRM Kind 変換テーブルに `run.googleapis.com/Service`
+# が無く、`--resource-types`（= `export_resource_types: "auto"`）を渡す経路では
+# gcloud 側の CAI list を作る段階で落ちるため（`_BuildAssetTypeFilterFromKind(
+# ["RunService"])` → `[]`）。config-connector バイナリの print-resources には
+# RunService があるが `SupportsBulkExport: false` と申告している。
+# `--resource-types` を外せばバイナリ側の経路で一部は出るが、リージョンによって
+# 取りこぼす（実測 5 件中 3 件）うえ、config-connector の 30 分 timeout が
+# 再発するため採らない。
+#
+# 代わりに Cloud Run 自身の宣言的 API（Knative YAML）で複製する:
+#     describe --format=export → 書き換え → replace
+#
+# **`replace` は「送った spec が正」**なので、書き換えで落としたフィールドは dst で
+# 既定値に戻る。したがって「知らないもの・移せないものは複製しない」allow-list 方式に
+# 倒し、扱えないサービスは DIFF 要対応へ回す（黙って劣化コピーを作らない）。
+
+# export に残るが dst では意味を持たない / src を指すフィールド。
+# `run.googleapis.com/build-*` は前方一致で落とす（ビルド系は src の build/source を指す）。
+_RUN_DROP_ANNOTATION_PREFIXES = ("run.googleapis.com/build-",)
+_RUN_DROP_ANNOTATIONS = (
+    "run.googleapis.com/urls",             # 出力専用（dst では別 URL になる）
+    "run.googleapis.com/ingress-status",   # 出力専用（ingress の実効値）
+    "run.googleapis.com/operation-id",     # 直近オペレーションの ID
+    "serving.knative.dev/creator",
+    "serving.knative.dev/lastModifier",
+    "client.knative.dev/user-image",
+)
+# revision テンプレート側のラベル。nonce はデプロイごとの一意値、
+# startupProbeType は Cloud Run が付ける出力専用ラベル。
+_RUN_DROP_LABELS = (
+    "client.knative.dev/nonce",
+    "run.googleapis.com/startupProbeType",
+)
+# サーバ採番のメタデータ。残すと replace が conflict / invalid になりうる。
+_RUN_DROP_METADATA_KEYS = (
+    "uid", "resourceVersion", "generation", "creationTimestamp",
+    "selfLink", "managedFields", "deletionTimestamp",
+)
+
+# Phase 1 が正しく移せないフィールド。**検出したらそのサービスは複製しない**。
+# 黙って落とすと「dst に存在するが壊れている」サービスができ、CAI 差分にも
+# 出なくなるので最悪（気付けない）。DIFF 要対応に回して人間に判断させる。
+_RUN_UNSUPPORTED_ANNOTATIONS: Dict[str, str] = {
+    "run.googleapis.com/vpc-access-connector":
+        "VPC アクセスコネクタ参照（src プロジェクトのコネクタを指す）",
+    "run.googleapis.com/network-interfaces":
+        "Direct VPC egress（network / subnetwork の src 参照を含む）",
+    "run.googleapis.com/cloudsql-instances":
+        "Cloud SQL 接続（<project>:<region>:<instance> の src 参照）",
+    "run.googleapis.com/binary-authorization":
+        "Binary Authorization（dst にポリシー / attestor が無い）",
+    "run.googleapis.com/encryption-key":
+        "CMEK（dst に KMS 鍵が無い）",
+}
+
+# Artifact Registry / Container Registry のイメージ参照。project 部分だけ差し替える。
+_AR_IMAGE_RE = re.compile(r'^([a-z0-9-]+-docker\.pkg\.dev)/([^/]+)/(.+)$')
+_GCR_IMAGE_RE = re.compile(r'^((?:[a-z0-9-]+\.)?gcr\.io)/([^/]+)/(.+)$')
+
+# serviceAccountName の形。user-managed は `_USER_MANAGED_SA_RE` を使う。
+_RUN_DEFAULT_COMPUTE_SA_RE = re.compile(
+    r'^(\d+)-compute@developer\.gserviceaccount\.com$')
+_RUN_APPSPOT_SA_RE = re.compile(
+    r'^([a-z][-a-z0-9]{4,28}[a-z0-9])@appspot\.gserviceaccount\.com$')
+
+# 平文 env に入っていたら秘匿情報の可能性が高い変数名。忠実複製はするが
+# 「新 ORG に秘密が増える」ことを必ず可視化するためのヒューリスティック。
+_RUN_SECRETISH_ENV_RE = re.compile(
+    r'(SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|API[-_]?KEY|ACCESS[-_]?KEY|'
+    r'PRIVATE[-_]?KEY|WEBHOOK|SIGNING)', re.I)
+
+
+def parse_gen2_function_run_services(text: Optional[str]) -> Set[Tuple[str, str]]:
+    """`gcloud functions list --format=json` から gen2 Function の実体 Cloud Run
+    サービス (name, region) の集合を返す（純粋関数）。
+
+    gen2 Cloud Functions の実体は Cloud Run サービスなので、Cloud Run 側で
+    そのまま複製すると dst には「Function ではない Run サービス」が生えて
+    二重管理になる。判定は `serviceConfig.service`
+    （`projects/<p>/locations/<region>/services/<name>` の**正式なリソース名**）を
+    使う。同名判定にすると、たまたま同名の利用者サービスまで巻き込む。
+    """
+    try:
+        data = json.loads(text) if text else []
+    except (ValueError, TypeError):
+        return set()
+    out: Set[Tuple[str, str]] = set()
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("environment") or "").upper() not in ("GEN_2", "GEN2"):
+            continue
+        svc = ((item.get("serviceConfig") or {}).get("service") or "").strip()
+        m = re.match(r'^projects/[^/]+/locations/([^/]+)/services/([^/]+)$', svc)
+        if m:
+            out.add((m.group(2), m.group(1)))
+            continue
+        # serviceConfig.service が空の場合は function 名から導出する
+        # （gen2 は function 名 = Run サービス名）。
+        m2 = re.match(r'^projects/[^/]+/locations/([^/]+)/functions/([^/]+)$',
+                      (item.get("name") or "").strip())
+        if m2:
+            out.add((m2.group(2), m2.group(1)))
+    return out
+
+
+def _iter_run_pod_specs(node: Any) -> List[Dict[str, Any]]:
+    """`containers` を持つ dict をすべて返す（純粋関数）。
+
+    Knative の入れ子はリソース種で違う:
+      Service … spec.template.spec（RevisionSpec）
+      Job     … spec.template.spec.template.spec（TaskSpec。Execution を挟む）
+    パスを決め打ちすると Job で全部素通りするので、構造ではなく
+    「containers を持つ dict」で探す。
+    """
+    found: List[Dict[str, Any]] = []
+    if isinstance(node, dict):
+        if isinstance(node.get("containers"), list):
+            found.append(node)
+        for v in node.values():
+            found.extend(_iter_run_pod_specs(v))
+    elif isinstance(node, list):
+        for v in node:
+            found.extend(_iter_run_pod_specs(v))
+    return found
+
+
+def _iter_run_metadata(node: Any) -> List[Dict[str, Any]]:
+    """`metadata` dict をすべて返す（トップレベル + テンプレート階層。純粋関数）。"""
+    found: List[Dict[str, Any]] = []
+    if isinstance(node, dict):
+        meta = node.get("metadata")
+        if isinstance(meta, dict):
+            found.append(meta)
+        for v in node.values():
+            found.extend(_iter_run_metadata(v))
+    elif isinstance(node, list):
+        for v in node:
+            found.extend(_iter_run_metadata(v))
+    return found
+
+
+def run_service_unsupported_reasons(doc: Optional[Dict[str, Any]]) -> List[str]:
+    """本ツールが複製できない理由を列挙する（純粋関数。空なら複製可）。
+
+    Cloud Run の **サービスとジョブの両方**に使う（入れ子の深さが違うだけで
+    判定対象のフィールドは同じ）。
+
+    「移せないものは複製しない」ための allow-list ガード。ここで拾えないまま
+    replace すると、参照だけ src を指した壊れたリソースが dst にでき、
+    CAI 差分にも現れなくなる（= 誰も気付けない）。
+    """
+    reasons: List[str] = []
+    if not isinstance(doc, dict):
+        return ["describe --format=export の内容を解釈できなかった"]
+
+    for meta in _iter_run_metadata(doc):
+        anns = meta.get("annotations") or {}
+        if not isinstance(anns, dict):
+            continue
+        for key, why in _RUN_UNSUPPORTED_ANNOTATIONS.items():
+            if key in anns:
+                reasons.append(f"{why} [{key}]")
+
+    for pod in _iter_run_pod_specs(doc):
+        containers = pod.get("containers") or []
+        if len(containers) > 1:
+            reasons.append(
+                f"複数コンテナ（サイドカー {len(containers)} 個）。"
+                f"ボリューム共有 / 起動順の再現を保証できない")
+        for c in containers:
+            if not isinstance(c, dict):
+                continue
+            for e in c.get("env") or []:
+                if isinstance(e, dict) and (e.get("valueFrom") or {}).get("secretKeyRef"):
+                    reasons.append(
+                        f"Secret Manager 参照の環境変数 `{e.get('name', '?')}`。"
+                        f"本ツールは Secret の値を複製しない方針のため dst に存在しない")
+            limits = ((c.get("resources") or {}).get("limits") or {})
+            if any(str(k).endswith("gpu") or "nvidia" in str(k) for k in limits):
+                reasons.append("GPU 割り当て（dst の quota / 対応リージョンを検証できない）")
+
+        for v in pod.get("volumes") or []:
+            if not isinstance(v, dict):
+                continue
+            kinds = [k for k in v.keys() if k != "name"]
+            if any(k != "emptyDir" for k in kinds):
+                reasons.append(
+                    f"ボリューム `{v.get('name', '?')}`（{', '.join(sorted(kinds)) or '?'}）。"
+                    f"Secret / GCS / NFS などの外部参照は dst で再作成が要る")
+
+    traffic = (doc.get("spec") or {}).get("traffic") or []
+    if any(isinstance(t, dict) and (t.get("revisionName") or t.get("tag"))
+           for t in traffic):
+        reasons.append(
+            "リビジョン固定 / タグ付きのトラフィック分割。"
+            "dst には同じリビジョンが存在せず、latest に倒すと分割意図が失われる")
+
+    # 重複（複数コンテナ × 同じ理由など）は畳む。順序は安定させる。
+    seen: Set[str] = set()
+    uniq: List[str] = []
+    for r in reasons:
+        if r not in seen:
+            seen.add(r)
+            uniq.append(r)
+    return uniq
+
+
+def rewrite_run_image_ref(
+    image: str, proj_map: Dict[str, str],
+) -> Tuple[str, Optional[str]]:
+    """コンテナイメージ参照の project 部分を dst へ置換する（純粋関数）。
+
+    戻り値: (置換後のイメージ, 置換しなかった場合の理由 or None)
+
+    - 対象は Artifact Registry (`<loc>-docker.pkg.dev/<project>/...`) と
+      Container Registry (`[<loc>.]gcr.io/<project>/...`) のうち
+      **project_mapping にある src プロジェクト**のものだけ。
+    - タグ / `@sha256:` は触らない。Step 3.7 が gcrane で **digest 不変**の
+      コピーをするため、digest 参照はそのまま dst で解決できる
+      （docker pull→push 経路だと digest が変わるので、この前提は
+      「転送ツールは gcrane / crane のみ」というルールに依存している）。
+    - mapping 外 / 第三者レジストリ（docker.io など）は書き換えない。
+      dst からも同じ参照で引けるので、触ると逆に壊す。
+    """
+    image = (image or "").strip()
+    if not image:
+        return image, "イメージ参照が空"
+    for rx in (_AR_IMAGE_RE, _GCR_IMAGE_RE):
+        m = rx.match(image)
+        if not m:
+            continue
+        host, project, rest = m.group(1), m.group(2), m.group(3)
+        if project not in proj_map:
+            return image, (f"イメージのプロジェクト '{project}' が project_mapping に"
+                           f"無いため書き換えません")
+        return f"{host}/{proj_map[project]}/{rest}", None
+    return image, None
+
+
+def resolve_dst_run_service_account(
+    sa_email: str, proj_map: Dict[str, str], num_map: Dict[str, str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Cloud Run の serviceAccountName を dst 用に解決する（純粋関数）。
+
+    **GCE 用の `_resolve_dst_vm_service_account` は流用しないこと**。あちらは
+    「default compute SA は除去」「dst に無ければ空 SA を冪等作成」という VM 固有の
+    挙動を持ち、Cloud Run に当てるとサービスの実行権限が黙って変わる
+    （実測: 対象 5 サービス中 4 件が default compute SA を使っていた）。
+
+    戻り値: (dst の SA email, 注記)
+      - email が None のときは **serviceAccountName を YAML から外す**。
+        Cloud Run は未指定なら dst プロジェクトの既定 compute SA を使うため、
+        「src の既定 SA → dst の既定 SA」と意味が揃う（安全側）。
+      - 注記が非 None なら DIFF / ログに出す。
+    """
+    sa_email = (sa_email or "").strip()
+    if not sa_email:
+        return None, None
+
+    m = _USER_MANAGED_SA_RE.match(sa_email)
+    if m:
+        account_id, project = m.group(1), m.group(2)
+        if project in proj_map:
+            return f"{account_id}@{proj_map[project]}.iam.gserviceaccount.com", None
+        return None, (f"実行 SA `{sa_email}` のプロジェクト '{project}' が "
+                      f"project_mapping に無いため引き継げません。"
+                      f"dst の既定 compute SA で動作します")
+
+    m = _RUN_DEFAULT_COMPUTE_SA_RE.match(sa_email)
+    if m:
+        src_num = m.group(1)
+        if src_num in num_map:
+            return f"{num_map[src_num]}-compute@developer.gserviceaccount.com", None
+        return None, (f"実行 SA `{sa_email}` は src の既定 compute SA ですが "
+                      f"プロジェクト番号を解決できませんでした。"
+                      f"dst の既定 compute SA で動作します（意味は同じ）")
+
+    m = _RUN_APPSPOT_SA_RE.match(sa_email)
+    if m:
+        project = m.group(1)
+        if project in proj_map:
+            return f"{proj_map[project]}@appspot.gserviceaccount.com", None
+        return None, (f"実行 SA `{sa_email}` のプロジェクト '{project}' が "
+                      f"project_mapping に無いため引き継げません。"
+                      f"dst の既定 compute SA で動作します")
+
+    return None, (f"実行 SA `{sa_email}` を解釈できませんでした。"
+                  f"dst の既定 compute SA で動作します")
+
+
+def run_secretish_env_names(doc: Optional[Dict[str, Any]]) -> List[str]:
+    """平文 env のうち秘匿情報らしい変数名を返す（純粋関数）。
+
+    値は src と同じに複製する（`roles/owner` / 公開 invoker と同じ「忠実再現 +
+    警告」方針）が、**新 ORG に秘密が増えること自体**を必ず見せるための材料。
+    """
+    names: List[str] = []
+    if not isinstance(doc, dict):
+        return names
+    for pod in _iter_run_pod_specs(doc):
+        for c in pod.get("containers") or []:
+            if not isinstance(c, dict):
+                continue
+            for e in c.get("env") or []:
+                if not isinstance(e, dict) or "value" not in e:
+                    continue
+                name = str(e.get("name") or "")
+                if name and _RUN_SECRETISH_ENV_RE.search(name):
+                    names.append(name)
+    return sorted(set(names))
+
+
+def _drop_keys(d: Any, keys: Iterable[str]) -> None:
+    """dict から指定キーを in-place で除去する（存在しなくてもよい）。"""
+    if not isinstance(d, dict):
+        return
+    for k in keys:
+        d.pop(k, None)
+
+
+def _clean_run_annotations(anns: Any) -> None:
+    """annotations から出力専用 / src 固有のものを in-place で除去する。"""
+    if not isinstance(anns, dict):
+        return
+    for k in list(anns.keys()):
+        if k in _RUN_DROP_ANNOTATIONS or any(
+                str(k).startswith(p) for p in _RUN_DROP_ANNOTATION_PREFIXES):
+            anns.pop(k, None)
+
+
+def rewrite_run_service_yaml(
+    doc: Dict[str, Any],
+    src_project: str,
+    dst_project: str,
+    proj_map: Dict[str, str],
+    num_map: Dict[str, str],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """`gcloud run {services,jobs} describe --format=export` を dst 用に書き換える。
+
+    Cloud Run の **サービスとジョブの両方**に使う（テンプレートの入れ子の深さが
+    違うだけなので、パス決め打ちではなく `_iter_run_pod_specs` /
+    `_iter_run_metadata` で走査する。決め打ちにすると Job で全部素通りする）。
+
+    戻り値: (書き換え後の doc, 人間向け注記のリスト)
+
+    書き換えるのは以下だけ。**未知のフィールドは触らずそのまま残す**
+    （知らないものを勝手に消すと replace で既定値に戻ってしまう）。
+      1. metadata.namespace → dst プロジェクト ID（fail-closed。src を残さない）
+      2. 出力専用 / src 固有の annotation・label・メタデータを除去
+      3. テンプレート側の name（リビジョン / 実行名）を除去 → dst で新規採番
+      4. コンテナイメージの project を dst へ（digest は保持）
+      5. serviceAccountName を dst 用に解決（未解決なら外して dst 既定 SA）
+      6. env の値が src プロジェクト ID と完全一致するものを dst へ
+      7. traffic にリビジョン固定があれば latest 100% に倒す（サービスのみ。保険で、
+         通常は `run_service_unsupported_reasons` が先に弾く）
+    """
+    import copy as _copy
+    doc = _copy.deepcopy(doc if isinstance(doc, dict) else {})
+    notes: List[str] = []
+
+    top_meta = doc.setdefault("metadata", {})
+    # 1. namespace は必ず dst に向ける（未解決で src のまま残さない）
+    top_meta["namespace"] = dst_project
+    doc.pop("status", None)
+
+    # 2/3. metadata の掃除。トップレベルの name は**リソース名なので残す**が、
+    #      テンプレート側の name はリビジョン / 実行の名前なので落として
+    #      dst に採番させる（src 名を残すと衝突 / 命名規則違反になる）。
+    for meta in _iter_run_metadata(doc):
+        _clean_run_annotations(meta.get("annotations"))
+        _drop_keys(meta, _RUN_DROP_METADATA_KEYS)
+        if isinstance(meta.get("annotations"), dict) and not meta["annotations"]:
+            meta.pop("annotations", None)
+        labels = meta.get("labels")
+        if isinstance(labels, dict):
+            _drop_keys(labels, _RUN_DROP_LABELS)
+            if not labels:
+                meta.pop("labels", None)
+        if meta is not top_meta and meta.pop("name", None):
+            notes.append("テンプレートのリビジョン / 実行名を dst で新規採番するため除去")
+
+    for pod in _iter_run_pod_specs(doc):
+        # 4. イメージ参照
+        for c in pod.get("containers") or []:
+            if not isinstance(c, dict) or not c.get("image"):
+                continue
+            new_image, why = rewrite_run_image_ref(str(c["image"]), proj_map)
+            if why:
+                notes.append(why)
+            elif new_image != c["image"]:
+                notes.append(f"イメージを dst へ: {c['image']} → {new_image}")
+            c["image"] = new_image
+
+        # 5. 実行サービスアカウント
+        if pod.get("serviceAccountName"):
+            dst_sa_email, note = resolve_dst_run_service_account(
+                str(pod["serviceAccountName"]), proj_map, num_map)
+            if note:
+                notes.append(note)
+            if dst_sa_email:
+                if dst_sa_email != pod["serviceAccountName"]:
+                    notes.append(
+                        f"実行 SA を dst へ: {pod['serviceAccountName']} "
+                        f"→ {dst_sa_email}")
+                pod["serviceAccountName"] = dst_sa_email
+            else:
+                pod.pop("serviceAccountName", None)
+
+        # 6. env の src プロジェクト ID 完全一致（部分一致はしない。URL や JSON の中の
+        #    ID まで触ると利用者のデータを壊しうるため、機械的に安全な完全一致だけ）
+        for c in pod.get("containers") or []:
+            if not isinstance(c, dict):
+                continue
+            for e in c.get("env") or []:
+                if isinstance(e, dict) and e.get("value") == src_project:
+                    e["value"] = dst_project
+                    notes.append(
+                        f"環境変数 `{e.get('name', '?')}` の値が src プロジェクト ID と"
+                        f"一致したため dst へ置換")
+
+    # 7. traffic（サービスのみ。保険で、通常は unsupported 判定で先に弾かれる）
+    spec = doc.setdefault("spec", {})
+    traffic = spec.get("traffic") or []
+    if any(isinstance(t, dict) and (t.get("revisionName") or t.get("tag"))
+           for t in traffic):
+        spec["traffic"] = [{"latestRevision": True, "percent": 100}]
+        notes.append("リビジョン固定のトラフィック分割を latest 100% に変更")
+
+    return doc, notes
+
+
+def parse_run_jobs_list(text: Optional[str]) -> List[Tuple[str, str]]:
+    """`gcloud run jobs list --format=json` から [(name, region), ...] を返す（純粋関数）。
+
+    ジョブは `metadata.labels['cloud.googleapis.com/location']` にリージョンを持つ
+    （サービスと同じ Knative 表現）。
+    """
+    try:
+        data = json.loads(text) if text else []
+    except (ValueError, TypeError):
+        return []
+    out: List[Tuple[str, str]] = []
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("metadata") or {}
+        name = (meta.get("name") or "").strip()
+        region = ((meta.get("labels") or {}).get("cloud.googleapis.com/location")
+                  or "").strip()
+        if name and region:
+            out.append((name, region))
+    return sorted(set(out))
+
+
+# ---------------------------------------------------------------------------
+# Cloud Functions 複製 (Step 4.7 / serverless_sync) の純粋関数
+# ---------------------------------------------------------------------------
+# gen2 Function の実体は Cloud Run サービスだが、**Run として複製してはいけない**
+# （dst に「Function ではない Run サービス」が生えてトリガーと管理単位を失う）。
+# Function は Function として、ソース zip を dst に置いて `gcloud functions deploy`
+# で再ビルドする。ビルドが dst で走るのでイメージの複製は要らない。
+#
+# 対応するのは **HTTP トリガのみ**（Phase 2）。イベントトリガ（Eventarc / Pub/Sub /
+# GCS）は、参照先のトピック名・バケット名が dst でリネームされる / チャネルと
+# サービスエージェントの設定が要るなど、機械的に写すと**誤ったソースを購読する
+# 関数**を作りかねないため複製せず DIFF 要対応に回す。
+
+# Function の設定のうち、dst でそのまま使える deploy フラグへの対応表。
+# (describe のキー, gcloud フラグ, 値の変換) の順。
+_FN_GEN2_SERVICE_FLAGS = (
+    ("availableMemory",             "--memory",       None),
+    ("availableCpu",                "--cpu",          None),
+    ("timeoutSeconds",              "--timeout",      lambda v: f"{v}s"),
+    ("maxInstanceCount",            "--max-instances", None),
+    ("minInstanceCount",            "--min-instances", None),
+    ("maxInstanceRequestConcurrency", "--concurrency", None),
+    ("ingressSettings",             "--ingress-settings", None),
+)
+_FN_GEN1_FLAGS = (
+    ("availableMemoryMb",  "--memory",        lambda v: f"{v}MB"),
+    ("timeout",            "--timeout",       None),
+    ("maxInstances",       "--max-instances", None),
+    ("minInstances",       "--min-instances", None),
+    ("ingressSettings",    "--ingress-settings", None),
+)
+# gcloud の --ingress-settings が取る値（describe は ALLOW_ALL 形式で返す）。
+_FN_INGRESS_MAP = {
+    "ALLOW_ALL": "all",
+    "ALLOW_INTERNAL_ONLY": "internal-only",
+    "ALLOW_INTERNAL_AND_GCLB": "internal-and-gclb",
+}
+
+
+def parse_functions_list(text: Optional[str]) -> List[Dict[str, Any]]:
+    """`gcloud functions list --format=json` から関数の一覧を返す（純粋関数）。
+
+    戻り値の各要素: `{"name":..., "region":..., "gen2": bool}`
+    """
+    try:
+        data = json.loads(text) if text else []
+    except (ValueError, TypeError):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        m = re.match(r'^projects/[^/]+/locations/([^/]+)/functions/([^/]+)$',
+                     (item.get("name") or "").strip())
+        if not m:
+            continue
+        out.append({
+            "name": m.group(2),
+            "region": m.group(1),
+            "gen2": (item.get("environment") or "").upper() in ("GEN_2", "GEN2"),
+        })
+    return sorted(out, key=lambda f: (f["region"], f["name"]))
+
+
+def function_source_object(fn: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
+    """関数のソース zip の (bucket, object) を返す（純粋関数。取得不能なら None）。
+
+    - gen2 … `buildConfig.source.storageSource.{bucket,object}`。src プロジェクトの
+      `gcf-v2-sources-<番号>-<region>` バケットにあり、読み取れる。
+    - gen1 … `sourceArchiveUrl`（利用者バケットに置いた場合のみ）。コンソール /
+      `gcloud functions deploy --source=<ローカル>` で作った関数は
+      **`sourceUploadUrl`（署名付きアップロード URL）しか持たず、ソースを取得できない**
+      ため None を返す（実測: my-argolis の `function-1` がこれ）。
+    """
+    if not isinstance(fn, dict):
+        return None
+    ss = (((fn.get("buildConfig") or {}).get("source") or {})
+          .get("storageSource") or {})
+    bucket, obj = (ss.get("bucket") or "").strip(), (ss.get("object") or "").strip()
+    if bucket and obj:
+        return bucket, obj
+    m = re.match(r'^gs://([^/]+)/(.+)$', (fn.get("sourceArchiveUrl") or "").strip())
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def function_unsupported_reasons(fn: Optional[Dict[str, Any]]) -> List[str]:
+    """関数を複製できない理由を列挙する（純粋関数。空なら複製可）。
+
+    Cloud Run と同じ allow-list 方針。「dst に在るが誤ったイベントを購読する関数」
+    を作るくらいなら作らない。
+    """
+    if not isinstance(fn, dict):
+        return ["describe の内容を解釈できなかった"]
+    reasons: List[str] = []
+    gen2 = (fn.get("environment") or "").upper() in ("GEN_2", "GEN2")
+    svc_cfg = fn.get("serviceConfig") or {}
+    build_cfg = fn.get("buildConfig") or {}
+
+    if fn.get("eventTrigger"):
+        et = fn["eventTrigger"] if isinstance(fn["eventTrigger"], dict) else {}
+        kind = (et.get("eventType") or et.get("eventFilters") or "イベント")
+        reasons.append(
+            f"イベントトリガ（{kind}）。参照先のトピック / バケットは dst で名前が"
+            f"変わる場合があり、機械的に写すと誤ったイベント源を購読する関数になる")
+    if svc_cfg.get("secretEnvironmentVariables") or svc_cfg.get("secretVolumes"):
+        reasons.append(
+            "Secret Manager 参照。本ツールは Secret の値を複製しない方針のため "
+            "dst に存在しない")
+    if svc_cfg.get("vpcConnector") or fn.get("vpcConnector"):
+        reasons.append("VPC コネクタ参照（src プロジェクトのコネクタを指す）")
+    if svc_cfg.get("kmsKeyName") or fn.get("kmsKeyName") or build_cfg.get("kmsKeyName"):
+        reasons.append("CMEK（dst に KMS 鍵が無い）")
+    if function_source_object(fn) is None:
+        if gen2:
+            reasons.append("ソース zip の場所を特定できなかった")
+        else:
+            reasons.append(
+                "第 1 世代でソース zip が Google 管理のアップロード領域にあり"
+                "（`sourceUploadUrl` のみ）取得できない。"
+                "gcloud にソースをダウンロードするコマンドが無いため複製不能")
+    if not gen2:
+        runtime = (fn.get("runtime") or "").strip()
+        if not runtime:
+            reasons.append("runtime を特定できなかった")
+    else:
+        if not (build_cfg.get("runtime") or "").strip():
+            reasons.append("runtime を特定できなかった")
+    return reasons
+
+
+def build_function_deploy_flags(
+    fn: Dict[str, Any],
+    dst_project: str,
+    source_uri: str,
+    proj_map: Dict[str, str],
+    num_map: Dict[str, str],
+) -> Tuple[List[str], Dict[str, str], List[str]]:
+    """`gcloud functions deploy` のフラグ・環境変数・注記を組み立てる（純粋関数）。
+
+    戻り値: (フラグのリスト, 環境変数 dict, 注記のリスト)
+
+    設定を**取りこぼすと dst で黙って既定値になる**ので、describe から読める
+    ものは明示的にフラグへ落とす（`_FN_GEN2_SERVICE_FLAGS` / `_FN_GEN1_FLAGS`）。
+    未知のフィールドは触らない（= dst の既定値になる）が、それは
+    `function_unsupported_reasons` で危険なものを先に弾いた後の話。
+    """
+    gen2 = (fn.get("environment") or "").upper() in ("GEN_2", "GEN2")
+    build_cfg = fn.get("buildConfig") or {}
+    svc_cfg = fn.get("serviceConfig") or {}
+    notes: List[str] = []
+
+    runtime = (build_cfg.get("runtime") if gen2 else fn.get("runtime")) or ""
+    entry = (build_cfg.get("entryPoint") if gen2 else fn.get("entryPoint")) or ""
+
+    flags: List[str] = [
+        "--gen2" if gen2 else "--no-gen2",
+        f"--runtime={runtime}",
+        f"--source={source_uri}",
+        "--trigger-http",
+    ]
+    if entry:
+        flags.append(f"--entry-point={entry}")
+
+    table = _FN_GEN2_SERVICE_FLAGS if gen2 else _FN_GEN1_FLAGS
+    src_cfg = svc_cfg if gen2 else fn
+    for key, flag, conv in table:
+        val = src_cfg.get(key)
+        if val in (None, ""):
+            continue
+        if flag == "--ingress-settings":
+            mapped = _FN_INGRESS_MAP.get(str(val).upper())
+            if not mapped:
+                notes.append(f"未知の ingress 設定 '{val}' のため dst では既定値になります")
+                continue
+            val = mapped
+        elif conv:
+            val = conv(val)
+        flags.append(f"{flag}={val}")
+
+    sa_email = (svc_cfg.get("serviceAccountEmail") if gen2
+                else fn.get("serviceAccountEmail")) or ""
+    if sa_email:
+        dst_sa, note = resolve_dst_run_service_account(str(sa_email), proj_map, num_map)
+        if note:
+            notes.append(note)
+        if dst_sa:
+            flags.append(f"--service-account={dst_sa}")
+
+    env = (svc_cfg.get("environmentVariables") if gen2
+           else fn.get("environmentVariables")) or {}
+    env = {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {}
+    # Cloud Functions が自動で入れる予約変数は指定できない（deploy が弾く）。
+    for reserved in ("FUNCTION_TARGET", "FUNCTION_SIGNATURE_TYPE",
+                     "K_SERVICE", "K_REVISION", "K_CONFIGURATION"):
+        env.pop(reserved, None)
+    for k, v in list(env.items()):
+        # Cloud Run の env と同じく **完全一致のみ** 置換する（部分一致で
+        # URL や JSON の中身を壊さない）。
+        src_projects = [s for s, d in proj_map.items() if v == s]
+        if src_projects:
+            env[k] = proj_map[src_projects[0]]
+            notes.append(f"環境変数 `{k}` の値が src プロジェクト ID と一致したため dst へ置換")
+
+    return flags, env, notes
+
+
+def function_secretish_env_names(fn: Optional[Dict[str, Any]]) -> List[str]:
+    """関数の平文 env のうち秘匿情報らしい変数名を返す（純粋関数）。"""
+    if not isinstance(fn, dict):
+        return []
+    gen2 = (fn.get("environment") or "").upper() in ("GEN_2", "GEN2")
+    env = ((fn.get("serviceConfig") or {}).get("environmentVariables") if gen2
+           else fn.get("environmentVariables")) or {}
+    if not isinstance(env, dict):
+        return []
+    return sorted(n for n in env if _RUN_SECRETISH_ENV_RE.search(str(n)))
+
+
+# Step 4.7 が所有する Terraform リソース型。customize (Step 3) と apply 直前
+# (Step 4 `_purge_serverless_tf_files`) の**両方**からこの純粋関数を呼ぶ。
+# customize 側だけに置くと `skip_on_run: true` が customize ごとスキップして
+# 古い active/ をそのまま apply するため、二重所有が再発する
+# （GKE 管理リソースの除外と同じ二段構え）。
+_SERVERLESS_OWNED_TF_TYPES = {
+    "google_cloud_run_service":       "Cloud Run サービス",
+    "google_cloud_run_v2_service":    "Cloud Run サービス",
+    "google_cloud_run_v2_job":        "Cloud Run ジョブ",
+    "google_cloudfunctions_function": "Cloud Functions (第 1 世代)",
+    "google_cloudfunctions2_function": "Cloud Functions (第 2 世代)",
+}
+
+
+def serverless_tf_skip_reason(content: Optional[str]) -> Optional[str]:
+    """Step 4.7 が所有するサーバーレスリソースの .tf ならスキップ理由を返す（純粋関数）。
+
+    通常 bulk-export はこれらを出力しないが、`export_resource_types` を外すと
+    フィルタ無し経路で出てくることがある。terraform と Step 4.7 の二重所有に
+    なると、実行のたびに互いの設定を巻き戻すので落とす。
+    """
+    content = content or ""
+    for rtype, label in _SERVERLESS_OWNED_TF_TYPES.items():
+        if f'resource "{rtype}"' in content:
+            return (f"{label}は Step 4.7 (serverless_sync) が複製するため除外")
+    return None
+
+
 def coerce_nonneg_int(value: Any, default: int) -> int:
     """値を非負整数へ安全に変換する（純粋関数）。
 
@@ -2778,6 +3545,10 @@ def dedupe_tf_resource_labels(
 #   3. Step 99 が読み出して DIFF.md の専用セクションに掲載する
 # 新しい補正・スキップを足すときも、手動対応/確認が要るなら必ずこの経路に載せる。
 _CUSTOMIZE_NOTES_FILE = ".customize_notes.json"
+# Step 4.7 serverless_sync が「複製を見送った Cloud Run サービス」を書くファイル。
+# customize (Step 3) より後に走るので `.customize_notes.json` とは分ける
+# （同じファイルに書くと次回 customize に上書きされて注記が消える）。
+_SERVERLESS_NOTES_FILE = ".serverless_notes.json"
 
 
 def customize_note_row(note: Dict[str, str]) -> Tuple[str, str, str, str]:
@@ -2916,26 +3687,104 @@ def customize_note_row(note: Dict[str, str]) -> Tuple[str, str, str, str]:
             "certificate map / SSL 証明書はクラスタ外リソースで複製されないため "
             "dst に用意し、Gateway 側の参照（annotation）を確認",
         )
+    # --- Step 4.7 serverless_sync（Cloud Run の複製見送り / 確認事項） ---
+    region = note.get("region") or "<region>"
+    detail = note.get("detail") or ""
+    if kind == "run_service_unsupported":
+        return (
+            "要対応",
+            f"Cloud Run サービス `{res}`（{proj} / {region}）",
+            f"本ツールが安全に移せない設定を含むため複製を見送った: {detail}。"
+            "部分的に複製すると『dst に在るが参照先が src を指す壊れたサービス』に"
+            "なり、CAI 差分にも現れず気付けないため、あえて作らない",
+            f"src の定義を確認して手動で作成: `gcloud run services describe {res} "
+            f"--region={region} --project=<src> --format=export > svc.yaml` → "
+            f"上記の設定を dst 用に直す（VPC コネクタ / Cloud SQL / Secret / "
+            f"CMEK 等を dst に用意）→ `gcloud run services replace svc.yaml "
+            f"--region={region} --project={proj}`",
+        )
+    if kind == "run_service_image_missing":
+        return (
+            "要対応",
+            f"Cloud Run サービス `{res}`（{proj} / {region}）",
+            f"参照イメージが dst に存在しないため複製を見送った: {detail}。"
+            "この状態で replace するとリビジョン作成が `Image not found` で失敗し、"
+            "サービスが tainted で残る",
+            "Step 3.7 (Artifact Registry) のログでコピー失敗を確認 → "
+            "`steps.data_sync.artifact_registry.scope` で除外していないか確認 → "
+            "再実行するか、`gcrane cp <src-image> <dst-image>` で手動コピー後に "
+            "`make run` を再実行",
+        )
+    if kind == "run_service_plaintext_secret":
+        return (
+            "確認",
+            f"Cloud Run サービス `{res}`（{proj} / {region}）の平文環境変数",
+            f"秘匿情報らしい環境変数を **src と同じ値のまま複製**した: {detail}。"
+            "忠実再現の方針（`roles/owner` や公開 invoker と同じ扱い）だが、"
+            "別 ORG に同じ秘密が増えることになる",
+            "不要なら dst で値を差し替え / ローテーションする。恒久的には "
+            "Secret Manager 参照へ移行する（`--set-secrets`）",
+        )
+    if kind == "function_unsupported":
+        return (
+            "要対応",
+            f"Cloud Functions `{res}`（{proj} / {region}）",
+            f"本ツールが安全に移せない設定を含むため複製を見送った: {detail}。"
+            "誤ったイベント源を購読する関数や、参照先が dst に無い関数を作ると"
+            "気付きにくい障害になるため、あえて作らない",
+            f"src の設定を確認して手動でデプロイ: `gcloud functions describe {res} "
+            f"--region={region} --project=<src>` で runtime / entry-point / トリガ / "
+            f"ソースを確認 → 依存（Pub/Sub トピック・バケット・Secret・VPC コネクタ等）を "
+            f"dst に用意 → `gcloud functions deploy {res} --region={region} "
+            f"--project={proj} ...`。第 1 世代でソースが取得できない場合は "
+            f"コンソールの「ソース」タブから zip をダウンロードして使う",
+        )
+    if kind == "function_plaintext_secret":
+        return (
+            "確認",
+            f"Cloud Functions `{res}`（{proj} / {region}）の平文環境変数",
+            f"秘匿情報らしい環境変数を **src と同じ値のまま複製**した: {detail}。"
+            "忠実再現の方針だが、別 ORG に同じ秘密が増えることになる",
+            "不要なら dst で値を差し替え / ローテーションする。恒久的には "
+            "Secret Manager 参照へ移行する（`--set-secrets`）",
+        )
+    if kind == "run_service_note":
+        return (
+            "確認",
+            f"Cloud Run サービス `{res}`（{proj} / {region}）",
+            f"複製時に以下の書き換えを行った: {detail}",
+            "dst のサービスが意図どおり動くか確認する"
+            f"（`gcloud run services describe {res} --region={region} "
+            f"--project={proj}`）",
+        )
     # 未知 kind は握り潰さず確認として出す（登録漏れに気付けるように）
     return ("確認", f"{kind}: {res}（{proj}）", "詳細は実行ログを参照", "-")
 
 
 def load_customize_notes(active_dir: str) -> List[Dict[str, str]]:
-    """active/<src>/.customize_notes.json を全プロジェクト分読み出す（純粋関数）。"""
+    """active/<src>/ の注記ファイルを全プロジェクト分読み出す（純粋関数）。
+
+    2 系統ある:
+    - `.customize_notes.json` … Step 3 customize_hcl が書く（.tf の補正 / スキップ）
+    - `.serverless_notes.json` … Step 4.7 serverless_sync が書く（Cloud Run の
+      複製見送り）。customize より後に走るので別ファイルにしないと上書きされる。
+    どちらも「原因が消えれば注記も消える」ように、書き手が毎回書き直す。
+    """
     notes: List[Dict[str, str]] = []
     try:
         names = sorted(os.listdir(active_dir))
     except OSError:
         return notes
     for name in names:
-        path = os.path.join(active_dir, name, _CUSTOMIZE_NOTES_FILE)
-        try:
-            with open(path, encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, list):
-                notes.extend(n for n in loaded if isinstance(n, dict))
-        except (OSError, ValueError):
-            continue
+        for fname in (_CUSTOMIZE_NOTES_FILE, _SERVERLESS_NOTES_FILE):
+            path = os.path.join(active_dir, name, fname)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    notes.extend(n for n in loaded if isinstance(n, dict))
+            except (OSError, ValueError):
+                continue
     return notes
 
 
@@ -3034,6 +3883,9 @@ _STEP_ENABLED_DEFAULTS: Dict[str, bool] = {
     # dst の API 無効は Step 4 以降を軒並み 403 で落とす（GKE = container API が典型）。
     # config を書き換えていない既存環境でも復旧できるよう既定 true。
     "enable_apis": True,
+    # bulk-export が Cloud Run を一切出さないため、有効にしないと Cloud Run が
+    # 丸ごとコピーされない。既存 config に手を入れずに効いてほしいので既定 true。
+    "serverless_sync": True,
 }
 
 
@@ -3562,6 +4414,21 @@ def validate_steps_config(config: Dict[str, Any]) -> List[str]:
                     errors.append(
                         f"steps.data_sync.artifact_registry.scope の '{sc}' は"
                         f"未知の値です（指定できるのは {' / '.join(_AR_SCOPES)}）")
+
+    # --- Step 4.7: Cloud Run 複製 (serverless_sync) ---
+    # 既定 true のステップなので step_enabled で解決する。skip_services の綴り誤り
+    # （文字列を直書き等）は「除外したつもりが全部複製」になるため実行前に弾く。
+    if step_enabled(steps, 'serverless_sync'):
+        sc = steps.get('serverless_sync', {}) or {}
+        if not isinstance(sc, dict):
+            sc = {}
+        skip = sc.get('skip_services')
+        if skip is not None:
+            if not isinstance(skip, list) or any(
+                    not str(v or '').strip() for v in skip):
+                errors.append(
+                    "steps.serverless_sync.skip_services はサービス名の文字列"
+                    "リストにしてください（例: ['legacy-api']）")
 
     # --- Step 7: VPC Service Controls ---
     # access-context-manager は --project を持たないため billing_project が無いと
@@ -4376,12 +5243,204 @@ class MigrationOrchestrator:
 
         if cmd.strip().startswith("gcloud run services list"):
             logger.info(f"{tag}[MOCK] Cloud Run サービス一覧をシミュレート ({proj_id})")
+            # Step 4.7 の 3 経路（複製 / 移せない設定で skip / gen2 Function の実体で
+            # skip）を全部通す。どれかが壊れると make mock の出力が変わって気付ける。
+            return json.dumps([
+                {"metadata": {
+                    "name": "mock-public-api",
+                    "labels": {"cloud.googleapis.com/location": "asia-northeast1"},
+                }},
+                {"metadata": {
+                    "name": "mock-vpc-api",
+                    "labels": {"cloud.googleapis.com/location": "asia-northeast1"},
+                }},
+                {"metadata": {
+                    "name": "mock-fn-svc",
+                    "labels": {"cloud.googleapis.com/location": "us-central1"},
+                }},
+            ])
+
+        if cmd.strip().startswith("gcloud functions list"):
+            logger.info(f"{tag}[MOCK] Cloud Functions 一覧をシミュレート ({proj_id})")
+            # gen2 Function の実体 = Run サービス。dedup が壊れると
+            # mock-fn-svc が Run として複製されてしまう。
+            # mock-fn-legacy は gen1 でソースが取得できない例（複製不可）。
+            return json.dumps([
+                {
+                    "name": f"projects/{proj_id}/locations/us-central1"
+                            f"/functions/mock-fn-svc",
+                    "environment": "GEN_2",
+                    "serviceConfig": {
+                        "service": f"projects/{proj_id}/locations/us-central1"
+                                   f"/services/mock-fn-svc",
+                    },
+                },
+                {
+                    "name": f"projects/{proj_id}/locations/us-central1"
+                            f"/functions/mock-fn-legacy",
+                    "environment": "GEN_1",
+                },
+            ])
+
+        if cmd.strip().startswith("gcloud functions describe"):
+            m = re.search(r'functions describe (\S+)', cmd)
+            fn = m.group(1) if m else "mock-fn-svc"
+            logger.info(f"{tag}[MOCK] Cloud Functions 定義をシミュレート ({fn})")
+            if fn == "mock-fn-legacy":
+                # 第 1 世代 + sourceUploadUrl のみ = ソース取得不能。
+                # 判定が壊れると「複製できたつもり」で deploy が走ってしまう。
+                return json.dumps({
+                    "name": f"projects/{proj_id}/locations/us-central1/functions/{fn}",
+                    "runtime": "python39",
+                    "entryPoint": "hello_world",
+                    "httpsTrigger": {"securityLevel": "SECURE_OPTIONAL"},
+                    "sourceUploadUrl": "https://storage.googleapis.com/gcf-upload/x.zip",
+                    "serviceAccountEmail": f"{proj_id}@appspot.gserviceaccount.com",
+                })
+            return json.dumps({
+                "name": f"projects/{proj_id}/locations/us-central1/functions/{fn}",
+                "environment": "GEN_2",
+                "buildConfig": {
+                    "runtime": "nodejs22",
+                    "entryPoint": "SyntheticFunction",
+                    "source": {"storageSource": {
+                        "bucket": f"gcf-v2-sources-111111111111-us-central1",
+                        "object": f"{fn}/function-source.zip",
+                        "generation": "1",
+                    }},
+                },
+                "serviceConfig": {
+                    "service": f"projects/{proj_id}/locations/us-central1/services/{fn}",
+                    "serviceAccountEmail":
+                        "111111111111-compute@developer.gserviceaccount.com",
+                    "availableMemory": "256Mi",
+                    "timeoutSeconds": 30,
+                    "maxInstanceCount": 100,
+                    "ingressSettings": "ALLOW_ALL",
+                    "environmentVariables": {
+                        "LOG_EXECUTION_ID": "true",
+                        "PROJECT_ID": proj_id,
+                        "SLACK_TOKEN": "xoxb-mock",
+                    },
+                },
+            })
+
+        if cmd.strip().startswith("gcloud functions deploy"):
+            logger.info(f"{tag}[MOCK] Cloud Functions の deploy をシミュレート")
+            return ""
+
+        if cmd.strip().startswith("gcloud run jobs list"):
+            logger.info(f"{tag}[MOCK] Cloud Run ジョブ一覧をシミュレート ({proj_id})")
             return json.dumps([{
                 "metadata": {
-                    "name": "mock-public-api",
+                    "name": "mock-batch-job",
                     "labels": {"cloud.googleapis.com/location": "asia-northeast1"},
                 },
             }])
+
+        if (cmd.strip().startswith("gcloud run jobs describe")
+                and "--format=export" in cmd):
+            logger.info(f"{tag}[MOCK] Cloud Run ジョブ定義をシミュレート")
+            # Job は Execution を挟むぶんテンプレートが 1 段深い。パス決め打ちの
+            # 書き換えに戻すとここが素通りして検出できる。
+            return yaml.safe_dump({
+                "apiVersion": "run.googleapis.com/v1",
+                "kind": "Job",
+                "metadata": {
+                    "name": "mock-batch-job",
+                    "namespace": "111111111111",
+                    "labels": {"cloud.googleapis.com/location": "asia-northeast1"},
+                },
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "taskCount": 2,
+                            "template": {
+                                "spec": {
+                                    "maxRetries": 3,
+                                    "serviceAccountName":
+                                        f"batch@{proj_id}.iam.gserviceaccount.com",
+                                    "containers": [{
+                                        "image": f"asia-northeast1-docker.pkg.dev/"
+                                                 f"{proj_id}/cloud-run-source-deploy"
+                                                 f"/mock-batch-job:v1",
+                                        "env": [{"name": "PROJECT_ID",
+                                                 "value": proj_id}],
+                                    }],
+                                },
+                            },
+                        },
+                    },
+                },
+            }, sort_keys=False)
+
+        if cmd.strip().startswith("gcloud run jobs replace"):
+            logger.info(f"{tag}[MOCK] Cloud Run ジョブの replace をシミュレート")
+            return ""
+
+        if (cmd.strip().startswith("gcloud run services describe")
+                and "--format=export" in cmd):
+            m = re.search(r'run services describe (\S+)', cmd)
+            svc = m.group(1) if m else "mock-public-api"
+            logger.info(f"{tag}[MOCK] Cloud Run サービス定義をシミュレート ({svc})")
+            tmpl_annotations: Dict[str, Any] = {
+                "autoscaling.knative.dev/maxScale": "100",
+            }
+            if svc == "mock-vpc-api":
+                # 移せない設定（VPC コネクタ）。unsupported 判定が壊れると
+                # このサービスまで複製されてしまう。
+                tmpl_annotations["run.googleapis.com/vpc-access-connector"] = (
+                    f"projects/{proj_id}/locations/asia-northeast1/connectors/mock-conn")
+            return yaml.safe_dump({
+                "apiVersion": "serving.knative.dev/v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": svc,
+                    "namespace": "111111111111",
+                    "labels": {"cloud.googleapis.com/location": "asia-northeast1"},
+                    "annotations": {
+                        "run.googleapis.com/build-id": "mock-build",
+                        "run.googleapis.com/urls": '["https://mock.a.run.app"]',
+                        "run.googleapis.com/ingress": "all",
+                    },
+                },
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "name": f"{svc}-00001-abc",
+                            "annotations": tmpl_annotations,
+                            "labels": {"client.knative.dev/nonce": "mocknonce"},
+                        },
+                        "spec": {
+                            "containerConcurrency": 80,
+                            "serviceAccountName":
+                                f"{svc}@{proj_id}.iam.gserviceaccount.com",
+                            "containers": [{
+                                "image": f"asia-northeast1-docker.pkg.dev/{proj_id}"
+                                         f"/cloud-run-source-deploy/{svc}"
+                                         f"@sha256:{'0' * 64}",
+                                "env": [
+                                    {"name": "PROJECT_ID", "value": proj_id},
+                                    {"name": "SLACK_TOKEN", "value": "xoxb-mock"},
+                                ],
+                            }],
+                        },
+                    },
+                    "traffic": [{"latestRevision": True, "percent": 100}],
+                },
+            }, sort_keys=False)
+
+        if cmd.strip().startswith("gcloud run services describe"):
+            # Step 5.7 の「dst にサービスがあるか」確認用（--format='value(...)'）。
+            # Step 4.7 が複製を見送ったサービス（mock-vpc-api / mock-fn-svc）は
+            # dst に無いので空を返す = 公開設定を付けられない警告パスを通す。
+            m = re.search(r'run services describe (\S+)', cmd)
+            svc = m.group(1) if m else "mock-public-api"
+            return "" if svc in ("mock-vpc-api", "mock-fn-svc") else svc
+
+        if cmd.strip().startswith("gcloud run services replace"):
+            logger.info(f"{tag}[MOCK] Cloud Run サービスの replace をシミュレート")
+            return ""
 
         if cmd.strip().startswith("gcloud run services get-iam-policy"):
             logger.info(f"{tag}[MOCK] Cloud Run IAM ポリシーをシミュレート")
@@ -4809,6 +5868,13 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
                 self.step_artifact_registry()
             if step_enabled(steps, 'terraform_apply'):
                 self.step_terraform_apply()
+            # Step 4.7: Cloud Run は bulk-export が出力しないため Terraform では
+            # 複製されない。terraform の**後**に置くのは、サービスが参照する
+            # SA / VPC / バケットを Step 4 が先に作るため。逆に Step 5.7 の
+            # `_sync_run_service_invokers`（公開設定の複製）は dst にサービスが
+            # ある前提なので、必ずこの後に来ること。
+            if step_enabled(steps, 'serverless_sync'):
+                self.step_serverless_sync()
             if step_enabled(steps, 'network_firewall'):
                 self.step_network_firewall()
             if step_enabled(steps, 'gce_restore'):
@@ -6829,6 +7895,17 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
             if m and not re.match(r'^[a-z]([-a-z0-9]*[a-z0-9])?$', m.group(1)):
                 return f"作成不能なデフォルト SA: account_id={m.group(1)}"
 
+        # Cloud Run サービスは Step 4.7 (serverless_sync) が Knative YAML で
+        # 複製する所有モデル。terraform 側に残すと二重所有になり、
+        # apply がネイティブ側の設定を巻き戻す（`replace` は送った spec が正、
+        # terraform も自分の state が正なので、実行のたびに殴り合う）。
+        # 通常 bulk-export は Cloud Run を出力しないが、`export_resource_types` を
+        # 外すとフィルタ無し経路で .tf が出てくるため、その場合に効く。
+        if step_enabled(self.config.get('steps', {}), 'serverless_sync'):
+            reason = serverless_tf_skip_reason(content)
+            if reason:
+                return reason
+
         # VM とディスクは Step 5（スナップショット復元）が管理する。
         # terraform での create/replace は Step 5 の復元と衝突するためスキップ。
         # Step 4 は VPC/サービス/SA 等のインフラを担当し、VM 実体は Step 5 任せ。
@@ -7187,6 +8264,52 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
             )
         return removed
 
+    def _purge_serverless_tf_files(self, proj_dir: str) -> int:
+        """Terraform ルート直下から Cloud Run サービスの .tf を削除する。
+
+        Step 4.7 (serverless_sync) が所有するリソースを terraform にも持たせると
+        二重所有になり、実行のたびに互いの設定を巻き戻す。customize (Step 3) でも
+        落としているが、`skip_on_run: true` は customize ごとスキップして古い
+        active/ をそのまま apply するため、apply 直前にも確認する（最終防衛線。
+        GKE 管理 .tf と同じ二段構え）。判定は `serverless_tf_skip_reason()` に集約。
+
+        dry_run でも削除する（`make plan` の plan を `make run` がそのまま使うため、
+        消さないと plan と apply の対象がずれる）。
+        """
+        if not step_enabled(self.config.get('steps', {}), 'serverless_sync'):
+            return 0
+        try:
+            names = sorted(os.listdir(proj_dir))
+        except OSError:
+            return 0
+        removed = 0
+        for name in names:
+            if not name.endswith(".tf"):
+                continue
+            path = os.path.join(proj_dir, name)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+            except OSError:
+                continue
+            if not serverless_tf_skip_reason(content):
+                continue
+            try:
+                os.remove(path)
+            except OSError as e:
+                self.dst_logger.warning(
+                    f"    Cloud Run .tf の削除に失敗: {name}: {e}")
+                continue
+            removed += 1
+            self.dst_logger.info(f"    除外（Step 4.7 が複製）: {name}")
+        if removed:
+            self.dst_logger.warning(
+                f"    Cloud Run サービスの .tf を {removed} 件除外しました"
+                f"（Step 4.7 serverless_sync が Knative YAML で複製します）: "
+                f"{os.path.basename(proj_dir)}"
+            )
+        return removed
+
     def _terraform_one_project(self, proj_dir: str, proj_map: Dict[str, str],
                                 sa_map: Dict[str, Optional[str]]):
         self.dst_logger.info(f"  → Terraform ルート: {proj_dir}")
@@ -7208,6 +8331,9 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
         # 再利用する**ため、判定が customize 側だけだと修正後も同じ 404 が出続ける
         # （regression: gkegw1-* BackendService が除外済み health check を参照）。
         self._purge_gke_managed_tf_files(proj_dir)
+        # Cloud Run サービスは Step 4.7 が所有する。同じ理由（skip_on_run で
+        # customize を飛ばすと古い active/ が残る）で apply 直前にも落とす。
+        self._purge_serverless_tf_files(proj_dir)
         # dst プロジェクトが前回と変わった（= 別環境への移行）場合、前回の
         # terraform.tfstate は旧プロジェクトのリソースを指したままで、import が
         # 「既に state にある」と誤判定し、plan で新プロジェクトへ再作成 → 既存と
@@ -8910,6 +10036,618 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
             f"--role={shlex.quote(g['dst_role'])} "
             f"--condition=None --quiet --format=none"
         )
+
+    # ------------------------------------------------------------------
+    # Step 4.7: Cloud Run サービス複製 (serverless_sync)
+    # ------------------------------------------------------------------
+    def step_serverless_sync(self):
+        """Step 4.7: Cloud Run サービスを src → dst に複製する。
+
+        bulk-export は Cloud Run を 1 件も出力しないため（詳細は
+        `rewrite_run_service_yaml` 上部のコメント）、Terraform ではなく Cloud Run
+        自身の宣言的 API で複製する: `describe --format=export` → 書き換え →
+        `replace`。
+
+        実行位置は **Step 4（terraform apply）の後**。サービスが参照する SA /
+        VPC / バケット等を terraform が先に作る必要があるため。逆に Step 5.7
+        (iam_sync) の `_sync_run_service_invokers` は「dst にサービスがあること」を
+        前提にするので、必ずこのステップの**後**に来ること。
+
+        `replace` は「送った spec が正」= 送らなかったフィールドは既定値に戻る
+        破壊的 API なので、以下の安全弁を必ず通す:
+          1. `run_service_unsupported_reasons` で移せない設定を持つサービスを除外
+             （部分コピーで「動いているように見えて壊れた」サービスを作らない）
+          2. 参照イメージが dst に実在するか確認（無ければ `Image not found` で
+             リビジョン作成が失敗し tainted で残る）
+          3. `replace --dry-run` でサーバ側検証してから本適用
+        除外したものは全て `.serverless_notes.json` 経由で DIFF の要対応に出す。
+        """
+        pairs = list(self._iter_project_pairs())
+        log_stage_header(
+            self.dst_logger, 47,
+            "Cloud Run サービス複製 (Knative YAML round-trip)", len(pairs),
+        )
+        proj_map = self._build_proj_id_map()
+        num_map = getattr(self, 'proj_num_map', None) or {}
+
+        notes: List[Dict[str, str]] = []
+        notes_lock = threading.Lock()
+
+        def add_note(src_proj: str, dst_proj: str, kind: str, resource: str,
+                     region: str, detail: str = ""):
+            note = {
+                "kind": kind, "src_dir": src_proj, "resource": resource,
+                "project": dst_proj, "region": region, "detail": detail,
+            }
+            with notes_lock:
+                if note not in notes:
+                    notes.append(note)
+
+        units = self._collect_run_sync_work(pairs, add_note)
+        if not units:
+            self.dst_logger.info("  複製対象の Cloud Run サービス / ジョブはありません")
+        else:
+            self.dst_logger.info(
+                f"  複製対象: {len(units)} 件 (parallel_jobs={self.parallel_jobs})")
+
+            def worker(unit):
+                self._sync_one_run_resource(unit, proj_map, num_map, add_note)
+
+            # プロジェクト単位ではなく **サービス / ジョブ単位**で並列化する。
+            # replace は 1 件あたり数十秒かかり、Cloud Run は 1 プロジェクトに
+            # 集中しがちなので、プロジェクト並列だと並列度が事実上 1 になる
+            # （AR イメージ複製と同じ flat unit 方式）。
+            self._parallel_for_each(units, worker, "run-sync")
+
+        fn_units = self._collect_function_sync_work(pairs, add_note)
+        if not fn_units:
+            self.dst_logger.info("  複製対象の Cloud Functions はありません")
+        else:
+            self.dst_logger.info(
+                f"  複製対象: {len(fn_units)} 関数 (parallel_jobs={self.parallel_jobs})")
+
+            def fn_worker(unit):
+                self._sync_one_function(unit, proj_map, num_map, add_note)
+
+            self._parallel_for_each(fn_units, fn_worker, "fn-sync")
+
+        self._persist_serverless_notes(pairs, notes)
+        self.dst_logger.info("  ✓ Step 4.7 完了")
+
+    def _gen2_function_run_services(
+        self, src_proj: str, src_sa: Optional[str],
+    ) -> Set[Tuple[str, str]]:
+        """src の gen2 Cloud Functions が実体として持つ Run サービスを返す。
+
+        取得できなかった場合は空集合を返す（= Run として複製を試みる）。
+        Functions API が無効なプロジェクトでは 403 になるので INFO に落とす。
+        """
+        rc, out, err = self._soft_run(
+            f"gcloud functions list --project={src_proj} --format=json --quiet",
+            "src", self.org_logger, impersonate_sa=src_sa, timeout=180,
+            skip_on_dry_run=False,
+        )
+        if rc != 0:
+            if not is_api_disabled_error(f"{err or ''}\n{out or ''}"):
+                self.org_logger.warning(
+                    f"    [Run] {src_proj}: Cloud Functions 一覧を取得できません"
+                    f"でした（gen2 Function の実体判定をスキップします）: "
+                    f"{_first_meaningful_line(err, out)}"
+                )
+            return set()
+        return parse_gen2_function_run_services(out)
+
+    def _collect_run_sync_work(self, pairs, add_note) -> List[Dict[str, Any]]:
+        """(プロジェクト並列) src の Cloud Run サービスを列挙して複製 unit を作る。"""
+        units: List[Dict[str, Any]] = []
+        lock = threading.Lock()
+        cfg = self.config.get('steps', {}).get('serverless_sync', {}) or {}
+        skip_services = {
+            str(s).strip() for s in (cfg.get('skip_services') or []) if str(s).strip()
+        } if isinstance(cfg, dict) else set()
+
+        def worker(item):
+            src_proj, dst_proj, src_sa, dst_sa = item
+            rc, out, err = self._soft_run(
+                f"gcloud run services list --project={src_proj} "
+                f"--format=json --quiet",
+                "src", self.org_logger, impersonate_sa=src_sa, timeout=300,
+                skip_on_dry_run=False,
+            )
+            if rc != 0:
+                # Cloud Run を使っていない src では API 無効の 403 になる。
+                # これで run 全体を失敗にしない（AR 列挙と同じ扱い）。
+                if is_api_disabled_error(f"{err or ''}\n{out or ''}"):
+                    self.org_logger.info(
+                        f"    src '{src_proj}' は Cloud Run API が無効"
+                        f"（= 未使用）。複製対象なし"
+                    )
+                else:
+                    self.org_logger.warning(
+                        f"    [Run] {src_proj}: サービス一覧を取得できませんでした: "
+                        f"{_first_meaningful_line(err, out)}"
+                    )
+                return
+            services = parse_run_services_list(out)
+            if not services:
+                self.org_logger.info(
+                    f"    src '{src_proj}': Cloud Run サービスなし")
+            # サービスが 0 件でも **ジョブの列挙は続ける**（早期 return すると
+            # 「サービスは無いがジョブはある」プロジェクトを丸ごと取りこぼす）。
+            fn_owned = (self._gen2_function_run_services(src_proj, src_sa)
+                        if services else set())
+            local: List[Dict[str, Any]] = []
+            skipped_fn = 0
+            for name, region in services:
+                if name in skip_services:
+                    self.dst_logger.info(
+                        f"    skip {src_proj}/{name} ({region}): "
+                        f"steps.serverless_sync.skip_services で除外"
+                    )
+                    continue
+                if (name, region) in fn_owned:
+                    # Function 側（後段の fn-sync）が複製を担当する分担なので、
+                    # ここは DIFF 注記を出さずログだけ。Function 側で複製できなかった
+                    # 場合は `function_unsupported` の注記が出る。
+                    skipped_fn += 1
+                    self.dst_logger.info(
+                        f"    skip {src_proj}/{name} ({region}): "
+                        f"gen2 Cloud Functions の実体なので Function として複製する"
+                    )
+                    continue
+                local.append({
+                    "src_proj": src_proj, "dst_proj": dst_proj,
+                    "src_sa": src_sa, "dst_sa": dst_sa,
+                    "name": name, "region": region, "kind": "services",
+                })
+            if services:
+                self.org_logger.info(
+                    f"    {src_proj}: Cloud Run サービス {len(services)} 件"
+                    f"（複製対象 {len(local)} 件 / gen2 Function の実体 {skipped_fn} 件）"
+                )
+            # --- Cloud Run ジョブ（サービスと同じ Knative YAML round-trip）---
+            rc_j, out_j, err_j = self._soft_run(
+                f"gcloud run jobs list --project={src_proj} --format=json --quiet",
+                "src", self.org_logger, impersonate_sa=src_sa, timeout=300,
+                skip_on_dry_run=False,
+            )
+            if rc_j != 0:
+                if not is_api_disabled_error(f"{err_j or ''}\n{out_j or ''}"):
+                    self.org_logger.warning(
+                        f"    [Run] {src_proj}: ジョブ一覧を取得できませんでした: "
+                        f"{_first_meaningful_line(err_j, out_j)}"
+                    )
+            else:
+                jobs = parse_run_jobs_list(out_j)
+                for name, region in jobs:
+                    if name in skip_services:
+                        self.dst_logger.info(
+                            f"    skip {src_proj}/{name} ({region}): "
+                            f"steps.serverless_sync.skip_services で除外")
+                        continue
+                    local.append({
+                        "src_proj": src_proj, "dst_proj": dst_proj,
+                        "src_sa": src_sa, "dst_sa": dst_sa,
+                        "name": name, "region": region, "kind": "jobs",
+                    })
+                if jobs:
+                    self.org_logger.info(
+                        f"    {src_proj}: Cloud Run ジョブ {len(jobs)} 件")
+            with lock:
+                units.extend(local)
+
+        self._parallel_for_each(pairs, worker, "run-list")
+        return sorted(units,
+                      key=lambda u: (u["src_proj"], u["kind"], u["region"], u["name"]))
+
+    def _missing_dst_images(
+        self, doc: Dict[str, Any], dst_proj: str, dst_sa: Optional[str],
+    ) -> List[str]:
+        """dst に存在しないコンテナイメージ参照を返す。
+
+        イメージが無いまま replace するとリビジョン作成が
+        `Image '...' not found.` で失敗し、サービスが tainted で残る
+        （Step 3.7 が AR を複製済みである前提の最終確認）。
+        判定できる Artifact Registry (`*-docker.pkg.dev`) だけを見る。
+        mock / dry_run では実 GCP を叩かないので確認しない。
+        """
+        if self.mock or self.dry_run:
+            return []
+        missing: List[str] = []
+        tmpl_spec = (((doc.get("spec") or {}).get("template") or {}).get("spec") or {})
+        for c in tmpl_spec.get("containers") or []:
+            image = (c or {}).get("image") if isinstance(c, dict) else None
+            if not image or not _AR_IMAGE_RE.match(str(image)):
+                continue
+            if not self._gcloud_exists(
+                f"gcloud artifacts docker images describe {shlex.quote(str(image))} "
+                f"--format='value(image_summary.digest)'", dst_sa,
+            ):
+                missing.append(str(image))
+        return missing
+
+    def _sync_one_run_resource(self, unit: Dict[str, Any],
+                               proj_map: Dict[str, str], num_map: Dict[str, str],
+                               add_note):
+        """Cloud Run サービス / ジョブ 1 件を src → dst に複製する（並列 worker）。"""
+        src_proj, dst_proj = unit["src_proj"], unit["dst_proj"]
+        src_sa, dst_sa = unit["src_sa"], unit["dst_sa"]
+        name, region = unit["name"], unit["region"]
+        kind = unit.get("kind", "services")
+        what = "サービス" if kind == "services" else "ジョブ"
+        label = f"{src_proj}/{name} ({region})"
+
+        def fail(msg: str):
+            # 並列 worker から sys.exit しない（他の worker を巻き添えにする）。
+            self.dst_logger.error(f"    ✗ [Run] {label}: {msg}")
+            self.stats.incr("failed")
+            self.stats.add_failure(f"Run Sync {name}", msg)
+
+        rc, out, err = self._soft_run(
+            f"gcloud run {kind} describe {name} --region={region} "
+            f"--project={src_proj} --format=export --quiet",
+            "src", self.org_logger, impersonate_sa=src_sa, timeout=180,
+            skip_on_dry_run=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            fail(f"src の定義を取得できませんでした: {_first_meaningful_line(err, out)}")
+            return
+        try:
+            doc = yaml.safe_load(out)
+        except yaml.YAMLError as e:
+            fail(f"src の定義を YAML として解釈できませんでした: {e}")
+            return
+
+        reasons = run_service_unsupported_reasons(doc)
+        if reasons:
+            detail = " / ".join(reasons)
+            add_note(src_proj, dst_proj, "run_service_unsupported",
+                     name, region, detail)
+            self.dst_logger.warning(
+                f"    skip [Run] {label}: 安全に移せない設定のため複製しません "
+                f"→ {detail}（DIFF の要対応に手順を出します）"
+            )
+            return
+
+        new_doc, rewrite_notes = rewrite_run_service_yaml(
+            doc, src_proj, dst_proj, proj_map, num_map)
+        for n in rewrite_notes:
+            self.dst_logger.info(f"    [Run] {label}: {n}")
+
+        # 実行 SA が dst に無ければ未指定に倒す（指定したまま replace すると
+        # 「does not have access to service account」で必ず失敗する）。
+        # 入れ子の深さはサービスとジョブで違うので走査で拾う。
+        for pod in _iter_run_pod_specs(new_doc):
+            sa_email = pod.get("serviceAccountName")
+            if not sa_email or (self.mock or self.dry_run):
+                continue
+            if not self._gcloud_exists(
+                f"gcloud iam service-accounts describe {sa_email} "
+                f"--project={dst_proj} --format='value(email)'", dst_sa,
+            ):
+                pod.pop("serviceAccountName", None)
+                self.dst_logger.warning(
+                    f"    [Run] {label}: 実行 SA {sa_email} が dst に無いため未指定に"
+                    f"しました（dst の既定 compute SA で起動します）"
+                )
+        src_sa_names = [p.get("serviceAccountName")
+                        for p in _iter_run_pod_specs(doc or {})
+                        if p.get("serviceAccountName")]
+        dst_sa_names = [p.get("serviceAccountName")
+                        for p in _iter_run_pod_specs(new_doc)
+                        if p.get("serviceAccountName")]
+        if src_sa_names and not dst_sa_names:
+            add_note(src_proj, dst_proj, "run_service_note", name, region,
+                     f"src の実行 SA `{src_sa_names[0]}` を引き継げず、dst の既定 "
+                     f"compute SA で起動します。必要な権限が異なる可能性があります")
+
+        missing = self._missing_dst_images(new_doc, dst_proj, dst_sa)
+        if missing:
+            add_note(src_proj, dst_proj, "run_service_image_missing",
+                     name, region, ", ".join(missing))
+            self.dst_logger.warning(
+                f"    skip [Run] {label}: 参照イメージが dst に存在しません "
+                f"({', '.join(missing)})。Step 3.7 のログを確認してください"
+            )
+            return
+
+        secretish = run_secretish_env_names(new_doc)
+        if secretish:
+            add_note(src_proj, dst_proj, "run_service_plaintext_secret",
+                     name, region, ", ".join(secretish))
+            self.dst_logger.warning(
+                f"    ⚠ [Run] {label}: 平文の環境変数を src と同じ値で複製します "
+                f"({', '.join(secretish)})。別 ORG に同じ秘密が増えるため、"
+                f"不要なら dst で差し替え / ローテーションしてください"
+            )
+
+        fd, path = tempfile.mkstemp(prefix=f"run-{name}-", suffix=".yaml")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.safe_dump(new_doc, f, sort_keys=False, allow_unicode=True)
+            quoted = shlex.quote(path)
+            # サーバ側検証を先に通す。`replace` は送った spec が正なので、
+            # 検証せずに適用すると壊れた spec がそのまま dst のサービスになる。
+            rc_v, out_v, err_v = self._soft_run(
+                f"gcloud run {kind} replace {quoted} --region={region} "
+                f"--project={dst_proj} --dry-run --quiet",
+                "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=300,
+            )
+            if rc_v != 0:
+                fail(f"replace --dry-run の検証に失敗: "
+                     f"{_first_meaningful_line(err_v, out_v)}")
+                return
+            res = self.run_command(
+                f"gcloud run {kind} replace {quoted} --region={region} "
+                f"--project={dst_proj} --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Run Replace {name}",
+                explanation=f"dst {dst_proj} に Cloud Run{what} "
+                            f"{name} ({region}) を作成 / 更新",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+            if res is None and not (self.dry_run or self.mock):
+                # run_command が失敗を stats に積んでいるので add_failure はしない
+                self.dst_logger.error(f"    ✗ [Run] {label}: replace に失敗しました")
+                return
+            self.dst_logger.info(f"    ✓ 複製 {dst_proj}/{name} ({region})")
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    # ----- Cloud Functions (Phase 2) -----
+    def _fn_source_bucket(self, dst_proj: str) -> str:
+        """関数ソース zip の受け渡しに使う dst バケット名を返す。
+
+        既定は `<dst_proj>-fn-source-migration`（dst プロジェクト ID がグローバル
+        一意なのでバケット名も一意になる）。`steps.serverless_sync.source_bucket`
+        で上書きできる。
+        """
+        cfg = self.config.get('steps', {}).get('serverless_sync', {}) or {}
+        override = str((cfg.get('source_bucket') or '')).strip() \
+            if isinstance(cfg, dict) else ''
+        return override or f"{dst_proj}-fn-source-migration"
+
+    def _collect_function_sync_work(self, pairs, add_note) -> List[Dict[str, Any]]:
+        """(プロジェクト並列) src の Cloud Functions を列挙して複製 unit を作る。"""
+        units: List[Dict[str, Any]] = []
+        lock = threading.Lock()
+        cfg = self.config.get('steps', {}).get('serverless_sync', {}) or {}
+        skip_services = {
+            str(s).strip() for s in (cfg.get('skip_services') or []) if str(s).strip()
+        } if isinstance(cfg, dict) else set()
+
+        def worker(item):
+            src_proj, dst_proj, src_sa, dst_sa = item
+            rc, out, err = self._soft_run(
+                f"gcloud functions list --project={src_proj} --format=json --quiet",
+                "src", self.org_logger, impersonate_sa=src_sa, timeout=300,
+                skip_on_dry_run=False,
+            )
+            if rc != 0:
+                if is_api_disabled_error(f"{err or ''}\n{out or ''}"):
+                    self.org_logger.info(
+                        f"    src '{src_proj}' は Cloud Functions API が無効"
+                        f"（= 未使用）。複製対象なし")
+                else:
+                    self.org_logger.warning(
+                        f"    [Fn] {src_proj}: 関数一覧を取得できませんでした: "
+                        f"{_first_meaningful_line(err, out)}")
+                return
+            fns = parse_functions_list(out)
+            if not fns:
+                self.org_logger.info(f"    src '{src_proj}': Cloud Functions なし")
+                return
+            local: List[Dict[str, Any]] = []
+            for f in fns:
+                if f["name"] in skip_services:
+                    self.dst_logger.info(
+                        f"    skip {src_proj}/{f['name']} ({f['region']}): "
+                        f"steps.serverless_sync.skip_services で除外")
+                    continue
+                local.append({
+                    "src_proj": src_proj, "dst_proj": dst_proj,
+                    "src_sa": src_sa, "dst_sa": dst_sa,
+                    "name": f["name"], "region": f["region"], "gen2": f["gen2"],
+                })
+            self.org_logger.info(
+                f"    {src_proj}: Cloud Functions {len(fns)} 件"
+                f"（複製対象 {len(local)} 件）")
+            with lock:
+                units.extend(local)
+
+        self._parallel_for_each(pairs, worker, "fn-list")
+        return sorted(units, key=lambda u: (u["src_proj"], u["region"], u["name"]))
+
+    def _copy_function_source(
+        self, src_bucket: str, src_object: str, dst_uri: str,
+        src_sa: Optional[str], dst_sa: Optional[str], dst_proj: str, region: str,
+    ) -> Optional[str]:
+        """src の関数ソース zip を dst バケットへ複製する（失敗時は理由を返す）。
+
+        **1 プロセスで src と dst の借用 SA を同時に使えない**ので、
+        「src 認証でローカルへ download」→「dst 認証でアップロード」の 2 段にする。
+        `gcloud storage cp gs://... <local>` は宛先がローカルパスなので read-only
+        （`is_src_read_only` の `_SRC_GCS_DOWNLOAD_RE` で明示的に許可している）。
+        """
+        if self.mock or self.dry_run:
+            self.dst_logger.info(
+                f"    [Fn] [DRY RUN] 予定: gs://{src_bucket}/{src_object} → {dst_uri}")
+            return None
+        bucket = dst_uri.split("/", 3)[2]
+        # dst バケットは無ければ作る（冪等）。関数と同じリージョンに置く。
+        if not self._gcloud_exists(
+            f"gcloud storage buckets describe gs://{bucket} "
+            f"--project={dst_proj} --format='value(name)'", dst_sa,
+        ):
+            self.run_command(
+                f"gcloud storage buckets create gs://{bucket} "
+                f"--project={dst_proj} --location={region} --quiet",
+                side="dst", logger=self.dst_logger,
+                desc=f"Create bucket {bucket}",
+                explanation=f"関数ソース zip の受け渡し用バケットを dst に作成",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+        tmpdir = tempfile.mkdtemp(prefix="fn-src-")
+        local = os.path.join(tmpdir, "function-source.zip")
+        try:
+            rc, out, err = self._soft_run(
+                f"gcloud storage cp gs://{src_bucket}/{src_object} "
+                f"{shlex.quote(local)}",
+                "src", self.org_logger, impersonate_sa=src_sa, timeout=600,
+                skip_on_dry_run=False,
+            )
+            if rc != 0 or not os.path.exists(local):
+                return (f"src のソース zip を取得できませんでした "
+                        f"(gs://{src_bucket}/{src_object}): "
+                        f"{_first_meaningful_line(err, out)}")
+            rc_u, out_u, err_u = self._soft_run(
+                f"gcloud storage cp {shlex.quote(local)} {dst_uri} "
+                f"--project={dst_proj}",
+                "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=600,
+            )
+            if rc_u != 0:
+                return (f"dst へソース zip を配置できませんでした ({dst_uri}): "
+                        f"{_first_meaningful_line(err_u, out_u)}")
+            return None
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _sync_one_function(self, unit: Dict[str, Any], proj_map: Dict[str, str],
+                           num_map: Dict[str, str], add_note):
+        """Cloud Functions 1 件を src → dst に複製する（並列 worker）。
+
+        ソース zip を dst に置いて `gcloud functions deploy` で **dst 側で再ビルド**
+        する。ビルドが dst で走るのでイメージの複製は要らない。
+        """
+        src_proj, dst_proj = unit["src_proj"], unit["dst_proj"]
+        src_sa, dst_sa = unit["src_sa"], unit["dst_sa"]
+        name, region = unit["name"], unit["region"]
+        label = f"{src_proj}/{name} ({region})"
+
+        def fail(msg: str):
+            self.dst_logger.error(f"    ✗ [Fn] {label}: {msg}")
+            self.stats.incr("failed")
+            self.stats.add_failure(f"Function Sync {name}", msg)
+
+        rc, out, err = self._soft_run(
+            f"gcloud functions describe {name} --region={region} "
+            f"--project={src_proj} --format=json --quiet",
+            "src", self.org_logger, impersonate_sa=src_sa, timeout=180,
+            skip_on_dry_run=False,
+        )
+        if rc != 0 or not (out or "").strip():
+            fail(f"src の定義を取得できませんでした: {_first_meaningful_line(err, out)}")
+            return
+        try:
+            fn = json.loads(out)
+        except (ValueError, TypeError) as e:
+            fail(f"src の定義を JSON として解釈できませんでした: {e}")
+            return
+
+        reasons = function_unsupported_reasons(fn)
+        if reasons:
+            detail = " / ".join(reasons)
+            add_note(src_proj, dst_proj, "function_unsupported", name, region, detail)
+            self.dst_logger.warning(
+                f"    skip [Fn] {label}: 安全に移せない設定のため複製しません "
+                f"→ {detail}（DIFF の要対応に手順を出します）")
+            return
+
+        source = function_source_object(fn)
+        if not source:   # function_unsupported_reasons が拾うので通常ここには来ない
+            add_note(src_proj, dst_proj, "function_unsupported", name, region,
+                     "ソース zip の場所を特定できなかった")
+            return
+        src_bucket, src_object = source
+        dst_uri = (f"gs://{self._fn_source_bucket(dst_proj)}/"
+                   f"{name}/function-source.zip")
+        why = self._copy_function_source(
+            src_bucket, src_object, dst_uri, src_sa, dst_sa, dst_proj, region)
+        if why:
+            fail(why)
+            return
+
+        flags, env, notes = build_function_deploy_flags(
+            fn, dst_proj, dst_uri, proj_map, num_map)
+        for n in notes:
+            self.dst_logger.info(f"    [Fn] {label}: {n}")
+
+        secretish = function_secretish_env_names(fn)
+        if secretish:
+            add_note(src_proj, dst_proj, "function_plaintext_secret",
+                     name, region, ", ".join(secretish))
+            self.dst_logger.warning(
+                f"    ⚠ [Fn] {label}: 平文の環境変数を src と同じ値で複製します "
+                f"({', '.join(secretish)})。別 ORG に同じ秘密が増えるため、"
+                f"不要なら dst で差し替え / ローテーションしてください")
+
+        # env は `--set-env-vars` ではなく **ファイル渡し**にする。
+        # 値にカンマや `=` が入ると --set-env-vars のパースが壊れるため。
+        fd, env_path = tempfile.mkstemp(prefix=f"fn-env-{name}-", suffix=".yaml")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.safe_dump(env, f, sort_keys=True, allow_unicode=True,
+                               default_flow_style=False)
+            def _q(flag: str) -> str:
+                """`--key=value` の value 側だけシェルクォートする。
+
+                entry-point / runtime などは src 由来の値なので、素で埋め込むと
+                空白や記号でコマンドが壊れる（`--key` 単独のフラグはそのまま）。
+                """
+                if "=" not in flag:
+                    return flag
+                k, v = flag.split("=", 1)
+                return f"{k}={shlex.quote(v)}"
+
+            cmd = (f"gcloud functions deploy {name} --region={region} "
+                   f"--project={dst_proj} " + " ".join(_q(f) for f in flags))
+            if env:
+                cmd += f" --env-vars-file={shlex.quote(env_path)}"
+            cmd += " --quiet"
+            res = self.run_command(
+                cmd, side="dst", logger=self.dst_logger,
+                desc=f"Function Deploy {name}",
+                explanation=f"dst {dst_proj} に Cloud Functions {name} "
+                            f"({region}) をソースから再ビルド / デプロイ",
+                impersonate_sa=dst_sa, allow_fail=True,
+            )
+            if res is None and not (self.dry_run or self.mock):
+                self.dst_logger.error(f"    ✗ [Fn] {label}: deploy に失敗しました")
+                return
+            self.dst_logger.info(f"    ✓ 複製 {dst_proj}/{name} ({region})")
+        finally:
+            try:
+                os.unlink(env_path)
+            except OSError:
+                pass
+
+    def _persist_serverless_notes(self, pairs, notes: List[Dict[str, str]]):
+        """複製を見送ったサービスの注記を active/<src>/.serverless_notes.json に書く。
+
+        Step 99 の `load_customize_notes` が読み、DIFF.md の注記セクションに出す。
+        **処理した src は注記が無くても空リストで上書きする**（原因が解消したら
+        注記も消えるように。.tf と同じライフサイクル）。
+        """
+        active_dir = os.path.join(self._tf_base_dir(), 'active')
+        by_src: Dict[str, List[Dict[str, str]]] = {
+            src: [] for src, _dst, _s, _d in pairs}
+        for n in notes:
+            by_src.setdefault(n.get("src_dir", ""), []).append(n)
+        for src, items in by_src.items():
+            if not src:
+                continue
+            proj_dir = os.path.join(active_dir, src)
+            try:
+                os.makedirs(proj_dir, exist_ok=True)
+                with open(os.path.join(proj_dir, _SERVERLESS_NOTES_FILE),
+                          "w", encoding="utf-8") as f:
+                    json.dump(items, f, ensure_ascii=False, indent=2)
+            except OSError as e:
+                self.dst_logger.warning(
+                    f"  [Run] 注記を書き出せませんでした ({src}): {e}")
 
     def step_iam_sync(self):
         """Step 5.7: src の SA に付いている IAM ロールを dst の同名 SA へ複製する。

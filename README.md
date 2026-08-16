@@ -1,7 +1,7 @@
-# GCP プロジェクト まるごとコピー ツール (Terraform / IaC ベース)
+# GCP プロジェクト GCE まるごとコピー ツール (Terraform / IaC ベース)
 
 既存の GCP マルチプロジェクト環境（**Original / コピー元**）を、構成とデータを保持したまま
-新しい GCP プロジェクト群（**Destination / コピー先**）へ **まるごとクローン** する運用自動化ツールです。
+新しい GCP プロジェクト群（**Destination / コピー先**）へ主に GCE を **まるごとクローン** する運用自動化ツールです。
 
 `dst/config.yaml` の定義に基づき、CAI スキャン → スナップショット検証 → Terraform エクスポート/適用 →
 GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行します。
@@ -18,6 +18,16 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > ノードは使い捨てのため復元する意味がなく、GKE が作り直したものと同等です）。
 > ノードが作られる仕組みと、コピー対象から外している GKE 自動生成リソースの一覧は
 > [GKE Standard のノード VM はどうやって作られるか](#-gke-standard-のノード-vm-はどうやって作られるか) を参照してください。
+
+> ⚡ **Cloud Run / Cloud Functions は Terraform ではなく専用ステップでコピーします。**
+> リソース定義を Terraform HCL に書き出す `bulk-export` が Cloud Run に対応していないため、
+> **Step 4.7 (`serverless_sync`)** がそれぞれのサービス自身の仕組みで複製します
+> （Cloud Run は定義 YAML の取り出し / 取り込み、Cloud Functions はソース zip を運んで
+> コピー先で再ビルド）。設定は不要で、`make run` を実行すれば動きます。
+> **正しく移せない設定を含むものは「中途半端にコピーしない」方針**で、
+> `DIFF.md` の要対応に手順つきで出ます。詳細は
+> [設定ファイル (config.yaml) の準備](#3-設定ファイル-configyaml-の準備) の
+> `steps.serverless_sync` を参照してください。
 > PersistentVolume のデータやクラスタ内の k8s オブジェクト（Deployment 等）は対象外なので、
 > コピー先クラスタ作成後に **Backup for GKE のリストア**（推奨）または再デプロイで戻してください。
 > コピー先クラスタは Backup for GKE のエージェントを**有効化した状態で作成**します（復元の必須要件）。
@@ -188,8 +198,9 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > make bootstrap-shared-vpc             # host を Shared VPC 化、svc をアタッチ、networkUser 付与
 > ```
 > 中身（呼び出されるスクリプト）:
-> - `scripts/bootstrap_dst_sa.sh` … dst SA を各 dst プロジェクトに作成し、`roles/editor`・`roles/storage.admin`・`roles/bigquery.admin`・`roles/iam.roleAdmin`・`roles/resourcemanager.projectIamAdmin` と、実行アカウントへの `roles/iam.serviceAccountTokenCreator` を付与。
->   `projectIamAdmin` は Step 5.7 (`iam_sync`) で src SA のロールを dst SA へ付与するために必要です（`roles/editor` に `setIamPolicy` は含まれません）。この SA が「任意の principal に任意のロールを配れる」力を持つ点は理解した上で運用してください。IAM 複製が不要なら `steps.iam_sync.enabled: false` にしてこのロールを外せます。**既存環境では再実行が必要です。**
+> - `scripts/bootstrap_dst_sa.sh` … dst SA を各 dst プロジェクトに作成し、`roles/editor`・`roles/storage.admin`・`roles/bigquery.admin`・`roles/iam.roleAdmin`・`roles/resourcemanager.projectIamAdmin`・`roles/iam.serviceAccountUser` と、実行アカウントへの `roles/iam.serviceAccountTokenCreator` を付与。
+>   `projectIamAdmin` は Step 5.7 (`iam_sync`) で src SA のロールを dst SA へ付与するために必要です（`roles/editor` に `setIamPolicy` は含まれません）。この SA が「任意の principal に任意のロールを配れる」力を持つ点は理解した上で運用してください。IAM 複製が不要なら `steps.iam_sync.enabled: false` にしてこのロールを外せます。
+>   `iam.serviceAccountUser` は Step 4.7 (`serverless_sync`) で Cloud Run / Functions に実行 SA を指定する（`actAs`）ために必要です（`roles/editor` には含まれません）。**既存環境では再実行が必要です。**
 > - `scripts/bootstrap_cross_project.sh` … 各 src プロジェクトに read-only カスタムロール `migrationSrcReader` を作成し、対応する dst SA に付与（さらに `roles/bigquery.dataViewer`）。**src(ORG) への read-only IAM 付与**を伴うため、`sync_env.py` の ORG 保護から意図的に分離されています。
 > - `scripts/bootstrap_shared_vpc.sh` … dst host を Shared VPC ホストにし、dst svc プロジェクトをアタッチ、各 svc の cloudservices/compute SA と svc 借用 SA に `roles/compute.networkUser` を付与。
 >
@@ -202,11 +213,11 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 
 | 対象 | 付与するロール | 理由 |
 | :--- | :--- | :--- |
-| **src（全プロジェクト）** | `roles/viewer` | compute / GCS の read、`resourcemanager.projects.getIamPolicy`（Step 5.7）、`serviceusage.services.list`（Step 1.5）を含む |
+| **src（全プロジェクト）** | `roles/viewer` | compute / GCS の read、`resourcemanager.projects.getIamPolicy`（Step 5.7）、`serviceusage.services.list`（Step 1.5）、`run.services.*` / `cloudfunctions.functions.*` の read（Step 4.7）を含む |
 | | `roles/cloudasset.viewer` | `cloudasset.assets.searchAllResources`（Step 1 `cai_scan` / Step 3 `bulk_export`）。**`roles/viewer` には含まれません** |
 | | `roles/bigquery.dataViewer` | BigQuery のデータ読み取り（Step 6 `data_sync`） |
-| | `migrationSrcReader`（カスタム） | `compute.snapshots.useReadOnly` など定義済みロールで賄えない read 権限。`scripts/bootstrap_cross_project.sh` が作成 |
-| **dst（全プロジェクト）** | `bootstrap_dst_sa.sh` の `ROLES` 相当 | `roles/editor` + `storage.admin` + `bigquery.admin` + `iam.roleAdmin` + `resourcemanager.projectIamAdmin`。dst では事実上 owner 相当の権限が必要です |
+| | `migrationSrcReader`（カスタム） | `compute.snapshots.useReadOnly` / `run.services.get` / `cloudfunctions.functions.get` / `storage.objects.get`（関数ソース zip）など、定義済みロールで賄えない read 権限。`scripts/bootstrap_cross_project.sh` が作成 |
+| **dst（全プロジェクト）** | `bootstrap_dst_sa.sh` の `ROLES` 相当 | `roles/editor` + `storage.admin` + `bigquery.admin` + `iam.roleAdmin` + `resourcemanager.projectIamAdmin` + `iam.serviceAccountUser`。dst では事実上 owner 相当の権限が必要です |
 
 > ⚠️ **`roles/viewer` だけでは足りません。** 上表の 4 つを揃えないと Step 1 / 3 / 5 / 6 が権限不足で失敗します。
 
@@ -250,7 +261,7 @@ cp dst/config.yaml.template dst/config.yaml
   （例: `-dst-MMDDHHMM`）を自動生成します。生成値は `terraform/.gcs_rename_value` に
   永続化され、`make plan` / `make run` / `skip_on_run` 間で同じ値が再利用されます
   （別名で作り直す場合はこのファイルを削除）。
-- **`steps`**: 各ステップ (`cai_scan` / `enable_apis` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `iam_sync` / `data_sync` / `vpc_sc`) の有効/無効と個別設定（スナップショット期限など）。
+- **`steps`**: 各ステップ (`cai_scan` / `enable_apis` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `serverless_sync` / `network_firewall` / `gce_restore` / `iam_sync` / `data_sync` / `vpc_sc`) の有効/無効と個別設定（スナップショット期限など）。
   `bulk_export.skip_on_run: true` にすると本番実行 (`make run`) では export/customize を
   スキップし、`make plan` で生成済みの `terraform/active/` を再利用して高速化します
   （`make plan` 自体は常に最新を取り直します）。実行時に一度だけ変えるなら
@@ -299,6 +310,45 @@ cp dst/config.yaml.template dst/config.yaml
     - 有効化に失敗した API は**エラーにせず** WARNING + 手動コマンドを案内します
       （本当に必要な API なら後続ステップが本来のエラーで止めます）。
       dst で不要な API は `skip_apis`、逆に足したい API は `extra_apis` に指定してください。
+  - **`serverless_sync`** (Step 4.7): **Cloud Run サービス / ジョブ**と **Cloud Functions**
+    (第 1・第 2 世代) を src → dst に複製します。**キー未指定でも有効**（設定不要で動きます）。
+    無効にするときだけ `enabled: false`。
+    - **なぜ専用ステップなのか**: `bulk-export` は Cloud Run を **1 件も出力しません**
+      （gcloud の asset type → KRM Kind 変換表に `run.googleapis.com/Service` が無いため）。
+      Terraform では複製されないので、それぞれのサービス自身の仕組みを使います。
+      - Cloud Run … 定義を YAML で書き出し、dst 用に書き換えて取り込む
+        （イメージは Step 3.7 が複製済みのものを digest ごと参照）
+      - Cloud Functions … ソース zip を dst のバケットへ運び、**dst 側で再ビルド**
+        （イメージ複製は不要。`<dst プロジェクト ID>-fn-source-migration` バケットを
+        関数と同じリージョンに冪等作成します。`source_bucket` で変更可）
+    - 環境変数・メモリ / CPU・タイムアウト・インスタンス数・同時実行数・ingress・
+      ヘルスチェック等は src の内容がそのまま引き継がれます。
+    - **「中途半端にコピーしない」方針**: 以下は**複製せず** `DIFF.md` の要対応に手順つきで
+      出します。参照先が src を指したままのリソースを dst に作ると、差分レポートにも
+      現れず（**存在はしている**ため）実行時まで壊れていることに気付けないためです。
+      - **Cloud Run サービス / ジョブ**: VPC コネクタ / Direct VPC egress / Cloud SQL 接続 /
+        Secret Manager 参照 / CMEK / Binary Authorization / サイドカー（複数コンテナ）/
+        GPU / 特定リビジョンへのトラフィック固定（カナリア配信・リビジョンタグ）
+      - **Cloud Functions**: **イベントトリガ**（Pub/Sub・Cloud Storage 等。
+        **HTTP トリガのみ対応**）/ Secret Manager 参照 / VPC コネクタ / CMEK /
+        第 1 世代でソース zip を取得できないもの（コンソールやローカルからアップロード
+        して作った関数は Google 管理領域にしかソースが無く、gcloud に取得手段がありません）
+    - **gen2 Cloud Functions の実体は Cloud Run サービス**です。Run として複製すると
+      dst に「Function ではない Run サービス」が生えてトリガーと管理単位を失うため、
+      Run 側では複製せず **Function として**複製します。
+    - **平文の環境変数**（`*_TOKEN` / `*_SECRET` / `*_WEBHOOK` 等）は **src と同じ値**で
+      複製します（`roles/owner` や公開設定と同じ「忠実再現 + 警告」方針）。別 ORG に同じ
+      秘密が増えるため、不要なら dst で差し替え / ローテーションしてください
+      （`DIFF.md` の「確認」に一覧が出ます）。
+    - **実行サービスアカウント**は dst の同名 SA（既定 SA なら dst の既定 SA）に読み替えます。
+      読み替えできない / dst に存在しない場合は dst の既定 compute SA で起動するため、
+      権限が異なる可能性があります（`DIFF.md` の「確認」に出ます）。
+    - 特定のサービス・ジョブ・関数を除外したいときは `skip_services` に名前を列挙します。
+    - 必要権限: src に `run.services.get/list` / `cloudfunctions.functions.get/list` /
+      `storage.objects.get`（`bootstrap_cross_project.sh`）、dst に
+      `roles/iam.serviceAccountUser`（`bootstrap_dst_sa.sh`）。**既存環境では再実行が必要です。**
+      付与していなくても移行は止まりません（複製が警告付きでスキップされます）。
+
   - **`iam_sync`** (Step 5.7): src の SA に付いている IAM ロールを dst の同名 SA へ複製。
     **キー未指定でも有効**（設定不要で動きます）。無効にするときだけ `enabled: false`。
     - 対象は **src 各プロジェクトの project IAM ポリシー**のうち user-managed SA
@@ -468,6 +518,7 @@ make plan
 > | **3.5** `enable_apis` | 生成された `.tf` から必要 API を**確定**させて全量を有効化し、**全て有効と確認**してから次へ進む関門。 |
 > | **3.7** `data_sync.artifact_registry` | コンテナイメージを**同じ digest** でコピー先へ複製。**Terraform より前**なのは Cloud Run が digest 固定で参照するため（無いと Step 4 が `Image ... not found`）。 |
 > | **4** `terraform_apply` | `terraform plan -out=tfplan` を生成（本番時のみ apply）。 |
+> | **4.7** `serverless_sync` | Cloud Run サービス / ジョブと Cloud Functions を複製。移せない設定を含むものは**作らず** `DIFF.md` の要対応へ。dry-run では書き換え内容と実行予定コマンドを表示。 |
 > | **4.5** `network_firewall` | classic firewall と Network Firewall Policy を複製（`secure_tag_map` 未登録の tagValues 参照は skip + WARNING）。 |
 > | **5** `gce_restore` | スナップショットから復元したディスクで VM を作成・差し替え。 |
 > | **5.5** `gce_restore` | 電源状態（TERMINATED / SUSPENDED）をコピー元に合わせる。 |
@@ -515,13 +566,14 @@ make run
 > 1. **Step 1.5 / 3.5 (`enable_apis`)** で必要な API をコピー先に用意する。1.5 はコピー元由来を先行有効化して伝播時間を稼ぎ、3.5 は生成された `.tf` から確定させた**全量**を有効化して**全て有効と確認**してから Terraform に進む（GKE の `container.googleapis.com` など。無効なままだと `terraform apply` が 403 で止まる）。
 > 2. **Step 3.7** でコンテナイメージを複製する（Cloud Run が digest 固定で参照するため Terraform より前）。
 > 3. コピー先ホストプロジェクトに、Terraform で VPC・サブネット・Cloud Router・Cloud NAT 等のインフラを再現（bulk-export の HCL を `terraform apply`）。
-> 4. classic firewall ルールと Network Firewall Policy は **Step 4.5 (`network_firewall`)** で `gcloud` 経由で複製（dst host VPC が出来ている前提。`secure_tag_map` で別 ORG の tagValues 変換、未登録参照は skip + WARNING）。
-> 5. Original の有効なスナップショット（期限内）から、コピー先にディスクを復元。
-> 6. 復元したブートディスクを VM に差し替えて起動（OS 状態・データごと完全復元）。電源状態（RUNNING / TERMINATED / SUSPENDED）は **Step 5.5** でまとめて反映。
-> 7. src の SA に付いていた IAM ロールを **Step 5.7 (`iam_sync`)** で dst の同名 SA へ複製（別 ORG で ID が変わるロールはスキップ + WARNING。`roles/owner` を付与した場合は末尾に警告）。**Cloud Run の「未認証アクセスを許可」もここで複製**します（付与内容は末尾に警告表示）。
-> 8. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
-> 9. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
-> 10. 全移行の最後に、dst プロジェクトを既存の VPC Service Controls ペリメタへ追加（`vpc_sc.billing_project` が必須。未設定ならスキップ）。
+> 4. **Step 4.7 (`serverless_sync`)** で Cloud Run サービス / ジョブと Cloud Functions を複製（SA・VPC・バケットが Terraform で出来た後、かつ Cloud Run の公開設定を付ける Step 5.7 より前）。
+> 5. classic firewall ルールと Network Firewall Policy は **Step 4.5 (`network_firewall`)** で `gcloud` 経由で複製（dst host VPC が出来ている前提。`secure_tag_map` で別 ORG の tagValues 変換、未登録参照は skip + WARNING）。
+> 6. Original の有効なスナップショット（期限内）から、コピー先にディスクを復元。
+> 7. 復元したブートディスクを VM に差し替えて起動（OS 状態・データごと完全復元）。電源状態（RUNNING / TERMINATED / SUSPENDED）は **Step 5.5** でまとめて反映。
+> 8. src の SA に付いていた IAM ロールを **Step 5.7 (`iam_sync`)** で dst の同名 SA へ複製（別 ORG で ID が変わるロールはスキップ + WARNING。`roles/owner` を付与した場合は末尾に警告）。**Cloud Run の「未認証アクセスを許可」もここで複製**します（Step 4.7 でサービスが出来ているので、**1 回の `make run` で公開設定まで入ります**。付与内容は末尾に警告表示）。
+> 9. `rename_rules` に基づき GCS バケット等を衝突回避してリネームし、データを同期。
+> 10. BigQuery データセットは **src の location を継承** して作成（クロスリージョン失敗を回避）。
+> 11. 全移行の最後に、dst プロジェクトを既存の VPC Service Controls ペリメタへ追加（`vpc_sc.billing_project` が必須。未設定ならスキップ）。
 
 > ♻️ **Terraform 適用の冪等性 / state 管理**（再実行しても 409/404 で落ちないための仕組み）
 > - **`make plan` は state を消さない**（`clean` 依存を撤去済み）。同一 dst project id なら前回の
@@ -643,6 +695,9 @@ steps:
 | 外部 IP アドレス | Google 採番のグローバル資源で同じ値は確保できない | 新しい IP が採番されます（**内部 IP は同じ値のまま複製**） |
 | サーバーレス NEG / 前段 LB の一部 | bulk-export が出力しない | コピー先で手動再構築 |
 | Container Analysis の occurrence | 過去ビルドの来歴レコード。参照先がコピー先に存在しない | 再ビルドすれば再生成されます |
+| VPC / Cloud SQL / Secret / CMEK 等を使う Cloud Run | 参照先がコピー元を指したままの**壊れたサービス**を作ると差分レポートにも現れず気付けない | 依存をコピー先に用意してから手動で `gcloud run services replace`（DIFF に手順を掲載） |
+| イベントトリガの Cloud Functions | 参照先のトピック名 / バケット名がコピー先では変わるため、誤ったイベント源を購読しかねない | 依存を用意して手動 `gcloud functions deploy`（**HTTP トリガは自動でコピーされます**） |
+| 第 1 世代 Functions のうちソース取得不能なもの | `sourceUploadUrl`（署名付きアップロード URL）しか無く、gcloud にダウンロード手段が無い | コンソールの「ソース」タブから zip を取得して手動デプロイ |
 
 > ⚠️ **`deletion_protection` は `false` で作成されます**（Cloud Run / GKE / Cloud SQL）。
 > コピー元の設定に出力されない項目で、既定の `true` のままだと**途中で失敗したリソースを次回作り直せず移行が詰む**ためです。
@@ -746,7 +801,7 @@ make vmware-clean       # vmware/logs/ を削除
 
 - **日本語で記録**: 各操作の「実行内容」を日本語の補足説明付きで出力。
 - **ステップ単位でグループ化**: `━━━━` バーで `ステップ N: タイトル (対象 X 件)` を区切り表示。
-  小数のステップは**小数点を省いた番号**で出ます（Step 1.5 → `ステップ 15`、3.5 → `ステップ 35`、3.7 → `ステップ 37`、4.5 → `ステップ 45`、5.7 → `ステップ 57`、差分レポート → `ステップ 99`）。
+  小数のステップは**小数点を省いた番号**で出ます（Step 1.5 → `ステップ 15`、3.5 → `ステップ 35`、3.7 → `ステップ 37`、4.5 → `ステップ 45`、4.7 → `ステップ 47`、5.7 → `ステップ 57`、差分レポート → `ステップ 99`）。
 - **アクションの記号化**: `✓ スキップ / + 作成 / − 削除 / ✗ 失敗` で一目で判別。
 - **スレッドタグ**: 並列実行時、各ログ行に `[main]` / `[cai-scan_0]` 等のタグが自動付与され、`grep` で追跡可能。
 - **末尾サマリ**: 実行時間 / 読取成功 / 書込成功 / スキップ / 失敗 / Mock 実行 / ログパスを出力。

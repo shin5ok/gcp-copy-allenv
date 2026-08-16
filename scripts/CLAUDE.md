@@ -19,6 +19,9 @@
 | 2 gce_snapshot | プロジェクト | 既存 |
 | 3 bulk_export | プロジェクト | 既存 |
 | 4 terraform_apply (init / plan / apply) | プロジェクト (Terraform ルート) | 各 `terraform/active/<src>/` は state 分離済。`_terraform_one_project` を `_parallel_for_each` で並列化 |
+| 4.7 serverless_sync (列挙) | プロジェクト | `run-list` / `fn-list`。src の Cloud Run サービス・ジョブ・Functions 一覧 |
+| 4.7 serverless_sync (Run 複製) | **サービス / ジョブ** | flat (project × resource) units で並列（`run-sync`）。`replace` は 1 件数十秒かかり Cloud Run は 1 プロジェクトに集中しがちなので、プロジェクト並列だと並列度が事実上 1 になる |
+| 4.7 serverless_sync (Fn 複製) | **関数** | flat units で並列（`fn-sync`）。deploy は dst で Cloud Build が走るぶんさらに遅い |
 | 4.5 network_firewall (classic rules) | ルール | `_sync_classic_firewall_rules` 内 |
 | 4.5 network_firewall (policy rules) | ルール | `_sync_fw_policy_rules` 内 |
 | 5 gce_restore (listing) | プロジェクト | VM/snap 一覧並列取得 |
@@ -234,6 +237,33 @@
   - dst host VPC の作成は `_replicate_host_networks()` の責務。元々は `step_gce_restore` (Step 5) からしか呼ばれず Step 4.5 が先に走って詰んでいたため、現在は **`step_network_firewall` の冒頭でも呼ぶ**。冪等 (`_gcloud_exists` ガード) なので Step 5 で再度呼ばれても describe のみで安全。
   - 追加の防御として `_sync_classic_firewall_rules` 冒頭で参照される dst network を一括 pre-flight チェックし、`_sync_fw_policy_associations` でも assoc 単位で existence チェックして、未存在なら skip + WARNING に倒す（cryptic な API エラー量産を防ぐ）。
   - Shared VPC ホスト化・サービスプロジェクト関連付け・networkUser 付与は別途 `bootstrap_shared_vpc.sh` の担当。VPC 自体は作らない点に注意。
+
+### サーバーレス複製（Step 4.7 / `step_serverless_sync`）
+
+- **bulk-export は Cloud Run を 1 件も出力しない**。gcloud の asset type → KRM Kind 変換テーブルに `run.googleapis.com/Service` が無く、`--resource-types`（= `export_resource_types: "auto"`）を渡す経路では gcloud 側が CAI list を作る段階で落ちる（`_BuildAssetTypeFilterFromKind(["RunService"])` → `[]`）。config-connector バイナリの `print-resources` には `RunService` があるが **`SupportsBulkExport: false`** と申告している。フィルタ無し経路（`--resource-types` を付けない）ならバイナリ側が一部出力するが、**リージョンによって取りこぼす**（実測 5 件中 3 件のみ）うえ 30 分 timeout が再発するので採らない。→ Terraform を諦めて **Knative YAML の round-trip**（`describe --format=export` → 書き換え → `replace`）で複製する。
+- **`replace` は「送った spec が正」**＝ YAML から落としたフィールドは dst で既定値に戻る破壊的 API。したがって **allow-list 方式**に倒す:
+  - 未知のフィールドは**触らずそのまま残す**（知らないものを消すと既定値へ戻る）。
+  - 移せない設定を持つサービスは **複製しない**（`run_service_unsupported_reasons`）。VPC コネクタ / Direct VPC egress / Cloud SQL / Secret Manager 参照 / CMEK / Binary Authorization / サイドカー / GPU / 非 emptyDir ボリューム / リビジョン固定トラフィックが対象。**部分コピーすると「dst に在るが参照先が src を指す壊れたサービス」**ができ、CAI 差分にも現れないので誰も気付けない（＝ 作らない方が安全）。
+  - 本適用の前に必ず `replace --dry-run`（サーバ側検証）を通す。
+- **GCE 用の `_resolve_dst_vm_service_account` を流用しないこと**。あちらは「default compute SA は除去」「dst に無ければ空 SA を冪等作成」という VM 固有の挙動で、Cloud Run に当てるとサービスの実行権限が黙って変わる。serverless 専用の `resolve_dst_run_service_account`（純粋関数）を使う。実測では **対象 5 サービス中 4 件が default compute SA** だったので影響が大きい。返り値 `None` は「`serviceAccountName` を YAML から外す」＝ dst の既定 compute SA に委ねる意味（src の既定 SA → dst の既定 SA で意味が揃う）。
+- **イメージは digest を保ったまま project 部分だけ差し替える**（`rewrite_run_image_ref`）。Step 3.7 が gcrane / crane で **digest 不変**コピーをしている前提に依存する（docker の pull→push だと digest が変わり `@sha256:` 参照が解決不能になる）。mapping 外プロジェクト / 第三者レジストリは**書き換えない**（触ると存在しない参照を作る）。適用前に `gcloud artifacts docker images describe` で dst の実在も確認する（無いまま replace すると `Image not found` でリビジョン作成が失敗し tainted で残る）。
+- **gen2 Cloud Functions の実体は Run サービス**。`serviceConfig.service` の**正式なリソース名**（project + region + service）で判定して Run 側の複製から外す（`parse_gen2_function_run_services`）。**同名判定にすると、たまたま同名の利用者サービスまで巻き込む**。Run として複製すると dst に「Function ではない Run サービス」が生えてトリガーと管理単位を失うため。除外しても **Function 側（`fn-sync`）が複製を担当する分担**なので DIFF 注記は出さない（複製できなければ `function_unsupported` の注記が出る）。
+- **実行位置は Step 4（terraform apply）の後、Step 5.7（iam_sync）の前**。SA / VPC / バケットを Step 4 が先に作る必要があり、`_sync_run_service_invokers`（公開設定の複製）は「dst にサービスがある」前提。順番を崩すと初回 run で公開設定が付かず再実行が要る。
+- **Terraform との二重所有を必ず断つ**。`serverless_tf_skip_reason()`（純粋関数）を customize (Step 3) と apply 直前 (Step 4 `_purge_serverless_tf_files`) の**両方**から呼ぶ。customize 側だけだと `skip_on_run: true` が customize ごとスキップして古い `active/` をそのまま apply する（GKE 管理 .tf と同じ二段構え）。対象は `_SERVERLESS_OWNED_TF_TYPES`（Run サービス / Run ジョブ / Functions gen1・gen2）。**このステップが複製しないものを terraform から消してはいけない**（誰も複製しない = 単なる移行漏れになる）。
+- **注記は `.serverless_notes.json`（`_SERVERLESS_NOTES_FILE`）に別ファイルで書く**。customize より後に走るため `.customize_notes.json` に書くと次回 customize に上書きされて消える。`load_customize_notes()` が両方読む。処理した src は**注記が無くても空リストで上書き**する（原因が消えたら注記も消える = .tf と同じライフサイクル）。
+- **平文 env のシークレットは忠実複製 + 警告**（`roles/owner` や公開 invoker と同じ扱い）。ただし別 ORG に同じ秘密が増えるので、`run_secretish_env_names()` で拾って WARNING + DIFF の「確認」に必ず出す。Secret Manager 参照（`secretKeyRef`）は値を複製しない方針なので、そもそも unsupported として複製自体を見送る。
+- **env の値置換は src プロジェクト ID の完全一致のみ**。部分一致で置換すると URL や JSON の中身を壊す。
+- **権限は preflight（`_SRC_PERMS_BY_STEP` / `_DST_PERMS_BY_STEP`）に足さない**。既定 true のステップなので、足すと Cloud Run を使っていない移行でも権限を要求し、`bootstrap_cross_project.sh` の絞ったカスタムロールを使う既存環境が bootstrap 再実行まで止まる（`serviceusage.services.list` と同じ扱い）。代わりに一覧取得失敗を WARNING + スキップに倒し、bootstrap 側の `CUSTOM_PERMS` / `ROLES` にだけ追加する（dst は実行 SA 指定に `roles/iam.serviceAccountUser` = `actAs` が要る）。
+- **`is_src_read_only` の動詞判定は「左に `-` . / : @ が無いこと」で見る**。`\b` だと AR の既定リポジトリ名 `cloud-run-source-deploy` が `deploy` に誤マッチして read-only の `artifacts docker images list` まで拒否される（regression）。右のハイフンは許す（`attach-disk` / `add-iam-policy-binding` / `create-with-container` のように動詞が接頭辞になる実在の書込サブコマンドを取り逃さないため）。`_WRITE_VERBS` に単語を足すときはこの非対称性を意識すること。
+- **Cloud Run ジョブはテンプレートが 1 段深い**（Service は `spec.template.spec` = RevisionSpec、Job は `spec.template.spec.template.spec` = TaskSpec で Execution を挟む）。パス決め打ちで書き換えると **Job で全部素通りして src 参照のまま複製される**ため、`_iter_run_pod_specs()` / `_iter_run_metadata()` で「`containers` を持つ dict」「`metadata` dict」を走査する。同じ理由で unsupported 判定・平文シークレット検出も走査ベース。**トップレベルの `metadata.name` はリソース名なので残し、テンプレート側の `name`（リビジョン / 実行名）だけ落とす**。
+- **Cloud Functions は「ソース zip を dst に置いて再ビルド」**（`gcloud functions deploy`）。イメージの複製は不要（dst の Cloud Build が作る）。したがって dst には `run` / `cloudfunctions` / `cloudbuild` / `artifactregistry` の 4 API が要る（`_STEP_DST_APIS`）。
+- **第 1 世代でソース zip を取得できないケースがある**。コンソールや `--source=<ローカル>` で作った gen1 は `sourceUploadUrl`（**署名付きアップロード URL**）しか持たず、`sourceArchiveUrl`（利用者バケットの gs:// パス）が無い。gcloud にソースをダウンロードするコマンドは存在しない（`gcloud functions` に該当サブコマンド無し）ので複製不能 → DIFF 要対応でコンソールからの zip 取得を案内する（実測: my-argolis の `function-1`）。判定は `function_source_object()` が None を返すかどうか。
+- **Functions は HTTP トリガのみ対応**。イベントトリガ（Pub/Sub / GCS / Firestore）は、参照先のトピック名・**バケット名が `rename_rules` で dst では変わる**、Eventarc のチャネルとサービスエージェント設定が要る、等で機械的に写すと**誤ったイベント源を購読する関数**を作りかねない。対応を広げるなら参照先の存在確認とリネーム追従を実装してからにすること。
+- **`gcloud functions deploy` に渡す設定を取りこぼすと dst で黙って既定値になる**。describe から読めるものは `_FN_GEN2_SERVICE_FLAGS` / `_FN_GEN1_FLAGS` で明示的にフラグへ落とす（memory / cpu / timeout / max・min instances / concurrency / ingress）。gen1 と gen2 で**キー名も単位も違う**（`availableMemoryMb: 256` → `--memory=256MB` / `availableMemory: "256Mi"` → `--memory=256Mi`、`timeoutSeconds: 30` → `--timeout=30s`）。`--ingress-settings` は describe の `ALLOW_ALL` 形式をそのまま渡せないので `_FN_INGRESS_MAP` で変換する。
+- **env は `--set-env-vars` ではなく `--env-vars-file`（YAML）で渡す**。値にカンマや `=` が入ると `--set-env-vars` のパースが壊れる。`FUNCTION_TARGET` / `K_SERVICE` 等の予約変数は deploy が弾くので除去する。
+- **ソース zip の複製は「src 認証で download → dst 認証で upload」の 2 フェーズ**。1 プロセスで src と dst の借用 SA を同時には使えないため。`gcloud storage cp gs://... <local>` は `cp` が `_WRITE_VERBS` にあるので通常は拒否されるが、**宛先が `gs://` でないこと**を構文で確認する `_SRC_GCS_DOWNLOAD_RE` で明示的に許可している。**この条件を緩めてはいけない**（緩めると src バケットへの書き込みが素通りする）。`cp <local> gs://src/...` と `cp gs://a gs://b` は引き続き拒否される。
+- dst のソース受け渡しバケットは `<dst プロジェクト ID>-fn-source-migration`（`steps.serverless_sync.source_bucket` で上書き可）。dst プロジェクト ID がグローバル一意なのでバケット名も一意になる。無ければ関数と同じリージョンに冪等作成する。
+- mock には 5 経路を仕込んである: 複製できる Run サービス `mock-public-api` / VPC コネクタ付きで skip する `mock-vpc-api` / gen2 Function の実体で Run 側は skip する `mock-fn-svc` / **入れ子の深い** Run ジョブ `mock-batch-job` / ソース取得不能な gen1 `mock-fn-legacy`。判定が壊れると `make mock` の出力が変わって気付ける。
 
 ### IAM ロール複製（Step 5.7 / `step_iam_sync`）
 

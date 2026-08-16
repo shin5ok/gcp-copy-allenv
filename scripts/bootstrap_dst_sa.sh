@@ -42,6 +42,11 @@ ROLES=(
   "roles/bigquery.admin"
   "roles/iam.roleAdmin"
   "roles/resourcemanager.projectIamAdmin"
+  # Step 4.7 (serverless_sync) が Cloud Run サービスを作るときに、サービスの実行
+  # SA を指定するため `iam.serviceAccounts.actAs` が要る。roles/editor には
+  # 含まれないので明示付与する（不足すると replace が
+  # "does not have access to service account" で失敗する）。
+  "roles/iam.serviceAccountUser"
 )
 
 while [[ $# -gt 0 ]]; do
