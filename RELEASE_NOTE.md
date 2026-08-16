@@ -7,9 +7,10 @@
 
 ## 2026-08-17 — Cloud Run / Cloud Functions を自動でコピーするようになりました
 
-これまで **Cloud Run と Cloud Functions は 1 件もコピーされていませんでした**。
-コピー元の定義を Terraform 形式で書き出す `bulk-export` が Cloud Run に対応しておらず、
-DIFF.md に「要対応（手動で作り直してください）」と出るだけだったためです。
+これまで **Cloud Run と Cloud Functions は確実にはコピーされませんでした**。
+コピー元の定義を Terraform 形式で書き出す `bulk-export` が Cloud Run をうまく扱えず、
+リージョンによっては書き出されない（設定によっては 1 件も書き出されない）ためです。
+コピーされなかったものは DIFF.md に「要対応（手動で作り直してください）」と出るだけでした。
 
 今回、それぞれのサービス自身の仕組みを使う **Step 4.7** を追加しました。設定は不要で、
 `make run` を実行すれば動きます。
