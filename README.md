@@ -25,7 +25,7 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > 具体的な手順（コピー元でのバックアップ作成・サービスエージェント権限を含む）は
 > クラスタごとに `DIFF.md` の「要対応」へ出力されます。
 
-> 📚 **関連ドキュメント**: [architecture/sync-env-flow.html](./architecture/sync-env-flow.html)（実行フロー図）・[PROCEDURE.md](./PROCEDURE.md)（推奨運用フロー）・[SPEC.md](./SPEC.md)（全体仕様）・[dst/SPEC.md](./dst/SPEC.md)（コピー先仕様）・[HISTORY.md](./HISTORY.md)（変更履歴）・[doc/outbound-quarantine-design.md](./doc/outbound-quarantine-design.md)（dst outbound 遮断（検疫）設計）
+> 📚 **関連ドキュメント**: [architecture/sync-env-flow.md](./architecture/sync-env-flow.md)（実行フロー図）・[PROCEDURE.md](./PROCEDURE.md)（推奨運用フロー）・[SPEC.md](./SPEC.md)（全体仕様）・[dst/SPEC.md](./dst/SPEC.md)（コピー先仕様）・[HISTORY.md](./HISTORY.md)（変更履歴）・[doc/outbound-quarantine-design.md](./doc/outbound-quarantine-design.md)（dst outbound 遮断（検疫）設計）
 
 ---
 
@@ -777,14 +777,14 @@ make test
 変更内容と理由は [`HISTORY.md`](./HISTORY.md) に日付の新しい順で記録しています。
 
 ### 実行フロー図
-[`architecture/sync-env-flow.html`](./architecture/sync-env-flow.html) をブラウザで開くと、`make run` が Step 0 から Step 99 まで**何を判定して、どこで止まり・どこで複製をやめ・どこで警告だけ出すか**を 6 枚のフロー図で確認できます（起動前チェックの停止条件、`.tf` の間引き判定、GKE 除外、`terraform apply` の内部、VM 復元と電源状態）。
+`make run` が Step 0 から Step 99 まで**何を判定して、どこで止まり・どこで複製をやめ・どこで警告だけ出すか**を 6 枚のフロー図で確認できます（起動前チェックの停止条件、`.tf` の間引き判定、GKE 除外、`terraform apply` の内部、VM 復元と電源状態）。同じ内容を 2 つの形式で置いています。
+
+- [`architecture/sync-env-flow.md`](./architecture/sync-env-flow.md): **GitHub 上でそのまま図が表示されます**（mermaid）。
+- [`architecture/sync-env-flow.html`](./architecture/sync-env-flow.html): ブラウザで開く用。単体で完結しているため追加インストール・ネットワーク接続は不要です。
 
 ```bash
 xdg-open architecture/sync-env-flow.html   # macOS は open
 ```
-
-> 単体で完結した HTML なので追加インストール・ネットワーク接続は不要です。
-> GitHub の画面上ではソースが表示されるため、**クローンしてブラウザで開いてください**。
 
 ### 仕様書
 - [`SPEC.md`](./SPEC.md) / [`dst/SPEC.md`](./dst/SPEC.md): 詳細仕様。

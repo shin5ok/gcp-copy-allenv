@@ -436,21 +436,21 @@ flowchart TD
         <pre class="mermaid">
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace, Menlo, Consolas, 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif","fontSize":"13px","lineColor":"#7C8D92","textColor":"#16242A","edgeLabelBackground":"#EDF1F1"}}}%%
 flowchart TD
-  F["raw/&lt;src&gt;/**/*.tf を 1 件読む"] --> R1["1. src ID / 番号 → dst に置換<br/>network URL を .self_link 参照へ"]
+  F["raw/(src)/**/*.tf を 1 件読む"] --> R1["1. src ID / 番号 → dst に置換<br/>network URL を .self_link 参照へ"]
   R1 --> R2["2-3.7. バケット名リネーム / boot_disk.source 除去<br/>固定 IP 解除 / UBLA 統一 / provider 非互換の吸収"]
   R2 --> D1{"3.8 project = が<br/>dst ID 集合に無い非数値か"}
   D1 -->|"はい = 越境出力"| K1["捨てる<br/>無関係な実プロジェクトへの<br/>書き込みを防ぐ"]
   D1 -->|"いいえ"| D2{"4. _skip_reason_for_file<br/>複製不能 or GKE 管理か"}
   D2 -->|"self-managed 証明書<br/>occurrence / GKE 管理"| K2["捨てる + DIFF に注記"]
   D2 -->|"いいえ"| D3{"3.85 src で IN_USE の<br/>内部アドレスか"}
-  D3 -->|"はい"| K3["捨てる<br/>Step 5 が mig-&lt;vm&gt;-&lt;ip&gt; で予約し直す"]
+  D3 -->|"はい"| K3["捨てる<br/>Step 5 が mig-(vm)-(ip) で予約し直す"]
   D3 -->|"いいえ"| D4{"3.9 resource_types の<br/>include / exclude に外れるか"}
   D4 -->|"全型が対象外"| K4["捨てる<br/>1 型でも残るなら通す"]
   D4 -->|"いいえ"| D5{"google_container_cluster か"}
   D5 -->|"はい"| N1["DIFF に Backup for GKE の<br/>移行手順を要対応で追記"]
-  D5 -->|"いいえ"| R3["4.5 ラベル重複を &lt;label&gt;_&lt;location&gt; に改名<br/>deletion_protection = false を補完"]
+  D5 -->|"いいえ"| R3["4.5 ラベル重複を (label)_(location) に改名<br/>deletion_protection = false を補完"]
   N1 --> R3
-  R3 --> W["active/&lt;src&gt;/ へ平坦に書き出し"]
+  R3 --> W["active/(src)/ へ平坦に書き出し"]
   W --> P2["2 パス目<br/>subnet / SA / URL 参照を<br/>terraform 参照へ書き換え<br/>証明書待ちの LB フロントを保留"]
 
   classDef gate fill:#FAF0DA,stroke:#8A6612,stroke-width:1.5px,color:#3D2E08;
@@ -485,12 +485,12 @@ flowchart TD
   C["HCL の中身"] --> D1{"GKE 管理型 かつ name が<br/>gke- / gk3- / k8s- 接頭辞"}
   D1 -->|"はい"| S1["捨てる<br/>instance template / MIG /<br/>autoscaler / health check / route"]
   D1 -->|"いいえ"| D2{"description に kubernetes.io の<br/>所有者マーカー"}
-  D2 -->|"はい"| S2["捨てる<br/>k8s Service LB<br/>名前は a&lt;31hex&gt; で接頭辞に掛からない"]
+  D2 -->|"はい"| S2["捨てる<br/>k8s Service LB<br/>名前は a(31hex) で接頭辞に掛からない"]
   D2 -->|"いいえ"| D3{"Gateway マーカー k8sResource+k8sCluster<br/>または gkegw1- / k8s1- / k8s-be-"}
   D3 -->|"はい"| S3["捨てる<br/>backend service / URL map /<br/>proxy / forwarding rule / NEG"]
-  D3 -->|"いいえ"| D4{"name が pvc-&lt;uuid&gt; / mcrt-&lt;uuid&gt;"}
+  D3 -->|"いいえ"| D4{"name が pvc-(uuid) / mcrt-(uuid)"}
   D4 -->|"はい"| S4["捨てる<br/>復元後に dst で再発行される"]
-  D4 -->|"いいえ"| D5{"gke-&lt;cluster&gt;-&lt;hash&gt;-dns ゾーン<br/>または backup / restore plan"}
+  D4 -->|"いいえ"| D5{"gke-(cluster)-(hash)-dns ゾーン<br/>または backup / restore plan"}
   D5 -->|"はい"| S5["捨てる"]
   D5 -->|"いいえ"| K["残す<br/>google_container_cluster と<br/>node_pool は絶対に落とさない"]
 
