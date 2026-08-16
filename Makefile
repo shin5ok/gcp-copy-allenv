@@ -22,6 +22,13 @@ VMWARE_MAKE   := $(MAKE) -C vmware CONFIG=$(VMWARE_CONFIG)
 YES      :=
 YES_FLAG := $(if $(YES),--yes,)
 
+# bulk_export.skip_on_run の実行時上書き（config.yaml を触らず今回だけ変える）
+#   make run SKIP_ON_RUN=0  … export/customize を必ず再実行
+#   make run SKIP_ON_RUN=1  … 既存 active を再利用
+# YES と同じく `:=` で環境変数を無視（コマンドラインでの明示指定のみ有効）
+SKIP_ON_RUN      :=
+SKIP_ON_RUN_FLAG := $(if $(filter 0,$(SKIP_ON_RUN)),--no-skip-on-run,$(if $(filter 1,$(SKIP_ON_RUN)),--skip-on-run,))
+
 ## help: ターゲット一覧を表示します
 help:
 	@echo "使用方法: make [target] [ARGS=\"...\"]"
@@ -41,9 +48,9 @@ plan: setup
 mock: setup
 	uv run python3 scripts/sync_env.py --mock --no-dry-run $(ARGS)
 
-## run: 本番実行（dst プロジェクトに対する書き込みを伴います）※YES=1 で続行確認を自動承認
+## run: 本番実行（dst プロジェクトに対する書き込みを伴います）※YES=1 で続行確認を自動承認 / SKIP_ON_RUN=0|1 で skip_on_run を今回だけ上書き
 run: setup
-	uv run python3 scripts/sync_env.py --no-dry-run $(YES_FLAG) $(ARGS)
+	uv run python3 scripts/sync_env.py --no-dry-run $(YES_FLAG) $(SKIP_ON_RUN_FLAG) $(ARGS)
 
 ## test: 単体テスト（pytest）を実行
 test:

@@ -34,6 +34,16 @@ global:
   # 人間が理解しやすい実行目的の補足説明がログに詳細に出力されます。
   verbose_logging: true
 
+  # Mock モード (デフォルト: false)
+  # true の場合、外部コマンド (gcloud / terraform / bq / docker) を一切実行せず、
+  # ダミーデータで一連の流れだけをシミュレートします (GCP 未接続でも動く)。
+  #
+  # ⚠️ 通常は **この値を書かず、`make mock` を使ってください**。
+  #    `make mock` はコマンドラインの --mock でこの値を上書きします。
+  #    ここに true を書いたまま忘れると、`make run` が Mock モードで走り
+  #    「成功したのに dst に何も作られていない」状態になります (dry_run と同種の事故)。
+  # mock: false
+
 # ------------------------------------------------------------------------------
 # 1.5. 事前準備設定 (Provisioning / Bootstrap Settings)
 # ------------------------------------------------------------------------------
@@ -136,6 +146,13 @@ rename_rules:
 # 4. ステップ制御 (Step Control)
 # ------------------------------------------------------------------------------
 # 各手順の実行有無 (enabled) および個別設定を行います。
+#
+# ■ enabled を省略した場合の既定値はステップごとに違います
+#   - enable_apis / iam_sync / network_firewall … 既定 **true**
+#     (設定を書かなくても動く。後から追加したステップで、キーの無い既存 config でも
+#      有効になるようにしてある。無効化したいときだけ enabled: false を明記する)
+#   - 上記以外のステップ … 既定 **false**
+#     (キーごと消すと「黙ってスキップ」になります。無効化の意図が無いなら消さないこと)
 steps:
   # [Step 1] Cloud Asset Inventory (CAI) での現状確認
   cai_scan:
@@ -144,6 +161,22 @@ steps:
     # 未登録 assetType（_ASSET_COVERAGE に無い種別）を検出したら処理を停止するか
     # 既定 false: WARNING でログに残すのみ。CI で漏れゼロを強制したい場合は true。
     fail_on_uncovered: false
+
+  # [Step 1.5] dst プロジェクトの API 事前有効化
+  # src で有効な API（CAI の serviceusage / `gcloud services list --enabled`）を
+  # dst にも反映します。dst で API が無効だと Step 4 の terraform apply が
+  # 「<API> has not been used in project ... before or it is disabled」で止まります
+  # （GKE = container.googleapis.com が典型）。
+  # このキー自体が無い場合も既定で有効 (true) です。
+  enable_apis:
+    enabled: true
+    # src に無くても必ず有効化したい API
+    extra_apis: []
+    # src で有効でも dst では有効化しない API
+    # （廃止済み API / 旧エイリアスはコード側にも既定の除外リストあり）
+    skip_apis: []
+    # 有効化の伝播待ち秒数（0 で待たない）。直後に terraform を回すと 403 になるため既定 120。
+    wait_seconds: 120
 
   # [Step 2] GCE Snapshot の準備
   gce_snapshot:
@@ -166,12 +199,62 @@ steps:
     # 用途: 前回 make run で生成済みの active を、同じ dst の次回 run で再利用したいとき。
     skip_on_run: false
 
+    # [オプション] 移行範囲の選択（Terraform パイプライン Step 3/4 のみに効く）。
+    # bulk-export が出力するリソース型（google_ で始まる Terraform 型名、fnmatch の
+    # ワイルドカード可）を include（ホワイトリスト）/ exclude（ブラックリスト）で絞る。
+    # 未指定 = 全部移行（従来どおり）。除外した型の欠落は DIFF.md で
+    # 「参考 P3（設定で除外）」に分類され、要対応には出ません。
+    # gcloud ベースのステップ（FW / GCE 復元 / IAM / データ同期 / AR イメージ）は
+    # 従来どおり各 steps.*.enabled で制御します。
+    # 例1: GCE と VPC 関連だけ移行する
+    # resource_types:
+    #   include:
+    #     - "google_compute_*"
+    #     - "google_service_account"
+    # 例2: Cloud Run / Artifact Registry / GKE / monitoring を移行しない
+    # resource_types:
+    #   exclude:
+    #     - "google_cloud_run_*"
+    #     - "google_artifact_registry_*"
+    #     - "google_container_*"
+    #     - "google_monitoring_*"
+
+    # [オプション] bulk-export（CAI エクスポート）自体の規模・再試行の調整。
+    # リソース数が多い src では config-connector の内部タイムアウト（30 分・延長不可）で
+    # `Error executing export:: ... error waiting for operation:` が発生する。
+    # 対策は「エクスポートする量を減らす」こと。
+    #
+    # export_resource_types: エクスポート対象を **KRM Kind** で絞る。
+    #   "auto" … src が対応する Kind を実機から取得して全指定する（推奨）。
+    #            一覧は GCP リソースの Kind のみなので **クラスタ内の k8s オブジェクトが
+    #            自動的に対象外**になり（Backup for GKE の担当）、移行範囲は変わらない。
+    #            Kind を明示すると gcloud が別経路を使うため、タイムアウトの原因である
+    #            「30 分待ちの操作」自体が発生しない。
+    #   明示リスト … `gcloud beta resource-config list-resource-types --project=<src>` の
+    #            Kind 名（大文字始まり）。上の resource_types（Terraform 型）とは別物。
+    # export_resource_types: "auto"
+    # export_resource_types:
+    #   - "ComputeInstance"
+    #   - "ComputeNetwork"
+    #
+    # storage_path: CAI エクスポート先の GCS パス（省略時は一時バケットを毎回自動作成）。
+    #   export_resource_types とは併用不可（gcloud 仕様。併用時は Kind 絞り込みを優先）。
+    #   **書き出し先の指定でありキャッシュではない**（前回結果は再利用されず、
+    #   タイムアウト対策にもならない。一時バケット作成を省く用途）。
+    # storage_path: "gs://my-bucket/prefix"
+    #
+    # 再試行。タイムアウト起因の失敗に短間隔で再試行しても同じ待ちを繰り返すだけなので、
+    # 既定は「2 回 / 180 秒間隔」に抑えてある。
+    # retries: 2
+    # retry_wait_seconds: 180
+
   # [Step 4] dst へIaCでの再現 (Terraform適用)
   terraform_apply:
     enabled: true
 
   # [Step 4.5] host project のファイアウォールルール・ポリシーを dst に複製
   # bulk-export は network_firewall_policy を出力しないため gcloud で直接同期する
+  # このキー自体を書かなくても有効（設定不要で動く）。無効化したいときだけ false。
   network_firewall:
     enabled: true
     # Secure tag (tagValues/<数値ID>) は ORG スコープの permanent ID で、
@@ -220,8 +303,37 @@ steps:
     enabled: true
 
   # [Step 6] データの移行 (GCS, BigQueryなど)
+  # ※ Artifact Registry のイメージ複製だけは Terraform より前（Step 3.7）に実行される。
+  #    Cloud Run が image を digest 固定で参照するため、apply 後では間に合わないため。
   data_sync:
     enabled: true
+    # [オプション] Artifact Registry のコンテナイメージ複製（同一 digest で複製）。
+    # dst SA に src の roles/artifactregistry.reader が必要
+    # （make bootstrap-cross-project が付与）。
+    #
+    # ⚠️ gcrane（または crane）が **必須**。無いと実行前チェックがエラーで止まる。
+    #      go install github.com/google/go-containerregistry/cmd/gcrane@latest
+    #    docker は代替にならない: pull → push はマルチアーキイメージを単一
+    #    プラットフォームに落として **digest が変わる**ことがあり、そうなると
+    #    Cloud Run の @sha256: 固定参照が解決できず、再実行時も「既存」と
+    #    判定されずに毎回再送される。gcrane はレジストリ間で直接転送するので
+    #    digest が保たれ、dst に既にあるレイヤも再送しない。
+    #    イメージ複製自体が不要なら enabled: false にすればチェックも行われない。
+    #
+    # scope: 複製する digest の範囲。
+    #   all    … 全 digest（既定）。移行範囲を勝手に狭めない安全側。
+    #   tagged … tag の付いた digest だけ。Cloud Build は push のたびに tag を
+    #            新しいイメージへ移すので、**tag 無し = 置き換えられた過去ビルド**。
+    #            実測で 87 件中 64 件（74%）を削減できた。
+    #            **`.tf` が digest 固定で参照するイメージは tag が無くても必ず複製する**
+    #            ので、tagged にしても Step 4 の apply が Image not found で落ちることはない。
+    #            失うのは「Cloud Run で過去リビジョンへ戻す」操作と、GKE ワークロードが
+    #            tag 無し digest を固定参照している場合の復元（Pod の image 参照は
+    #            クラスタ構成のみコピーする方針上 .tf から引けないため）。該当するなら all のまま。
+    # artifact_registry:
+    #   enabled: true
+    #   skip_repos: []
+    #   scope: all
 
   # [Step 7] 作成した dst プロジェクトを既存の VPC Service Controls ペリメタへ追加
   # org は一切触らない: アクセスポリシー / ペリメタ自体の作成・削除は行わず、
