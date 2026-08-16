@@ -777,14 +777,7 @@ make test
 変更内容と理由は [`HISTORY.md`](./HISTORY.md) に日付の新しい順で記録しています。
 
 ### 実行フロー図
-`make run` が Step 0 から Step 99 まで**何を判定して、どこで止まり・どこで複製をやめ・どこで警告だけ出すか**を 6 枚のフロー図で確認できます（起動前チェックの停止条件、`.tf` の間引き判定、GKE 除外、`terraform apply` の内部、VM 復元と電源状態）。同じ内容を 2 つの形式で置いています。
-
-- [`architecture/sync-env-flow.md`](./architecture/sync-env-flow.md): **GitHub 上でそのまま図が表示されます**（mermaid）。
-- [`architecture/sync-env-flow.html`](./architecture/sync-env-flow.html): ブラウザで開く用。単体で完結しているため追加インストール・ネットワーク接続は不要です。
-
-```bash
-xdg-open architecture/sync-env-flow.html   # macOS は open
-```
+[`architecture/sync-env-flow.md`](./architecture/sync-env-flow.md) に、`make run` が Step 0 から Step 99 まで**何を判定して、どこで止まり・どこで複製をやめ・どこで警告だけ出すか**を 6 枚のフロー図でまとめています（起動前チェックの停止条件、`.tf` の間引き判定、GKE 除外、`terraform apply` の内部、VM 復元と電源状態）。GitHub 上でそのまま図が表示されます。
 
 ### 仕様書
 - [`SPEC.md`](./SPEC.md) / [`dst/SPEC.md`](./dst/SPEC.md): 詳細仕様。

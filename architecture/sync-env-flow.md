@@ -1,6 +1,6 @@
 # sync_env 実行フロー
 
-> `scripts/sync_env.py` の実行フロー図。HTML 版は [`sync-env-flow.html`](./sync-env-flow.html)（ブラウザで開く用）。
+> `scripts/sync_env.py` の実行フロー図。GitHub 上でそのまま図が表示されます。
 
 `make run` は一本道ではなく、**関所の連なり**です。各ステップが「通す / 落とす / 止める」の
 どれかを判定し、判定を誤った過去の事故がそのまま今の分岐条件になっています。
@@ -41,30 +41,42 @@ flowchart TD
   S7 --> S99["Step 99  DIFF.md<br/>CAI と .tf を突き合わせて<br/>要対応 / 参考 に仕分け"]
   S99 --> E{"失敗 0 件?"}
   E -->|"はい"| OK["exit 0"]
-  E -->|"いいえ"| NG["exit 1<br/>ただし全ステップは走り切っている"]
+  E -->|"いいえ"| NG["exit 1<br/>有効なステップは走り切っている"]
+  S1 & S2 & S3 & S4 & S5 & S6 -.->|"fail-fast の sys.exit(1)<br/>CAI 未カバー / snapshot 不足 / customize 例外 /<br/>active_dir 不在 / allow_fail=False のコマンド失敗"| XF["即時終了<br/>失敗一覧は出るが<br/>後続ステップと DIFF.md は出ない"]
 
   classDef gate fill:#FAF0DA,stroke:#8A6612,stroke-width:1.5px,color:#3D2E08;
   classDef pass fill:#DDEEE7,stroke:#0D6A53,stroke-width:1.5px,color:#0A382C;
   classDef halt fill:#F7DFDB,stroke:#9F3428,stroke-width:1.5px,color:#48160F;
   classDef step fill:#E4EAEC,stroke:#3E5257,stroke-width:1.2px,color:#16242A;
   class G,E gate;
-  class X,NG halt;
+  class X,NG,XF halt;
   class OK pass;
   class A,S1,S15,S2,S3,S35,S37,S4,S45,S5,S55,S57,S6,S7,S99 step;
 ```
 
 *図 1 — ステップの順序は依存関係で決まっている。半端な番号 = 後から割り込ませた位置。*
 
-> **ワーカーは自死しない。** 並列実行中のステップは失敗しても `sys.exit(1)` せず
-> `stats.add_failure()` に記録するだけです。他のプロジェクトは最後まで走り、
-> `main()` が終端で exit 1 にします。
+> **「記録して進む」は並列ワーカーの中だけの話です。** `_parallel_for_each` の worker は
+> 失敗しても `sys.exit(1)` せず `stats.add_failure()` に記録し、`main()` が終端で exit 1 に
+> します。一方、ステップ本体には今も即 `sys.exit(1)` する箇所があります
+> （`step_cai_scan` の未カバー / `step_gce_snapshot` の snapshot 不足 / `customize_hcl` の例外 /
+> `step_terraform_apply` の active_dir 不在 / `allow_fail=True` を付けていない `run_command`）。
+>
+> ただし**失敗一覧そのものは必ず出ます** — `execute()` は `finally: self._print_summary()` で
+> 締めるため、中断してもサマリーと失敗詳細はログ末尾に残ります。失われるのは
+> **未実行のステップと Step 99 の DIFF.md** だけです。
+>
+> なお図の各ステップは `step_enabled()` による opt-in で、既定 true は
+> `network_firewall` / `iam_sync` / `enable_apis` の 3 つだけです。Step 99 はさらに
+> **`cai_scan` と `bulk_export` の両方が有効**なときしか走りません。
+> つまり **DIFF.md が無いことは異常終了の証拠になりません**。
 
 ---
 
 ## Step 0 — 起動前ガード（書き込む前に止める）
 
-ここを抜けたあとの失敗は「30 分走ってから全滅」になります。だから 4 つとも
-**コピー先に触る前**に置いてあります。
+ここを抜けたあとの失敗は「30 分走ってから全滅」になります。だから 5 つとも
+**コピー先に触る前**に置いてあります（`make mock` では下 3 つが早期 return するため機能しません）。
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace, Menlo, Consolas, 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif","fontSize":"13px","lineColor":"#7C8D92","textColor":"#16242A","edgeLabelBackground":"#EDF1F1"}}}%%
@@ -73,27 +85,30 @@ flowchart TD
   C1 -->|"ORG 保護違反 / 設定不備"| H1["exit 1<br/>不備を全件列挙"]
   C1 -->|"OK"| C2{"tf_base/.sync_env.lock を<br/>flock できるか"}
   C2 -->|"取れない = 二重起動"| H2["exit 1<br/>state 破壊を防ぐ"]
-  C2 -->|"取れた"| C3{"必須ツールが PATH にあるか<br/>gcrane または crane"}
+  C2 -->|"取れた"| C3{"gcrane または crane が PATH にあるか<br/>data_sync 有効 かつ artifact_registry が false でない場合のみ判定"}
   C3 -->|"無い"| H3["exit 1<br/>イメージ未複製のまま<br/>apply させない"]
-  C3 -->|"ある"| C4{"全 dst プロジェクトが<br/>ACTIVE か"}
-  C4 -->|"1 つでも不在"| H4["exit 1<br/>make projects を案内"]
-  C4 -->|"全て ACTIVE"| C5{"認証主体が src に<br/>書込相当の権限を持つか"}
+  C3 -->|"ある / 判定対象外"| C6{"SA 実在 + impersonation は成立するか"}
+  C6 -->|"失敗"| H6["exit 1"]
+  C6 -->|"OK"| C5{"認証主体が src に<br/>書込相当の権限を持つか"}
   C5 -->|"持つ + --yes 無し"| Q{"対話で y/N"}
-  C5 -->|"持たない"| GO["Step 1 へ"]
+  C5 -->|"持つ + --yes 指定"| C4{"全 dst プロジェクトが<br/>ACTIVE か"}
+  C5 -->|"持たない"| C4
   Q -->|"N / 非対話"| H5["exit 1"]
-  Q -->|"y"| GO
+  Q -->|"y"| C4
+  C4 -->|"1 つでも不在"| H4["exit 1<br/>make projects を案内"]
+  C4 -->|"全て ACTIVE"| GO["Step 1 へ"]
 
   classDef gate fill:#FAF0DA,stroke:#8A6612,stroke-width:1.5px,color:#3D2E08;
   classDef halt fill:#F7DFDB,stroke:#9F3428,stroke-width:1.5px,color:#48160F;
   classDef pass fill:#DDEEE7,stroke:#0D6A53,stroke-width:1.5px,color:#0A382C;
   classDef step fill:#E4EAEC,stroke:#3E5257,stroke-width:1.2px,color:#16242A;
-  class C1,C2,C3,C4,C5,Q gate;
-  class H1,H2,H3,H4,H5 halt;
+  class C1,C2,C3,C4,C5,C6,Q gate;
+  class H1,H2,H3,H4,H5,H6 halt;
   class GO pass;
   class A step;
 ```
 
-*図 2 — 4 つの関所はすべて「コピー先に 1 バイトも書く前」に置かれている。*
+*図 2 — 5 つの関所はすべて「コピー先に 1 バイトも書く前」。承認プロンプトはコピー先の実在チェックより先に出る。*
 
 > **承認は必ず起動コマンドに現れる形で。** コピー元への書込権限がある場合の続行は
 > `--yes` をコマンドラインで明示したときだけです。環境変数による自動承認は
@@ -155,8 +170,8 @@ flowchart TD
   D2 -->|"はい"| S2["捨てる<br/>k8s Service LB<br/>名前は a(31hex) で接頭辞に掛からない"]
   D2 -->|"いいえ"| D3{"Gateway マーカー k8sResource+k8sCluster<br/>または gkegw1- / k8s1- / k8s-be-"}
   D3 -->|"はい"| S3["捨てる<br/>backend service / URL map /<br/>proxy / forwarding rule / NEG"]
-  D3 -->|"いいえ"| D4{"name が pvc-(uuid) / mcrt-(uuid)"}
-  D4 -->|"はい"| S4["捨てる<br/>復元後に dst で再発行される"]
+  D3 -->|"いいえ"| D4{"google_compute_managed_ssl_certificate<br/>かつ name が mcrt-(uuid)"}
+  D4 -->|"はい"| S4["捨てる<br/>ManagedCertificate 復元で dst が再発行"]
   D4 -->|"いいえ"| D5{"gke-(cluster)-(hash)-dns ゾーン<br/>または backup / restore plan"}
   D5 -->|"はい"| S5["捨てる"]
   D5 -->|"いいえ"| K["残す<br/>google_container_cluster と<br/>node_pool は絶対に落とさない"]
@@ -172,6 +187,17 @@ flowchart TD
 ```
 
 *図 4 — `gke_managed_tf_skip_reason()` の判定順。マーカー優先、接頭辞は保険。*
+
+> **`pvc-(uuid)` のディスクはこの関数では落ちません。** 除外しているのは
+> `_skip_reason_for_file` の `google_compute_disk` 判定で、これは Step 5（`gce_restore`）が
+> 管理する前提の無条件 skip です。次の 2 点に注意してください。
+>
+> - **`google_compute_region_disk` は除外対象外**です。regional PD の PV
+>   （`pvc-(uuid)`）はコピー先に複製され、Backup for GKE の volume restore が作る
+>   ディスクと衝突するか孤児になります。
+> - **Step 5 は既定で無効**（`_STEP_ENABLED_DEFAULTS` に含まれない）です。config で
+>   `gce_restore` を有効にしていない場合、ディスクは `.tf` から落とされたまま
+>   誰も作らず、run は成功として終わります。
 
 > **判定を誤ったときの損害が非対称です。** 落とし損ねると宙ぶらりんの参照で apply が 404、
 > 落とし過ぎると利用者リソースのコピー漏れ。後者のほうが気付きにくいので、
@@ -191,35 +217,47 @@ flowchart TD
   A["_terraform_one_project"] --> D1{"mock 生成物が混じっているか<br/>_MOCK_TF_MARK / 旧ラベル"}
   D1 -->|"ある"| F1["このルートだけ失敗<br/>rm -rf を案内して return<br/>他ルートは続行"]
   D1 -->|"ない"| P["_purge_gke_managed_tf_files<br/>最終防衛線 / dry_run でも実行"]
-  P --> D2{"state の dst が今回の dst と違う<br/>または marker 一致でも state 本文に無い"}
+  P --> D0{"実行モード"}
+  D0 -->|"make plan（dry_run）"| I["provider.tf だけ書き出す<br/>init / plan は run_command が<br/>[DRY RUN] 予定: と出して空振り"]
+  I --> STOP["何も実行されず終了<br/>tfplan は生成されない<br/>state reset / API 有効化 / import も走らない"]
+  D0 -->|"make mock"| MK["provider.tf / state reset /<br/>API 有効化 / import はスキップ<br/>init → plan → apply を擬似実行"]
+  D0 -->|"make run"| D2{"state の dst が今回の dst と違う<br/>または marker 一致でも state 本文に無い"}
   D2 -->|"stale"| R["state を破棄して import からやり直す"]
   D2 -->|"一致"| E["_ensure_dst_prereq_apis<br/>.tf から必要 API を引き直して有効化"]
   R --> E
-  E --> I["terraform init + provider.tf 書き出し"]
-  I --> IM["terraform import 既存リソース"]
+  E --> I2["provider.tf 書き出し + terraform init"]
+  I2 --> IM["terraform import 既存リソース"]
   IM --> D3{"import_error_kind"}
   D3 -->|"already = state 取込済み"| OKI["無視"]
   D3 -->|"missing = リモート実体なし"| OKI
   D3 -->|"None = 本当の失敗"| W1["WARNING<br/>_first_meaningful_line で理由を 1 行表示"]
-  OKI --> PL["terraform plan -out=tfplan"]
-  W1 --> PL
-  PL --> D4{"dry_run か"}
-  D4 -->|"はい make plan"| STOP["tfplan を残して終了<br/>dst には書き込まない"]
-  D4 -->|"いいえ make run"| AP["terraform apply tfplan"]
+  OKI --> PL2["terraform plan -out=tfplan"]
+  W1 --> PL2
+  PL2 --> AP["terraform apply -auto-approve tfplan"]
 
   classDef gate fill:#FAF0DA,stroke:#8A6612,stroke-width:1.5px,color:#3D2E08;
   classDef skip fill:#E8E2F6,stroke:#5C4F91,stroke-width:1.5px,color:#2F2758;
   classDef halt fill:#F7DFDB,stroke:#9F3428,stroke-width:1.5px,color:#48160F;
   classDef pass fill:#DDEEE7,stroke:#0D6A53,stroke-width:1.5px,color:#0A382C;
   classDef step fill:#E4EAEC,stroke:#3E5257,stroke-width:1.2px,color:#16242A;
-  class D1,D2,D3,D4 gate;
+  class D0,D1,D2,D3 gate;
   class F1 halt;
-  class OKI,W1,STOP skip;
+  class OKI,W1,STOP,MK skip;
   class AP pass;
-  class A,P,R,E,I,IM,PL step;
+  class A,P,R,E,I,I2,IM,PL2 step;
 ```
 
-*図 5 — plan と apply は同じ tfplan を使う。だから purge は dry_run でも実行する。*
+*図 5 — `make plan` は Terraform を一切実行しない。実行されるのは purge と `provider.tf` の書き出しだけ。*
+
+> **`make plan` は tfplan を作りません。** `run_command` は dry_run のとき
+> `side != "src"` のコマンドをすべて `[DRY RUN] 予定:` とログに出して実行せず返します。
+> `terraform init` も `terraform plan -out=tfplan` も `side="local"` なので走らず、
+> **`make run` は毎回ゼロから plan を計算し直します**。
+> 実行ログの「→ tfplan を生成しました」は誤解を招く出力で、実体はありません。
+>
+> したがって `make plan` が通っても、既存リソースの import 可否・stale state の破棄・
+> コピー先の API 有効化は検証されていません。`make run` で初めて 403 や 409 が出ることがあります
+> （ただし有効 API の一覧取得だけは dry_run でも走るため、有効化対象の API 名は `make plan` でも表示されます）。
 
 ---
 
@@ -266,23 +304,27 @@ flowchart TD
 
 ## 失敗の扱い — 何が run を止めるか
 
-同じ「失敗」でも扱いは 3 段階です。**止める**のは起動前だけ。走り出したあとは
-**記録して進む**のが原則です。
+扱いは大きく **止める / 記録して進む / 黙って落とす** に分かれます。走り出したあとは
+**記録して進む**のが原則ですが、**実行中でも即座に止まる箇所があります**（下表の「実行中でも止める」）。
+そこで止まっても失敗一覧は `finally` で必ず出力され、失われるのは未実行のステップと DIFF.md です。
 
 | 事象 | 扱い | 実装 | 結果 |
 |---|---|---|---|
 | config.yaml の不備 / ORG 保護違反 | 止める | `validate_steps_config` | 全件列挙して即 exit 1 |
 | 同じ作業ディレクトリで多重起動 | 止める | `_acquire_run_lock` | state 破壊を防ぐ |
-| gcrane / crane が無い | 止める | `check_prerequisites` | `make plan` でも止まる |
+| gcrane / crane が無い | 止める | `check_prerequisites` | `data_sync` 有効 かつ `artifact_registry.enabled != false` のときだけ判定。`make plan` でも止まる |
 | コピー先プロジェクトが未作成 | 止める | `check_dst_projects_exist` | 30 分後の全滅を先回りする |
 | mock 生成の `.tf` が残存 | そのルートのみ失敗 | `_terraform_one_project` | 他ルートは続行し、終端で exit 1 |
-| API 有効化に失敗 | soft fail | `_soft_run` | WARNING + 手動コマンド案内 |
+| API 有効化に失敗 | soft fail | `_soft_run` | WARNING + 手動コマンド案内。ただし `_soft_run` 自体は src 書込ガードと mock の未知コマンド検出で `sys.exit(1)` する |
 | コピー元で AR 未使用（API 無効の 403） | soft fail | `is_api_disabled_error` | INFO「複製対象なし」に落とす |
 | suspend が ACPI に失敗 | 警告のみ | `_try_dst_suspend` | exit code に影響させない |
 | secure tag が未マッピング | skip + 警告 | `fw_policy_rule_flags` | FW を意図せず緩めない |
 | コピー先で setIamPolicy 権限が無い | skip + 案内 | `_dst_can_set_iam_policy` | failed に積まない |
 | import 失敗（already / missing） | 無視 | `import_error_kind` | 想定内。apply が作る |
 | import 失敗（その他） | 警告のみ | `_first_meaningful_line` | 理由を 1 行で表示して続行 |
+| コマンド失敗（`allow_fail=True` 未指定） | 実行中でも止める | `run_command` | 未実行のステップと DIFF.md は生成されない |
+| CAI 未カバー / snapshot 不足 / customize の例外 | 実行中でも止める | `step_cai_scan` / `step_gce_snapshot` / `customize_hcl` | 同上 |
+| active_dir 不在・対象 `.tf` なし（Step 4） | 実行中でも止める | `step_terraform_apply` | **dry_run / mock では停止せず**「✓ Step 4 完了」と表示して return する |
 
 ---
 
