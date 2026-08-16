@@ -32,7 +32,6 @@
       "Read(logs/**)"
     ],
     "deny": [
-      "Bash(git push *)",
       "Bash(gcloud * delete *)",
       "Bash(terraform destroy *)"
     ]
@@ -64,6 +63,7 @@
   "enabledPlugins": {
     "semgrep@claude-plugins-official": true,
     "claude-code-setup@claude-plugins-official": true,
-    "frontend-design@claude-plugins-official": true
+    "frontend-design@claude-plugins-official": true,
+    "codex@openai-codex": true
   }
 }
