@@ -20,7 +20,8 @@ GCE 復元 → データ同期（GCS/BigQuery）までを一連で自動実行�
 > [GKE Standard のノード VM はどうやって作られるか](#-gke-standard-のノード-vm-はどうやって作られるか) を参照してください。
 
 > ⚡ **Cloud Run / Cloud Functions は Terraform ではなく専用ステップでコピーします。**
-> リソース定義を Terraform HCL に書き出す `bulk-export` が Cloud Run に対応していないため、
+> リソース定義を Terraform HCL に書き出す `bulk-export` が Cloud Run を確実に扱えないため
+> （既定の設定では 1 件も出力せず、設定を変えてもリージョンによって取りこぼします）、
 > **Step 4.7 (`serverless_sync`)** がそれぞれのサービス自身の仕組みで複製します
 > （Cloud Run は定義 YAML の取り出し / 取り込み、Cloud Functions はソース zip を運んで
 > コピー先で再ビルド）。設定は不要で、`make run` を実行すれば動きます。
@@ -313,9 +314,13 @@ cp dst/config.yaml.template dst/config.yaml
   - **`serverless_sync`** (Step 4.7): **Cloud Run サービス / ジョブ**と **Cloud Functions**
     (第 1・第 2 世代) を src → dst に複製します。**キー未指定でも有効**（設定不要で動きます）。
     無効にするときだけ `enabled: false`。
-    - **なぜ専用ステップなのか**: `bulk-export` は Cloud Run を **1 件も出力しません**
-      （gcloud の asset type → KRM Kind 変換表に `run.googleapis.com/Service` が無いため）。
-      Terraform では複製されないので、それぞれのサービス自身の仕組みを使います。
+    - **なぜ専用ステップなのか**: `bulk-export` は Cloud Run を確実に出力できません。
+      既定の `bulk_export.export_resource_types: "auto"` では **1 件も出力しません**
+      （gcloud に対応 Kind を問い合わせる一覧で `RunService` が「bulk-export 非対応」と
+      申告されるため、CAI へ問い合わせる段階で対象から外れます）。`auto` をやめて
+      絞り込み無しにすると一部は出力されますが、**リージョンによって取りこぼします**
+      （実測 5 件中 3 件）。どちらにしても Terraform では揃わないので、
+      それぞれのサービス自身の仕組みを使います。
       - Cloud Run … 定義を YAML で書き出し、dst 用に書き換えて取り込む
         （イメージは Step 3.7 が複製済みのものを digest ごと参照）
       - Cloud Functions … ソース zip を dst のバケットへ運び、**dst 側で再ビルド**
@@ -343,6 +348,16 @@ cp dst/config.yaml.template dst/config.yaml
     - **実行サービスアカウント**は dst の同名 SA（既定 SA なら dst の既定 SA）に読み替えます。
       読み替えできない / dst に存在しない場合は dst の既定 compute SA で起動するため、
       権限が異なる可能性があります（`DIFF.md` の「確認」に出ます）。
+    - **コピー先で見え方が変わるもの**（動くものは同じです）:
+      - **デプロイ方法の表示が「ソース」→「コンテナ」になります。** コピー元の
+        `run.googleapis.com/build-*` annotation（Cloud Build のビルド ID とソース zip の
+        GCS パス）は**コピー元のビルドとバケットを指している**ため落とします。コピー先には
+        Step 3.7 が **digest 不変**で複製したコンテナイメージだけが残るので、コンソールは
+        「コンテナをデプロイ」と分類します。**実行されるイメージはコピー元と同一 digest** です。
+        コピー先でも「ソース」表示にしたい場合は、ソースをコピー先へ置いて
+        `gcloud run deploy --source` で再ビルドしてください。
+      - **サービス URL は変わります**（プロジェクト番号が変わるため）。コピー元の URL を
+        指している設定（DNS・Webhook・フロントエンド）は手動で更新してください。
     - 特定のサービス・ジョブ・関数を除外したいときは `skip_services` に名前を列挙します。
     - 必要権限: src に `run.services.get/list` / `cloudfunctions.functions.get/list` /
       `storage.objects.get`（`bootstrap_cross_project.sh`）、dst に
