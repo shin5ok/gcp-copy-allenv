@@ -3084,6 +3084,84 @@ _FN_INGRESS_MAP = {
     "ALLOW_INTERNAL_AND_GCLB": "internal-and-gclb",
 }
 
+# --- 関数ビルド用サービスアカウント ---------------------------------------
+# `gcloud functions deploy` のビルドは Cloud Build が実行する。既定のビルド SA は
+# **dst の default compute SA** (`<番号>-compute@developer.gserviceaccount.com`) だが、
+# 2024-05-03 以降に作られたプロジェクトは組織ポリシー
+# `constraints/iam.automaticIamGrantsForDefaultServiceAccounts` が既定で強制され、
+# この SA に `roles/editor` が自動付与されない = **ロール 0** になるため、deploy が
+# 必ず "Could not build the function due to a missing permission on the build
+# service account" で失敗する。移行先は毎回「新規プロジェクト」なので必ず該当する。
+#
+# 対処は公式ドキュメントの 3 択のうち **「専用のビルド SA を作って明示指定する」**
+# を採る（functions/docs/building#provide_a_service_account_for_building_functions）:
+#   - default compute SA は **ランタイム ID も兼ねる**（VM / Cloud Run / 全 Function）。
+#     そこに広い `roles/cloudbuild.builds.builder` を足すと、移行と無関係な
+#     ワークロードの権限まで広がる。専用 SA なら影響がビルド用途に閉じる。
+#   - dst ORG が `cloudbuild.useComputeServiceAccount` を Not Enforced にしている
+#     （既定 SA でのビルドを禁止）場合、既定 SA に付与しても**動かない**。
+#   - ロールを公式指定の 3 つに絞れる。
+_FN_BUILD_SA_ACCOUNT_ID = "fn-build"
+# 公式が指定する custom build service account の最小ロール。
+_FN_BUILD_SA_ROLES = (
+    "roles/logging.logWriter",        # ビルドログを Cloud Logging に書く
+    "roles/artifactregistry.writer",  # ビルド成果物を gcf-artifacts に push する
+    "roles/storage.objectViewer",     # ソース zip を GCS から取得する
+)
+# 既定ビルド SA を使い続ける場合に必要なロール（自動用意を無効にしたときの案内用）。
+_FN_BUILD_SA_ROLE = "roles/cloudbuild.builds.builder"
+# 付与直後のビルドは古いポリシーで走ることがあるため、伝播を待ってから deploy する。
+_FN_BUILD_SA_PROPAGATION_WAIT = 30
+
+
+def missing_build_sa_roles(
+    bindings: Optional[Set[Tuple[str, str]]], member: str,
+) -> List[str]:
+    """ビルド SA に不足しているロールを返す（純粋関数）。
+
+    `bindings` が None（現行ポリシーを取得できなかった）は **全部不足** に倒す。
+    付与は冪等なので、判定できないことを理由に見送ると deploy が必ず失敗する側に
+    倒れてしまう。owner / editor を持つ SA には何も足さない。
+    """
+    if bindings is None:
+        return list(_FN_BUILD_SA_ROLES)
+    held = {role for (m, role) in bindings if m == member}
+    if held & {"roles/owner", "roles/editor"}:
+        return []
+    return [r for r in _FN_BUILD_SA_ROLES if r not in held]
+
+
+def default_runtime_sa_roles(
+    policy: Optional[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    """src の project IAM ポリシーから「既定ランタイム SA」のロールを抽出する（純粋関数）。
+
+    default compute / appspot SA は `build_iam_replication_plan` が複製対象から
+    外している（dst に **同等物が既定で存在する**ため）。ところが 2024-05-03 以降に
+    作られたプロジェクトは組織ポリシーで**ロールが 1 つも付かない**ので、
+    「存在は同等・権限は同等でない」状態になる。複製方針は変えず、DIFF で
+    可視化するための一覧を返す。条件付きバインディングは複製方針と揃えて除く。
+
+    戻り値: {src SA email: [roles...]}（ロール昇順）
+    """
+    out: Dict[str, Set[str]] = {}
+    if not isinstance(policy, dict):
+        return {}
+    for binding in (policy.get('bindings') or []):
+        if not isinstance(binding, dict) or binding.get('condition'):
+            continue
+        role = str(binding.get('role') or '')
+        if not role:
+            continue
+        for member in (binding.get('members') or []):
+            if not isinstance(member, str) or not member.startswith('serviceAccount:'):
+                continue
+            email = member.split(':', 1)[1].strip()
+            if (_RUN_DEFAULT_COMPUTE_SA_RE.match(email)
+                    or _RUN_APPSPOT_SA_RE.match(email)):
+                out.setdefault(email, set()).add(role)
+    return {email: sorted(roles) for email, roles in sorted(out.items())}
+
 
 def parse_functions_list(text: Optional[str]) -> List[Dict[str, Any]]:
     """`gcloud functions list --format=json` から関数の一覧を返す（純粋関数）。
@@ -3184,8 +3262,12 @@ def build_function_deploy_flags(
     source_uri: str,
     proj_map: Dict[str, str],
     num_map: Dict[str, str],
+    build_sa: Optional[str] = None,
 ) -> Tuple[List[str], Dict[str, str], List[str]]:
     """`gcloud functions deploy` のフラグ・環境変数・注記を組み立てる（純粋関数）。
+
+    `build_sa` を渡すと `--build-service-account` を付ける（既定ビルド SA =
+    default compute SA を使わせない）。gen1 / gen2 とも SDK 580 で対応済み。
 
     戻り値: (フラグのリスト, 環境変数 dict, 注記のリスト)
 
@@ -3226,6 +3308,11 @@ def build_function_deploy_flags(
         elif conv:
             val = conv(val)
         flags.append(f"{flag}={val}")
+
+    if build_sa:
+        # `--build-service-account` は projects/<p>/serviceAccounts/<email> 形式必須。
+        flags.append(
+            f"--build-service-account=projects/{dst_project}/serviceAccounts/{build_sa}")
 
     sa_email = (svc_cfg.get("serviceAccountEmail") if gen2
                 else fn.get("serviceAccountEmail")) or ""
@@ -3549,6 +3636,9 @@ _CUSTOMIZE_NOTES_FILE = ".customize_notes.json"
 # customize (Step 3) より後に走るので `.customize_notes.json` とは分ける
 # （同じファイルに書くと次回 customize に上書きされて注記が消える）。
 _SERVERLESS_NOTES_FILE = ".serverless_notes.json"
+# Step 5.7 iam_sync が書く注記（複製対象外にしている既定ランタイム SA の可視化）。
+# Step 4.7 より後に走るので `.serverless_notes.json` とも分ける。
+_IAM_NOTES_FILE = ".iam_notes.json"
 
 
 def customize_note_row(note: Dict[str, str]) -> Tuple[str, str, str, str]:
@@ -3739,6 +3829,76 @@ def customize_note_row(note: Dict[str, str]) -> Tuple[str, str, str, str]:
             f"--project={proj} ...`。第 1 世代でソースが取得できない場合は "
             f"コンソールの「ソース」タブから zip をダウンロードして使う",
         )
+    if kind == "function_build_sa_granted":
+        return (
+            "確認",
+            f"関数ビルド用サービスアカウント `{res}`（{proj}）",
+            f"Cloud Functions の deploy は Cloud Build が実行するが、既定のビルド SA "
+            f"（default compute SA）は組織ポリシー "
+            f"`constraints/iam.automaticIamGrantsForDefaultServiceAccounts` により"
+            f"新規プロジェクトではロールが 1 つも付かず、ビルドが必ず失敗する。"
+            f"**ランタイム ID も兼ねる既定 SA を太らせない**ため、本ツールが専用の"
+            f"ビルド SA を作成し公式指定の最小ロールを付与した: {detail}",
+            f"この SA は dst の正式なビルド ID として残す想定（関数の設定に記録される"
+            f"ため、削除すると再デプロイが失敗する）。内容の確認は "
+            f"`gcloud projects get-iam-policy {proj} "
+            f"--flatten=bindings --filter=bindings.members:{res}`。"
+            f"自前のビルド SA を使うなら "
+            f"`steps.serverless_sync.build_service_account: <email>`、"
+            f"自動用意そのものを止めるなら "
+            f"`grant_build_service_account: false`",
+        )
+    if kind == "function_build_sa_manual":
+        return (
+            "要対応",
+            f"関数ビルド用サービスアカウント `{res}`（{proj}）",
+            f"専用ビルド SA を用意できなかった: {detail}。"
+            f"ビルド SA に権限が無いと、Cloud Functions の deploy が "
+            f"`Could not build the function due to a missing permission on the "
+            f"build service account` でビルド段階から失敗する",
+            f"どちらかを実施して `make run` を再実行: "
+            f"① 専用 SA を用意 — `gcloud iam service-accounts create "
+            f"{_FN_BUILD_SA_ACCOUNT_ID} --project={proj}` → "
+            f"{' / '.join(_FN_BUILD_SA_ROLES)} を "
+            f"`gcloud projects add-iam-policy-binding {proj} "
+            f"--member=serviceAccount:{res} --role=<ROLE> --condition=None` で付与  "
+            f"② 既定 SA を使う — `<dst番号>-compute@developer.gserviceaccount.com` に "
+            f"`{_FN_BUILD_SA_ROLE}` を付与（既定 SA が太る点に注意）",
+        )
+    if kind == "default_runtime_sa_roles":
+        member = (note.get("dst_member")
+                  or "<dst番号>-compute@developer.gserviceaccount.com")
+        roles = [r for r in (detail or "").split(", ") if r]
+        first = roles[0] if roles else "roles/<ROLE>"
+        return (
+            "確認",
+            f"既定ランタイム SA `{res}` のロール（{proj}）",
+            f"src の既定 SA には {detail} が付いていたが、**dst の既定 SA "
+            f"`{member}` には付いていない**。既定 SA は project ごとに別 ID のため"
+            f"本ツールは IAM 複製の対象外にしており（dst に同等物が存在する前提）、"
+            f"2024-05-03 以降に作られたプロジェクトは組織ポリシー "
+            f"`constraints/iam.automaticIamGrantsForDefaultServiceAccounts` で "
+            f"`roles/editor` の自動付与も無いため、**既定 SA で動く VM / Cloud Run / "
+            f"Cloud Functions は dst で権限不足になる可能性がある**",
+            f"src と同じにするなら dst で付与（{len(roles)} 件。移行先 ORG の方針に"
+            f"合わない広いロールはここで絞る好機でもある）: "
+            f"`gcloud projects add-iam-policy-binding {proj} "
+            f"--member=serviceAccount:{member} --role={first} --condition=None`"
+            f"（他のロールも同様）。既定 SA を使わない設計にするなら、"
+            f"各ワークロードに user-managed SA を割り当てて必要な権限だけ付与する",
+        )
+    if kind == "function_deploy_failed":
+        return (
+            "要対応",
+            f"Cloud Functions `{res}`（{proj} / {region}）",
+            f"ソース zip は dst に配置できたが deploy が失敗した: {detail}。"
+            "多くはビルド段階の失敗（ビルド SA の権限不足 / runtime とソースの"
+            "不一致 / 依存パッケージの取得失敗）",
+            f"ビルドログを確認: `gcloud builds list --region={region} "
+            f"--project={proj} --limit=5` → `gcloud builds log <BUILD_ID> "
+            f"--region={region} --project={proj}`。原因を解消して `make run` を"
+            f"再実行すれば同じ手順で再デプロイされる",
+        )
     if kind == "function_plaintext_secret":
         return (
             "確認",
@@ -3764,11 +3924,13 @@ def customize_note_row(note: Dict[str, str]) -> Tuple[str, str, str, str]:
 def load_customize_notes(active_dir: str) -> List[Dict[str, str]]:
     """active/<src>/ の注記ファイルを全プロジェクト分読み出す（純粋関数）。
 
-    2 系統ある:
+    3 系統ある:
     - `.customize_notes.json` … Step 3 customize_hcl が書く（.tf の補正 / スキップ）
     - `.serverless_notes.json` … Step 4.7 serverless_sync が書く（Cloud Run の
       複製見送り）。customize より後に走るので別ファイルにしないと上書きされる。
-    どちらも「原因が消えれば注記も消える」ように、書き手が毎回書き直す。
+    - `.iam_notes.json` … Step 5.7 iam_sync が書く（複製対象外にしている
+      既定ランタイム SA のロール可視化）。さらに後に走るのでこれも別ファイル。
+    いずれも「原因が消えれば注記も消える」ように、書き手が毎回書き直す。
     """
     notes: List[Dict[str, str]] = []
     try:
@@ -3776,7 +3938,8 @@ def load_customize_notes(active_dir: str) -> List[Dict[str, str]]:
     except OSError:
         return notes
     for name in names:
-        for fname in (_CUSTOMIZE_NOTES_FILE, _SERVERLESS_NOTES_FILE):
+        for fname in (_CUSTOMIZE_NOTES_FILE, _SERVERLESS_NOTES_FILE,
+                      _IAM_NOTES_FILE):
             path = os.path.join(active_dir, name, fname)
             try:
                 with open(path, encoding="utf-8") as f:
@@ -4429,6 +4592,24 @@ def validate_steps_config(config: Dict[str, Any]) -> List[str]:
                 errors.append(
                     "steps.serverless_sync.skip_services はサービス名の文字列"
                     "リストにしてください（例: ['legacy-api']）")
+        # 文字列 "false" 等を書くと真値として扱われ「止めたつもりが用意される」
+        # ため、bool 以外は実行前に弾く（既定 true = 専用ビルド SA を用意する）。
+        grant = sc.get('grant_build_service_account')
+        if grant is not None and not isinstance(grant, bool):
+            errors.append(
+                "steps.serverless_sync.grant_build_service_account は true / false "
+                f"で指定してください（既定 true = 関数ビルド専用 SA "
+                f"`{_FN_BUILD_SA_ACCOUNT_ID}@<dst>.iam.gserviceaccount.com` を作成し "
+                f"{' / '.join(_FN_BUILD_SA_ROLES)} を付与する）")
+        # ビルド SA は email 形式でないと `--build-service-account` が弾かれる。
+        bsa = sc.get('build_service_account')
+        if bsa is not None:
+            bs = str(bsa or '').strip()
+            if not bs or '@' not in bs:
+                errors.append(
+                    "steps.serverless_sync.build_service_account は SA の email を"
+                    "指定してください（例: fn-build@<dst>.iam.gserviceaccount.com）。"
+                    "ツールは指定 SA の作成もロール付与も行いません")
 
     # --- Step 7: VPC Service Controls ---
     # access-context-manager は --project を持たないため billing_project が無いと
@@ -4549,6 +4730,14 @@ class MigrationOrchestrator:
         # customize_hcl が積む手動対応・確認注記（customize 実行のたびにリセットし、
         # active/<src>/.customize_notes.json へ永続化 → Step 99 が DIFF.md に掲載）。
         self._customize_notes: List[Dict[str, str]] = []
+        # Step 4.7 の関数ソース受け渡しバケット。**関数単位で並列**に走るため、
+        # describe → create を lock で直列化しないと同一バケットを二重作成して
+        # 409 で失敗する。
+        self._fn_buckets_ready: Set[str] = set()
+        self._fn_bucket_lock = threading.Lock()
+        # dst プロジェクト番号のキャッシュ {dst_proj: 番号|None}。
+        self._dst_num_cache: Dict[str, Optional[str]] = {}
+        self._dst_num_lock = threading.Lock()
 
     # ----- 設定 -----
     def load_config(self):
@@ -10105,6 +10294,27 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
         else:
             self.dst_logger.info(
                 f"  複製対象: {len(fn_units)} 関数 (parallel_jobs={self.parallel_jobs})")
+            # deploy のビルドは Cloud Build が走る。既定ビルド SA（default compute
+            # SA）は新規プロジェクトでロールが 0 なので、**dst プロジェクト単位で**
+            # 専用ビルド SA を用意して `--build-service-account` で明示する
+            # （関数ごとに実行すると add-iam-policy-binding が etag 競合する）。
+            granted: Set[str] = set()
+            build_sa_by_proj: Dict[str, Optional[str]] = {}
+            for dst_proj in sorted({u["dst_proj"] for u in fn_units}):
+                u0 = next(u for u in fn_units if u["dst_proj"] == dst_proj)
+                sa_email, changed = self._ensure_fn_build_service_account(
+                    u0["src_proj"], dst_proj, u0["dst_sa"], add_note)
+                build_sa_by_proj[dst_proj] = sa_email
+                if changed:
+                    granted.add(dst_proj)
+            for u in fn_units:
+                u["build_sa"] = build_sa_by_proj.get(u["dst_proj"])
+                u["build_sa_granted"] = u["dst_proj"] in granted
+            if granted:
+                self.dst_logger.info(
+                    f"    [Fn] IAM の伝播を {_FN_BUILD_SA_PROPAGATION_WAIT} 秒待ちます"
+                    f"（付与直後のビルドは古いポリシーで走ることがあるため）")
+                time.sleep(_FN_BUILD_SA_PROPAGATION_WAIT)
 
             def fn_worker(unit):
                 self._sync_one_function(unit, proj_map, num_map, add_note)
@@ -10410,6 +10620,184 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
             if isinstance(cfg, dict) else ''
         return override or f"{dst_proj}-fn-source-migration"
 
+    def _dst_project_number(
+        self, dst_proj: str, dst_sa: Optional[str],
+    ) -> Optional[str]:
+        """dst プロジェクト番号を返す（read-only / キャッシュ付き）。
+
+        借用 SA で describe できない構成もあるのでローカル認証にフォールバックする。
+        """
+        if self.mock:
+            return "111111111111"
+        with self._dst_num_lock:
+            if dst_proj in self._dst_num_cache:
+                return self._dst_num_cache[dst_proj]
+        num = self._get_project_number(dst_proj, dst_sa)
+        if not num and dst_sa:
+            num = self._get_project_number(dst_proj)
+        with self._dst_num_lock:
+            self._dst_num_cache[dst_proj] = num
+        return num
+
+    def _ensure_fn_build_service_account(
+        self, src_proj: str, dst_proj: str, dst_sa: Optional[str], add_note,
+    ) -> Tuple[Optional[str], bool]:
+        """関数ビルド専用の SA を dst に用意する（作成 + 最小ロール付与、冪等）。
+
+        既定ビルド SA（default compute SA）は**新規プロジェクトでは組織ポリシー
+        `constraints/iam.automaticIamGrantsForDefaultServiceAccounts` によりロールが
+        1 つも付かない**ため、そのままだと全関数の deploy が
+        "missing permission on the build service account" で失敗する
+        （regression: shingo-ar-alone081700 の test-1 / www-1）。
+
+        既定 SA に広いロールを足すのではなく、**専用 SA を作って
+        `--build-service-account` で明示する**（既定 SA はランタイム ID も兼ねる
+        ため、太らせると移行と無関係のワークロードの権限まで広がる）。
+
+        戻り値: (deploy に渡すビルド SA email or None, 今回作成/付与したか)
+        """
+        cfg = self.config.get('steps', {}).get('serverless_sync', {}) or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        override = str(cfg.get('build_service_account') or '').strip()
+        auto = cfg.get('grant_build_service_account') is not False
+
+        if override:
+            # 利用者管理の SA。作成もロール付与もしない（権限は利用者の責任）。
+            if not self._gcloud_exists(
+                f"gcloud iam service-accounts describe {override} "
+                f"--project={dst_proj} --format='value(email)'", dst_sa,
+            ) and not (self.dry_run or self.mock):
+                self.dst_logger.warning(
+                    f"    ⚠ [Fn] {dst_proj}: 指定されたビルド SA {override} が dst に"
+                    f"見つかりません（steps.serverless_sync.build_service_account）。"
+                    f"存在しない SA を指定すると deploy が失敗します")
+                add_note(src_proj, dst_proj, "function_build_sa_manual", override, "-",
+                         "steps.serverless_sync.build_service_account で指定された "
+                         "SA が dst に存在しない")
+                return None, False
+            self.dst_logger.info(
+                f"    [Fn] {dst_proj}: 指定のビルド SA {override} を使います"
+                f"（ロール付与はツールでは行いません）")
+            return override, False
+        if not auto:
+            self.dst_logger.info(
+                f"    [Fn] {dst_proj}: 専用ビルド SA の自動用意は設定で無効化"
+                f"（grant_build_service_account: false）。既定のビルド SA を使います"
+                f"（ロールが無い場合は {_FN_BUILD_SA_ROLE} の付与が必要）")
+            return None, False
+
+        build_sa = (f"{_FN_BUILD_SA_ACCOUNT_ID}@{dst_proj}"
+                    f".iam.gserviceaccount.com")
+        member = f"serviceAccount:{build_sa}"
+        changed = False
+
+        # --- 1. SA を冪等作成 ---
+        if not self._gcloud_exists(
+            f"gcloud iam service-accounts describe {build_sa} "
+            f"--project={dst_proj} --format='value(email)'", dst_sa,
+        ):
+            self.dst_logger.info(
+                f"    [Fn] {dst_proj}: 関数ビルド専用 SA {build_sa} を作成します")
+            rc, out, err = self._soft_run(
+                f"gcloud iam service-accounts create {_FN_BUILD_SA_ACCOUNT_ID} "
+                f"--project={dst_proj} "
+                f"--display-name='Cloud Functions build service account' --quiet",
+                "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=180)
+            if rc != 0 and not (self.dry_run or self.mock):
+                # 並列でも他ステップでもない単発作成なので ALREADY_EXISTS は
+                # 実質起きないが、起きたら成功扱いにする（describe で再確認）。
+                if not self._gcloud_exists(
+                    f"gcloud iam service-accounts describe {build_sa} "
+                    f"--project={dst_proj} --format='value(email)'", dst_sa,
+                ):
+                    why = _first_meaningful_line(err, out)
+                    self.dst_logger.warning(
+                        f"    ⚠ [Fn] {dst_proj}: ビルド専用 SA を作成できませんでした: "
+                        f"{why}。関数の deploy はビルド段階で失敗する可能性があります")
+                    add_note(src_proj, dst_proj, "function_build_sa_manual",
+                             build_sa, "-", why)
+                    return None, False
+            changed = True
+            if not (self.dry_run or self.mock):
+                # 新規 SA は伝播に数秒かかる（VM 用 SA 作成と同じ扱い）。
+                for _ in range(6):
+                    if self._gcloud_exists(
+                        f"gcloud iam service-accounts describe {build_sa} "
+                        f"--project={dst_proj} --format='value(email)'", dst_sa,
+                    ):
+                        break
+                    time.sleep(5)
+
+        # --- 2. 不足ロールだけ付与（同一プロジェクトなので直列 = etag 競合回避）---
+        missing = missing_build_sa_roles(
+            self._dst_existing_bindings(dst_proj, dst_sa), member)
+        if not missing:
+            self.dst_logger.info(
+                f"    [Fn] {dst_proj}: ビルド SA {build_sa} は必要なロールを保持済み")
+            return build_sa, changed
+        failed: List[str] = []
+        for role in missing:
+            rc, out, err = self._soft_run(
+                f"gcloud projects add-iam-policy-binding {dst_proj} "
+                f"--member={shlex.quote(member)} --role={role} "
+                f"--condition=None --quiet --format=none",
+                "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=180)
+            if rc != 0 and not (self.dry_run or self.mock):
+                failed.append(f"{role}: {_first_meaningful_line(err, out)}")
+        if self.dry_run or self.mock:
+            return build_sa, False
+        if failed:
+            self.dst_logger.warning(
+                f"    ⚠ [Fn] {dst_proj}: ビルド SA {build_sa} へのロール付与に"
+                f"失敗しました（{' / '.join(failed)}）。deploy はビルド段階で"
+                f"失敗する可能性があります")
+            add_note(src_proj, dst_proj, "function_build_sa_manual", build_sa, "-",
+                     " / ".join(failed))
+            return build_sa, changed
+        self.dst_logger.warning(
+            f"    ⚠ [Fn] {dst_proj}: 関数ビルド専用 SA {build_sa} に "
+            f"{', '.join(missing)} を付与しました（既定ビルド SA = default compute SA "
+            f"は組織ポリシーでロールが付かないため。既定 SA を太らせない形にしています）")
+        add_note(src_proj, dst_proj, "function_build_sa_granted", build_sa, "-",
+                 ", ".join(missing))
+        return build_sa, True
+
+    def _ensure_fn_source_bucket(
+        self, bucket: str, dst_proj: str, region: str, dst_sa: Optional[str],
+    ) -> Optional[str]:
+        """関数ソース受け渡し用の dst バケットを冪等に用意する（失敗理由を返す）。
+
+        **関数単位で並列**に走るため、同一 dst プロジェクトの複数関数が同時に
+        「describe（無い）→ create」を実行すると、片方が
+        `HTTPError 409: ... you already own it` で失敗する（regression）。
+        lock で直列化したうえで、create 失敗時は describe で実在を再確認し、
+        存在すれば成功として扱う（作成者がどちらの worker でも同じ結果）。
+        """
+        describe = (f"gcloud storage buckets describe gs://{bucket} "
+                    f"--project={dst_proj} --format='value(name)'")
+        with self._fn_bucket_lock:
+            if bucket in self._fn_buckets_ready:
+                return None
+            if self._gcloud_exists(describe, dst_sa):
+                self._fn_buckets_ready.add(bucket)
+                return None
+            self.dst_logger.info(
+                f"    [Fn] 関数ソース zip の受け渡し用バケットを dst に作成: "
+                f"gs://{bucket} ({region})")
+            rc, out, err = self._soft_run(
+                f"gcloud storage buckets create gs://{bucket} "
+                f"--project={dst_proj} --location={region} --quiet",
+                "dst", self.dst_logger, impersonate_sa=dst_sa, timeout=300)
+            if rc != 0:
+                if not self._gcloud_exists(describe, dst_sa):
+                    return (f"ソース受け渡し用バケット gs://{bucket} を作成できません"
+                            f"でした: {_first_meaningful_line(err, out)}")
+                self.dst_logger.info(
+                    f"    [Fn] gs://{bucket} は既に存在するため再利用します")
+            self._fn_buckets_ready.add(bucket)
+            return None
+
     def _collect_function_sync_work(self, pairs, add_note) -> List[Dict[str, Any]]:
         """(プロジェクト並列) src の Cloud Functions を列挙して複製 unit を作る。"""
         units: List[Dict[str, Any]] = []
@@ -10477,19 +10865,11 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
                 f"    [Fn] [DRY RUN] 予定: gs://{src_bucket}/{src_object} → {dst_uri}")
             return None
         bucket = dst_uri.split("/", 3)[2]
-        # dst バケットは無ければ作る（冪等）。関数と同じリージョンに置く。
-        if not self._gcloud_exists(
-            f"gcloud storage buckets describe gs://{bucket} "
-            f"--project={dst_proj} --format='value(name)'", dst_sa,
-        ):
-            self.run_command(
-                f"gcloud storage buckets create gs://{bucket} "
-                f"--project={dst_proj} --location={region} --quiet",
-                side="dst", logger=self.dst_logger,
-                desc=f"Create bucket {bucket}",
-                explanation=f"関数ソース zip の受け渡し用バケットを dst に作成",
-                impersonate_sa=dst_sa, allow_fail=True,
-            )
+        # dst バケットは無ければ作る（冪等 / 並列競合は _ensure_fn_source_bucket が吸収）。
+        # 関数と同じリージョンに置く。
+        why = self._ensure_fn_source_bucket(bucket, dst_proj, region, dst_sa)
+        if why:
+            return why
         tmpdir = tempfile.mkdtemp(prefix="fn-src-")
         local = os.path.join(tmpdir, "function-source.zip")
         try:
@@ -10571,7 +10951,7 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
             return
 
         flags, env, notes = build_function_deploy_flags(
-            fn, dst_proj, dst_uri, proj_map, num_map)
+            fn, dst_proj, dst_uri, proj_map, num_map, unit.get("build_sa"))
         for n in notes:
             self.dst_logger.info(f"    [Fn] {label}: {n}")
 
@@ -10613,9 +10993,18 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
                 explanation=f"dst {dst_proj} に Cloud Functions {name} "
                             f"({region}) をソースから再ビルド / デプロイ",
                 impersonate_sa=dst_sa, allow_fail=True,
+                # ビルド SA へ今回ロールを付与した場合のみ 1 回だけ再試行する。
+                # IAM の伝播が間に合わずビルドが古いポリシーで走ることがあるため。
+                retries=1 if unit.get("build_sa_granted") else 0,
+                retry_wait_seconds=60,
             )
             if res is None and not (self.dry_run or self.mock):
-                self.dst_logger.error(f"    ✗ [Fn] {label}: deploy に失敗しました")
+                self.dst_logger.error(
+                    f"    ✗ [Fn] {label}: deploy に失敗しました"
+                    f"（ビルドログ: `gcloud builds list --region={region} "
+                    f"--project={dst_proj} --limit=5`）")
+                add_note(src_proj, dst_proj, "function_deploy_failed", name, region,
+                         "gcloud functions deploy が失敗（ビルドログを確認）")
                 return
             self.dst_logger.info(f"    ✓ 複製 {dst_proj}/{name} ({region})")
         finally:
@@ -10624,16 +11013,16 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
             except OSError:
                 pass
 
-    def _persist_serverless_notes(self, pairs, notes: List[Dict[str, str]]):
-        """複製を見送ったサービスの注記を active/<src>/.serverless_notes.json に書く。
+    def _persist_step_notes(self, src_ids, notes: List[Dict[str, str]],
+                            fname: str, label: str):
+        """ステップの注記を active/<src>/<fname> に書く。
 
         Step 99 の `load_customize_notes` が読み、DIFF.md の注記セクションに出す。
         **処理した src は注記が無くても空リストで上書きする**（原因が解消したら
         注記も消えるように。.tf と同じライフサイクル）。
         """
         active_dir = os.path.join(self._tf_base_dir(), 'active')
-        by_src: Dict[str, List[Dict[str, str]]] = {
-            src: [] for src, _dst, _s, _d in pairs}
+        by_src: Dict[str, List[Dict[str, str]]] = {src: [] for src in src_ids}
         for n in notes:
             by_src.setdefault(n.get("src_dir", ""), []).append(n)
         for src, items in by_src.items():
@@ -10642,12 +11031,70 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
             proj_dir = os.path.join(active_dir, src)
             try:
                 os.makedirs(proj_dir, exist_ok=True)
-                with open(os.path.join(proj_dir, _SERVERLESS_NOTES_FILE),
-                          "w", encoding="utf-8") as f:
+                with open(os.path.join(proj_dir, fname), "w", encoding="utf-8") as f:
                     json.dump(items, f, ensure_ascii=False, indent=2)
             except OSError as e:
                 self.dst_logger.warning(
-                    f"  [Run] 注記を書き出せませんでした ({src}): {e}")
+                    f"  [{label}] 注記を書き出せませんでした ({src}): {e}")
+
+    def _persist_serverless_notes(self, pairs, notes: List[Dict[str, str]]):
+        """Step 4.7 の注記を active/<src>/.serverless_notes.json に書く。"""
+        self._persist_step_notes(
+            [src for src, _dst, _s, _d in pairs], notes,
+            _SERVERLESS_NOTES_FILE, "Run")
+
+    def _note_default_runtime_sa_roles(
+        self, src_policies: Dict[str, Dict[str, Any]], proj_map: Dict[str, str],
+    ):
+        """既定ランタイム SA（default compute / appspot）のロール差を DIFF に出す。
+
+        これらの SA は project ごとに別 ID なので `build_iam_replication_plan` が
+        複製対象から外している（dst に同等物が既定で存在する前提）。ところが
+        2024-05-03 以降に作られたプロジェクトは組織ポリシー
+        `constraints/iam.automaticIamGrantsForDefaultServiceAccounts` により
+        `roles/editor` の自動付与が無く、**存在は同等だが権限は同等でない**。
+        複製方針は変えず（別 ORG に editor を自動で生やさない）、
+        「src では何を持っていたか / dst には何が無いか」を可視化して判断を委ねる。
+        """
+        notes: List[Dict[str, str]] = []
+        dst_sa_by_src = self._build_dst_sa_map()
+        for src_proj in sorted(src_policies):
+            dst_proj = proj_map.get(src_proj)
+            if not dst_proj:
+                continue
+            src_roles = default_runtime_sa_roles(src_policies.get(src_proj))
+            if not src_roles:
+                continue
+            dst_sa = dst_sa_by_src.get(src_proj)
+            dst_bindings = self._dst_existing_bindings(dst_proj, dst_sa)
+            dst_num = self._dst_project_number(dst_proj, dst_sa)
+            for email, roles in src_roles.items():
+                dst_member = ""
+                if _RUN_DEFAULT_COMPUTE_SA_RE.match(email) and dst_num:
+                    dst_member = f"{dst_num}-compute@developer.gserviceaccount.com"
+                elif _RUN_APPSPOT_SA_RE.match(email):
+                    dst_member = f"{dst_proj}@appspot.gserviceaccount.com"
+                # dst が既に持っているロールは出さない。判定不能（None）は
+                # 「見落とすより過剰報告」の原則で全件出す。
+                if dst_bindings is not None and dst_member:
+                    held = {r for (m, r) in dst_bindings
+                            if m == f"serviceAccount:{dst_member}"}
+                    roles = [r for r in roles if r not in held]
+                if not roles:
+                    continue
+                notes.append({
+                    "kind": "default_runtime_sa_roles", "src_dir": src_proj,
+                    "resource": email, "project": dst_proj, "region": "-",
+                    "detail": ", ".join(roles), "dst_member": dst_member,
+                })
+                self.dst_logger.info(
+                    f"  [IAM] {src_proj}: 既定ランタイム SA {email} の "
+                    f"{len(roles)} ロール（{', '.join(roles)}）は複製対象外です。"
+                    f"dst の {dst_member or '既定 SA'} には付きません"
+                    f"（DIFF の「確認」に付与コマンドを出します）")
+        self._persist_step_notes(
+            [s for s in src_policies if proj_map.get(s)], notes,
+            _IAM_NOTES_FILE, "IAM")
 
     def step_iam_sync(self):
         """Step 5.7: src の SA に付いている IAM ロールを dst の同名 SA へ複製する。
@@ -10665,6 +11112,9 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
         - 条件付きバインディング（条件式が src のリソース名を参照しうる）
         - ORG カスタムロール / project_mapping 外のプロジェクトのカスタムロール
         - default compute / appspot / Google 管理 service agent（dst に同等物がある）
+          … ただし **同等なのは存在だけで権限は付かない**（組織ポリシー
+          `automaticIamGrantsForDefaultServiceAccounts`）ので、
+          `_note_default_runtime_sa_roles` が差分を DIFF の「確認」に出す
         - SA リソース自身の IAM ポリシー（= 誰がその SA を借用できるか）
         - プロジェクト以外のリソース（バケット / データセット等）のバインディング
 
@@ -10684,6 +11134,9 @@ resource "google_compute_backend_service" "mock_gkegw_backend" {{
         self._sync_run_service_invokers()
 
         src_policies = self._fetch_src_iam_policies()
+        # 複製対象外にしている既定ランタイム SA のロール差を DIFF に出す。
+        # 以降に「複製対象なし」の早期 return があるのでここで呼ぶ。
+        self._note_default_runtime_sa_roles(src_policies, proj_map)
         grants, warnings = build_iam_replication_plan(
             src_policies, proj_map, self._iam_excluded_sa_emails())
         for w in warnings:

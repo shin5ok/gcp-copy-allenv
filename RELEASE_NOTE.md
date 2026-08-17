@@ -80,10 +80,58 @@
 - コピー先: `roles/iam.serviceAccountUser`（実行 SA を指定するために必要）
   → `scripts/bootstrap_dst_sa.sh` を再実行してください。
 
+### Cloud Functions 用に「ビルド専用サービスアカウント」をコピー先へ作ります
+
+Cloud Functions のデプロイは、コピー先の Cloud Build がビルドを実行します。その既定の
+ビルド SA は「既定の Compute サービスアカウント」
+(`<プロジェクト番号>-compute@developer.gserviceaccount.com`) ですが、2024-05-03 以降に
+作られたプロジェクトは組織ポリシー
+（`constraints/iam.automaticIamGrantsForDefaultServiceAccounts`）により
+この SA に権限が一切付きません。**移行先は必ず新規プロジェクトなので毎回該当し**、
+すべての関数が次のエラーでデプロイに失敗していました。
+
+```
+Could not build the function due to a missing permission on the build service account.
+```
+
+Step 4.7 が関数をコピーする前に、コピー先プロジェクトごとに専用 SA
+**`fn-build@<コピー先プロジェクト>.iam.gserviceaccount.com`** を作成し、公式が指定する
+最小ロール（`roles/logging.logWriter` / `roles/artifactregistry.writer` /
+`roles/storage.objectViewer`）だけを付与して、デプロイ時に
+`--build-service-account` で明示するようにしました。
+
+**既定の Compute SA には手を入れません。** この SA は VM・Cloud Run・全 Function の
+「実行 ID」も兼ねるため、そこにビルド用の広い権限を足すと移行と無関係のワークロードの
+権限まで広がってしまうためです（コピー先組織が既定 SA でのビルドを禁止している場合にも
+この方式なら動きます）。
+
+- 作成した事実は実行ログの WARNING と DIFF.md の「確認」に出ます。
+- **この SA は移行後も残してください**。関数の設定に記録されるため、削除すると
+  再デプロイが失敗します（コピー先の正式なビルド ID として使う想定です）。
+- 自前のビルド SA を使う場合は `steps.serverless_sync.build_service_account: <email>`
+  （作成・権限付与はご自身で。ツールは指定するだけです）。
+- 自動用意そのものを止める場合は `grant_build_service_account: false`
+  （既定のビルド SA に `roles/cloudbuild.builds.builder` が必要になります）。
+- 用意できなかった場合は移行を止めず、DIFF.md に「要対応」＋手動コマンドを出します。
+
+### 「既定のサービスアカウントの権限」の差分を DIFF.md に出します
+
+上と同じ組織ポリシーの影響で、**コピー先の既定 Compute SA / App Engine SA は
+権限ゼロのまま**です。本ツールはこれらの SA を IAM 複製の対象外にしています
+（プロジェクトごとに別 ID で、コピー先にも同名の SA が既定で存在するため）が、
+「存在は同じでも権限は同じでない」状態になります。
+
+そこで **コピー元の既定 SA が持っていたロールのうち、コピー先に無いもの**を
+DIFF.md の「確認」に付与コマンド付きで出すようにしました。既定 SA で動く
+VM / Cloud Run / Cloud Functions がある場合は確認してください
+（自動では付与しません。別組織に `roles/editor` を勝手に生やさないためです）。
+
 ### 設定
 
 `steps.serverless_sync` は**キーを書かなくても有効**です。無効化したいときだけ
 `enabled: false`、特定のサービス・関数だけ除外したいときは `skip_services` を指定してください。
+ビルド専用 SA については `build_service_account` / `grant_build_service_account` を
+上記のとおり指定できます。
 
 ---
 

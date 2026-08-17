@@ -326,6 +326,28 @@ cp dst/config.yaml.template dst/config.yaml
       - Cloud Functions … ソース zip を dst のバケットへ運び、**dst 側で再ビルド**
         （イメージ複製は不要。`<dst プロジェクト ID>-fn-source-migration` バケットを
         関数と同じリージョンに冪等作成します。`source_bucket` で変更可）
+    - **関数ビルド専用 SA の自動用意**: Cloud Functions のビルドは dst の Cloud Build が
+      実行しますが、既定のビルド SA（`<番号>-compute@developer.gserviceaccount.com`）は
+      2024-05-03 以降に作られたプロジェクトでは組織ポリシー
+      `constraints/iam.automaticIamGrantsForDefaultServiceAccounts` によりロールが
+      1 つも付かず、**そのままでは全関数が
+      `missing permission on the build service account` でビルドに失敗します**。
+      複製前に dst プロジェクトごとに専用 SA
+      `fn-build@<dst>.iam.gserviceaccount.com` を冪等作成し、公式指定の最小ロール
+      (`roles/logging.logWriter` / `roles/artifactregistry.writer` /
+      `roles/storage.objectViewer`) を付与して、deploy に
+      `--build-service-account` で明示します（gen1 / gen2 とも対応）。
+      **既定 SA はランタイム ID も兼ねる**ため、そこに広い
+      `roles/cloudbuild.builds.builder` を足す方法は採りません
+      （移行と無関係のワークロードの権限まで広がる / dst ORG が
+      `cloudbuild.useComputeServiceAccount` を無効にしていると効かない）。
+      用意した事実は WARNING + `DIFF.md` の「確認」に出ます。
+      - 自前のビルド SA を使う: `build_service_account: <email>`（作成・権限付与は
+        利用者側の責任。ツールは指定するだけ）
+      - 自動用意そのものを止める: `grant_build_service_account: false`
+        （既定ビルド SA に `roles/cloudbuild.builds.builder` が必要）
+      - この SA は関数の設定に記録されるため、**移行後も残す前提**です
+        （削除すると再デプロイが失敗します）
     - 環境変数・メモリ / CPU・タイムアウト・インスタンス数・同時実行数・ingress・
       ヘルスチェック等は src の内容がそのまま引き継がれます。
     - **「中途半端にコピーしない」方針**: 以下は**複製せず** `DIFF.md` の要対応に手順つきで
@@ -375,6 +397,15 @@ cp dst/config.yaml.template dst/config.yaml
       SA 自身の IAM ポリシー（誰が借用できるか）/ バケット・データセット等のリソース単位バインディング。
     - **`roles/owner` 等の超高権限ロールも src と同じなら複製します**。付与した場合は実行ログの
       最後に「何を・どこに・なぜ・取消コマンド」を WARNING でまとめて出すので必ずレビューしてください。
+    - **既定ランタイム SA（default compute / appspot）は複製対象外ですが、差分を `DIFF.md` に
+      出します**。これらは project ごとに別 ID なので「dst にも同等物がある」前提で除外して
+      いますが、2024-05-03 以降に作られたプロジェクトでは組織ポリシー
+      `constraints/iam.automaticIamGrantsForDefaultServiceAccounts` により
+      `roles/editor` が自動付与されず、**存在は同等でも権限は同等になりません**。
+      「src の既定 SA が持っていたロール」と「dst に無いもの」を突き合わせて、
+      付与コマンド付きの「確認」として出します（自動付与はしません。別 ORG に
+      `roles/editor` を勝手に生やさないため）。既定 SA で動く VM / Cloud Run /
+      Cloud Functions がある場合は必ず確認してください。
     - dst 側に `roles/resourcemanager.projectIamAdmin` が必要（`bootstrap_dst_sa.sh` が付与）。
       権限が無い場合は**エラーにせず**スキップし、手動用の `add-iam-policy-binding` コマンドを案内します。
   - **`data_sync`** (Step 6 / Step 3.7): GCS バケット・BigQuery のデータ同期に加え、

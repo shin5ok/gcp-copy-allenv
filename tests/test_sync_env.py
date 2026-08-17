@@ -28,6 +28,10 @@ from scripts.sync_env import (
     function_unsupported_reasons,
     build_function_deploy_flags,
     function_secretish_env_names,
+    missing_build_sa_roles,
+    default_runtime_sa_roles,
+    _FN_BUILD_SA_ROLE,
+    _FN_BUILD_SA_ROLES,
     fw_policy_rule_layer4,
     fw_policy_rule_flags,
     fw_policy_rule_secure_tags,
@@ -7493,10 +7497,21 @@ class TestFunctionUnsupportedReasons:
 
 
 class TestBuildFunctionDeployFlags:
-    def _build(self, fn=None):
+    def _build(self, fn=None, build_sa=None):
         return build_function_deploy_flags(
             fn or _FN_GEN2, "dst-alone", "gs://dst-bucket/api/function-source.zip",
-            _PROJ_MAP, _NUM_MAP)
+            _PROJ_MAP, _NUM_MAP, build_sa)
+
+    def test_no_build_sa_flag_by_default(self):
+        flags, _env, _notes = self._build()
+        assert not any(f.startswith("--build-service-account=") for f in flags)
+
+    def test_build_sa_flag_uses_full_resource_path(self):
+        """--build-service-account は projects/<p>/serviceAccounts/<email> 形式必須。"""
+        flags, _env, _notes = self._build(
+            build_sa="fn-build@dst-alone.iam.gserviceaccount.com")
+        assert ("--build-service-account=projects/dst-alone/serviceAccounts/"
+                "fn-build@dst-alone.iam.gserviceaccount.com") in flags
 
     def test_core_flags(self):
         flags, _env, _notes = self._build()
@@ -7555,6 +7570,182 @@ class TestFunctionSecretishEnv:
         fn = copy.deepcopy(_FN_GEN2)
         fn["serviceConfig"]["environmentVariables"]["SLACK_TOKEN"] = "x"
         assert function_secretish_env_names(fn) == ["SLACK_TOKEN"]
+
+
+class TestMissingBuildSaRoles:
+    """関数ビルド専用 SA に不足しているロールの判定。"""
+
+    MEMBER = "serviceAccount:fn-build@dst-alone.iam.gserviceaccount.com"
+
+    def test_new_sa_needs_all_roles(self):
+        assert missing_build_sa_roles(set(), self.MEMBER) == list(_FN_BUILD_SA_ROLES)
+
+    def test_unknown_policy_falls_back_to_all(self):
+        """取得不能で見送ると deploy が必ず失敗する側に倒れるため全部付与する。"""
+        assert missing_build_sa_roles(None, self.MEMBER) == list(_FN_BUILD_SA_ROLES)
+
+    def test_partial_grant_returns_only_missing(self):
+        held = {(self.MEMBER, _FN_BUILD_SA_ROLES[0])}
+        assert missing_build_sa_roles(held, self.MEMBER) == list(_FN_BUILD_SA_ROLES[1:])
+
+    def test_all_present_returns_empty(self):
+        held = {(self.MEMBER, r) for r in _FN_BUILD_SA_ROLES}
+        assert missing_build_sa_roles(held, self.MEMBER) == []
+
+    def test_editor_or_owner_is_enough(self):
+        assert missing_build_sa_roles({(self.MEMBER, "roles/editor")}, self.MEMBER) == []
+        assert missing_build_sa_roles({(self.MEMBER, "roles/owner")}, self.MEMBER) == []
+
+    def test_other_member_does_not_count(self):
+        other = "serviceAccount:someone-else@dst-alone.iam.gserviceaccount.com"
+        held = {(other, r) for r in _FN_BUILD_SA_ROLES}
+        assert missing_build_sa_roles(held, self.MEMBER) == list(_FN_BUILD_SA_ROLES)
+
+
+class TestDefaultRuntimeSaRoles:
+    """複製対象外にしている既定ランタイム SA のロール抽出（DIFF 可視化用）。"""
+
+    POLICY = {"bindings": [
+        {"role": "roles/editor", "members": [
+            "serviceAccount:111111111111-compute@developer.gserviceaccount.com",
+            "user:someone@example.com"]},
+        {"role": "roles/storage.admin", "members": [
+            "serviceAccount:111111111111-compute@developer.gserviceaccount.com"]},
+        {"role": "roles/editor", "members": [
+            "serviceAccount:src-alone@appspot.gserviceaccount.com"]},
+        {"role": "roles/viewer", "members": [
+            "serviceAccount:app@src-alone.iam.gserviceaccount.com"]},
+    ]}
+
+    def test_collects_default_compute_and_appspot(self):
+        got = default_runtime_sa_roles(self.POLICY)
+        assert got == {
+            "111111111111-compute@developer.gserviceaccount.com":
+                ["roles/editor", "roles/storage.admin"],
+            "src-alone@appspot.gserviceaccount.com": ["roles/editor"],
+        }
+
+    def test_user_managed_sa_is_not_included(self):
+        """user-managed SA は iam_sync が本来の複製経路で扱う。"""
+        got = default_runtime_sa_roles(self.POLICY)
+        assert all("iam.gserviceaccount.com" not in e for e in got)
+
+    def test_conditional_binding_excluded(self):
+        policy = {"bindings": [{
+            "role": "roles/editor", "condition": {"expression": "x"},
+            "members": [
+                "serviceAccount:111111111111-compute@developer.gserviceaccount.com"],
+        }]}
+        assert default_runtime_sa_roles(policy) == {}
+
+    def test_garbage(self):
+        assert default_runtime_sa_roles(None) == {}
+        assert default_runtime_sa_roles({}) == {}
+
+
+class TestFunctionBuildSaNotes:
+    def test_granted_note_is_confirmation(self):
+        kind, what, why, how = customize_note_row({
+            "kind": "function_build_sa_granted",
+            "resource": "fn-build@dst-alone.iam.gserviceaccount.com",
+            "project": "dst-alone", "region": "-",
+            "detail": ", ".join(_FN_BUILD_SA_ROLES),
+        })
+        assert kind == "確認" and "ビルド" in what
+        assert "roles/logging.logWriter" in why
+        assert "build_service_account" in how
+
+    def test_manual_note_is_action_with_both_paths(self):
+        kind, _what, _why, how = customize_note_row({
+            "kind": "function_build_sa_manual",
+            "resource": "fn-build@dst-alone.iam.gserviceaccount.com",
+            "project": "dst-alone", "region": "-", "detail": "PERMISSION_DENIED",
+        })
+        assert kind == "要対応"
+        assert "service-accounts create" in how and _FN_BUILD_SA_ROLE in how
+
+    def test_default_runtime_sa_note_shows_dst_member_and_command(self):
+        kind, what, why, how = customize_note_row({
+            "kind": "default_runtime_sa_roles",
+            "resource": "111111111111-compute@developer.gserviceaccount.com",
+            "project": "dst-alone", "region": "-",
+            "detail": "roles/editor, roles/storage.admin",
+            "dst_member": "222222222222-compute@developer.gserviceaccount.com",
+        })
+        assert kind == "確認" and "既定ランタイム SA" in what
+        assert "222222222222-compute@developer.gserviceaccount.com" in why
+        assert "add-iam-policy-binding dst-alone" in how
+        assert "--role=roles/editor" in how
+
+    def test_deploy_failed_note_points_at_build_log(self):
+        kind, _what, _why, how = customize_note_row({
+            "kind": "function_deploy_failed", "resource": "test-1",
+            "project": "dst-alone", "region": "us-central1", "detail": "build failed",
+        })
+        assert kind == "要対応" and "gcloud builds list" in how
+
+
+class TestValidateBuildServiceAccountConfig:
+    def test_non_bool_rejected(self):
+        errs = validate_steps_config({"steps": {
+            "serverless_sync": {"grant_build_service_account": "false"}}})
+        assert any("grant_build_service_account" in e for e in errs)
+
+    def test_bool_ok(self):
+        assert validate_steps_config({"steps": {
+            "serverless_sync": {"grant_build_service_account": False}}}) == []
+
+    def test_build_sa_must_be_email(self):
+        errs = validate_steps_config({"steps": {
+            "serverless_sync": {"build_service_account": "fn-build"}}})
+        assert any("build_service_account" in e for e in errs)
+
+    def test_build_sa_email_ok(self):
+        assert validate_steps_config({"steps": {"serverless_sync": {
+            "build_service_account": "fn-build@dst.iam.gserviceaccount.com"}}}) == []
+
+
+class TestEnsureFnSourceBucket:
+    """並列 deploy でのバケット二重作成（409）を吸収する。"""
+
+    def _orch(self, temp_dir, exists, create_rc):
+        cfg = _full_config(temp_dir)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.mock = False
+        o.dry_run = False
+        o.dst_logger = logging.getLogger("test-dst")
+        o.calls = []
+        o._gcloud_exists = lambda cmd, sa: (o.calls.append(("describe", cmd))
+                                            or exists.pop(0))
+        def fake_soft_run(cmd, side, logger, **kw):
+            o.calls.append(("create", cmd))
+            return create_rc, "", "HTTPError 409: ... you already own it."
+        o._soft_run = fake_soft_run
+        return o
+
+    def test_creates_when_missing(self, temp_dir):
+        o = self._orch(temp_dir, exists=[False], create_rc=0)
+        assert o._ensure_fn_source_bucket("b", "dst-p", "us-central1", None) is None
+        assert [c[0] for c in o.calls] == ["describe", "create"]
+
+    def test_second_call_is_cached(self, temp_dir):
+        o = self._orch(temp_dir, exists=[False], create_rc=0)
+        o._ensure_fn_source_bucket("b", "dst-p", "us-central1", None)
+        assert o._ensure_fn_source_bucket("b", "dst-p", "us-central1", None) is None
+        assert [c[0] for c in o.calls] == ["describe", "create"]
+
+    def test_409_from_parallel_worker_is_success(self, temp_dir):
+        """他 worker が先に作った場合、create は 409 でも実在すれば成功扱い。"""
+        o = self._orch(temp_dir, exists=[False, True], create_rc=1)
+        assert o._ensure_fn_source_bucket("b", "dst-p", "us-central1", None) is None
+
+    def test_real_failure_is_reported(self, temp_dir):
+        o = self._orch(temp_dir, exists=[False, False], create_rc=1)
+        why = o._ensure_fn_source_bucket("b", "dst-p", "us-central1", None)
+        assert why and "gs://b" in why
 
 
 class TestSrcGcsDownloadException:
