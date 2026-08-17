@@ -296,24 +296,27 @@ flowchart TD
   V -->|"失敗"| ERR["このリソースだけ失敗<br/>他は続行し終端で exit 1"]
   V -->|"成功"| AP["replace を実行"]
 
-  SP -->|"Cloud Functions"| D4{"複製できるか<br/>HTTP トリガ / ソース zip 取得可 /<br/>Secret・VPC・CMEK なし"}
+  SP -->|"Cloud Functions"| B0["dst プロジェクト単位で 1 回<br/>専用ビルド SA fn-build@ を冪等作成<br/>不足する最小 3 ロールだけ付与"]
+  B0 --> BD{"用意できたか"}
+  BD -->|"できない"| K4["DIFF に要対応<br/>専用 SA / 既定 SA 両方の<br/>手動コマンドを案内"]
+  BD -->|"できた / 設定で無効"| D4{"複製できるか<br/>HTTP トリガ / ソース zip 取得可 /<br/>Secret・VPC・CMEK なし"}
   D4 -->|"いいえ"| K3["作らない + DIFF に要対応<br/>イベントトリガ / gen1 の<br/>sourceUploadUrl のみ 等"]
-  D4 -->|"はい"| CP["ソース zip を<br/>src 認証で download →<br/>dst 認証で upload"]
-  CP --> DP["gcloud functions deploy<br/>dst 側で再ビルド"]
+  D4 -->|"はい"| CP["ソース受け渡しバケットを冪等作成<br/>lock + 存在再確認で並列 409 を吸収<br/>src 認証で download → dst 認証で upload"]
+  CP --> DP["gcloud functions deploy<br/>--build-service-account で<br/>ビルド SA を明示 / dst 側で再ビルド"]
 
   classDef gate fill:#FAF0DA,stroke:#8A6612,stroke-width:1.5px,color:#3D2E08;
   classDef skip fill:#E8E2F6,stroke:#5C4F91,stroke-width:1.5px,color:#2F2758;
   classDef halt fill:#F7DFDB,stroke:#9F3428,stroke-width:1.5px,color:#48160F;
   classDef pass fill:#DDEEE7,stroke:#0D6A53,stroke-width:1.5px,color:#0A382C;
   classDef step fill:#E4EAEC,stroke:#3E5257,stroke-width:1.2px,color:#16242A;
-  class D0,SP,D1,D2,D3,D4,V gate;
-  class SK0,FN,K1,K2,K3 skip;
+  class D0,SP,D1,D2,D3,D4,V,BD gate;
+  class SK0,FN,K1,K2,K3,K4 skip;
   class ERR halt;
   class AP,DP pass;
-  class L,RW,CP step;
+  class L,RW,CP,B0 step;
 ```
 
-*図 6 — 「作らない」判断が 3 箇所ある。いずれも DIFF.md に手順つきで出る。*
+*図 6 — 「作らない」判断が 3 箇所ある。いずれも DIFF.md に手順つきで出る。関数のビルド SA だけは事前に**用意する**（用意しないと全関数が落ちるため）。*
 
 > **中途半端に作らないのは、気付けなくなるからです。** 参照先が src を指したまま
 > コピー先にリソースを作ると、CAI とコピー先の差分には現れません
@@ -334,6 +337,32 @@ flowchart TD
 > チャネル設定も要るため、機械的に写すと**誤ったイベント源を購読する関数**に
 > なりかねません。第 1 世代でソース zip が `sourceUploadUrl`（署名付きアップロード URL）
 > しか無い場合も、gcloud にダウンロード手段が無いため複製できません。
+
+> **関数のビルドは「専用サービスアカウントを作って明示指定」します。** deploy の
+> ビルドは Cloud Build が実行し、その既定 ID はコピー先の default compute SA です。
+> ところが 2024-05-03 以降に作られたプロジェクトは組織ポリシー
+> `constraints/iam.automaticIamGrantsForDefaultServiceAccounts` により
+> **この SA にロールが 1 つも付かない**ため、コピー先は必ず新規プロジェクトである
+> 本ツールでは**全関数が `missing permission on the build service account` で失敗**します。
+>
+> 既定 SA に広いロールを足す方法は採りません。既定 SA は **VM / Cloud Run / 全 Function の
+> 実行 ID も兼ねる**ため移行と無関係の権限まで広がり、コピー先組織が
+> `cloudbuild.useComputeServiceAccount` を無効にしている場合は付与しても動かないからです。
+> 代わりに `fn-build@<dst>` を作り、公式指定の 3 ロール
+> （`logging.logWriter` / `artifactregistry.writer` / `storage.objectViewer`）だけ付与して
+> `--build-service-account` で渡します。**この SA は関数の設定に記録される**ので、
+> 移行後も残す前提です（消すと再デプロイが壊れます）。
+>
+> なお gcloud 自身も同じ判定を持っていますが（`ValidateDefaultBuildServiceAccountAndPromptWarning`）、
+> 対話プロンプトで警告する実装のため **`--quiet` を付けている本ツールでは警告すら出ません**。
+> 原因がビルドログまで潜っていたのはこのためです。
+
+> **ソース受け渡しバケットの作成は直列化しています。** 関数の複製は**関数単位で並列**
+> なので、同じコピー先プロジェクトの複数関数が同時に「無い → 作る」を実行すると
+> 片方が `409 ... you already own it` で落ちます。lock で直列化したうえで、
+> 作成失敗時は実在を再確認して存在すれば成功として扱います
+> （409 という文字列だけで成功と判定はしません。名前が他人に取られている 409 と
+> 区別できないためです）。
 
 ---
 
@@ -378,6 +407,56 @@ flowchart TD
 
 ---
 
+## Step 5.7 — IAM 複製（複製しないものほど説明が要る）
+
+複製元は **コピー元各プロジェクトの project IAM ポリシーだけ**です。除外の理由は
+「コピー先の権限が緩まない方向に倒す」か「別 ORG では ID が変わる」のどちらかで、
+**唯一の例外が既定ランタイム SA** — こちらは「コピー先に同名の SA が既定で存在する」
+という理由での除外なので、権限が付かない現在は差分を可視化します。
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace, Menlo, Consolas, 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif","fontSize":"13px","lineColor":"#7C8D92","textColor":"#16242A","edgeLabelBackground":"#EDF1F1"}}}%%
+flowchart TD
+  R0["先に Cloud Run の公開設定を複製<br/>allUsers → run.invoker<br/>付与したら末尾に WARNING + 取消コマンド"] --> P["src の project IAM ポリシーを読む"]
+  P --> D0{"バインディングのメンバー種別"}
+  D0 -->|"Google 管理 service agent"| SK0["複製しない<br/>警告も出さない / コピー先に既存"]
+  D0 -->|"既定ランタイム SA<br/>default compute / appspot"| D5{"コピー先の同等 SA が<br/>同じロールを持つか"}
+  D0 -->|"user-managed SA"| D1{"読み替えできるか"}
+  D5 -->|"持つ"| Q["何も出さない"]
+  D5 -->|"持たない / 判定不能"| NOTE["DIFF に「確認」<br/>不足ロールと付与コマンド<br/>自動付与はしない"]
+  D1 -->|"条件付きバインディング"| SK1["skip + WARNING<br/>条件式が src を参照しうる"]
+  D1 -->|"ORG カスタムロール<br/>mapping 外のプロジェクト"| SK2["skip + WARNING<br/>別 ORG に同じ ID が無い"]
+  D1 -->|"読み替え可"| G["コピー先の同名 SA へ付与<br/>プロジェクト単位で並列 / 内部は直列<br/>etag 競合を避ける"]
+  G --> D2{"高権限ロールか"}
+  D2 -->|"roles/owner 等"| W["付与する + 末尾に WARNING<br/>何を・どこに・なぜ・取消コマンド"]
+  D2 -->|"いいえ"| OK["完了"]
+
+  classDef gate fill:#FAF0DA,stroke:#8A6612,stroke-width:1.5px,color:#3D2E08;
+  classDef skip fill:#E8E2F6,stroke:#5C4F91,stroke-width:1.5px,color:#2F2758;
+  classDef pass fill:#DDEEE7,stroke:#0D6A53,stroke-width:1.5px,color:#0A382C;
+  classDef step fill:#E4EAEC,stroke:#3E5257,stroke-width:1.2px,color:#16242A;
+  class D0,D1,D2,D5 gate;
+  class SK0,SK1,SK2,NOTE,Q,W skip;
+  class G,OK pass;
+  class R0,P step;
+```
+
+*図 8 — 「複製しない」判断のうち、既定ランタイム SA だけは DIFF に差分を出す。*
+
+> **「コピー先に同等物がある」の前提が変わりました。** 既定 compute / appspot SA を
+> 複製対象から外しているのは、プロジェクトごとに ID が変わるうえ**コピー先にも
+> 同名の SA が最初から存在する**ためです。この判断は、かつて GCP がプロジェクト作成時に
+> 既定 compute SA へ `roles/editor` を自動付与していた前提で成り立っていました。
+> 現在は組織ポリシー `constraints/iam.automaticIamGrantsForDefaultServiceAccounts` が
+> 新規プロジェクトで既定強制のため、**存在は同等でも権限は同等ではありません**。
+>
+> 複製方針は変えていません（別 ORG に `roles/editor` を自動で生やさないため）。
+> 代わりに「コピー元の既定 SA が持っていたロール」と「コピー先の現状」を突き合わせ、
+> **不足分だけ**を付与コマンド付きの「確認」として `DIFF.md` に出します。
+> コピー先のポリシーを読めない場合は全件出します（見落とすより過剰報告）。
+
+---
+
 ## 失敗の扱い — 何が run を止めるか
 
 扱いは大きく **止める / 記録して進む / 黙って落とす** に分かれます。走り出したあとは
@@ -395,6 +474,9 @@ flowchart TD
 | コピー元で AR / Cloud Run / Functions 未使用（API 無効の 403） | soft fail | `is_api_disabled_error` | INFO「複製対象なし」に落とす |
 | サーバーレスが移せない設定を含む | 作らない + 要対応 | `run_service_unsupported_reasons` / `function_unsupported_reasons` | 壊れたリソースを作らない。DIFF に手順を出す |
 | `replace --dry-run` の検証に失敗 | そのリソースのみ失敗 | `_sync_one_run_resource` | 他は続行し、終端で exit 1 |
+| 関数ソース用バケットの並列作成が衝突（409） | 吸収して続行 | `_ensure_fn_source_bucket` | lock + 実在の再確認。既存を再利用する |
+| 関数ビルド専用 SA を用意できない | soft fail + 要対応 | `_ensure_fn_build_service_account` | 移行は止めない。DIFF に手動コマンドを出す |
+| 関数の deploy が失敗 | そのリソースのみ失敗 | `_sync_one_function` | DIFF にビルドログの引き方を出す。他は続行し、終端で exit 1 |
 | suspend が ACPI に失敗 | 警告のみ | `_try_dst_suspend` | exit code に影響させない |
 | secure tag が未マッピング | skip + 警告 | `fw_policy_rule_flags` | FW を意図せず緩めない |
 | コピー先で setIamPolicy 権限が無い | skip + 案内 | `_dst_can_set_iam_policy` | failed に積まない |
@@ -420,6 +502,7 @@ flowchart TD
 | Secret Manager の値 | 秘密情報を自動で写さない方針 | 利用者 |
 | イベントトリガの Cloud Functions | 参照先のトピック / バケット名がコピー先で変わる。誤ったイベント源を購読させない | 利用者（手順は DIFF に掲載） |
 | 第 1 世代 Functions のうちソース取得不能なもの | `sourceUploadUrl` のみで gcloud にダウンロード手段が無い | 利用者（コンソールから zip を取得） |
+| 既定ランタイム SA（default compute / appspot）の権限 | プロジェクトごとに ID が変わるため複製対象外。組織ポリシーでコピー先には `roles/editor` も付かない | 利用者（不足ロールと付与コマンドを DIFF に掲載） |
 | Filestore のデータ | Backup for GKE の volume backup は PD のみ | 利用者 |
 
 ---
