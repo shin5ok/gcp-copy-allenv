@@ -1,7 +1,137 @@
 # RELEASE_NOTE
 
 このファイルは `copy-all-env` の変更のうち、**利用者（顧客エンジニア）が把握しておくべき内容**を
-日付の新しい順に記録します。開発者向けの詳細な変更履歴は `HISTORY.md` を参照してください。
+日付の新しい順に記録します。実装レベルの詳細は `git log` と `scripts/CLAUDE.md` を参照してください。
+
+---
+
+## 2026-08-17 — Cloud Run / Cloud Functions を自動でコピーするようになりました
+
+これまで **Cloud Run と Cloud Functions は確実にはコピーされませんでした**。
+コピー元の定義を Terraform 形式で書き出す `bulk-export` が Cloud Run をうまく扱えず、
+リージョンによっては書き出されない（設定によっては 1 件も書き出されない）ためです。
+コピーされなかったものは DIFF.md に「要対応（手動で作り直してください）」と出るだけでした。
+
+今回、それぞれのサービス自身の仕組みを使う **Step 4.7** を追加しました。設定は不要で、
+`make run` を実行すれば動きます。
+
+| 対象 | どうやってコピーするか |
+|---|---|
+| Cloud Run サービス | 定義を YAML で書き出し、コピー先用に書き換えて取り込む |
+| Cloud Run ジョブ | 同上 |
+| Cloud Functions（第 1・第 2 世代） | ソース zip をコピー先へ運び、**コピー先で再ビルド** |
+
+環境変数・メモリ / CPU・タイムアウト・インスタンス数・同時実行数・ingress・ヘルスチェック
+などはコピー元の内容がそのまま引き継がれます。コンテナイメージは既存の Artifact Registry
+複製（Step 3.7）で運ばれたものを参照します。
+
+### 自動でコピーされないもの（DIFF.md に手順つきで出ます）
+
+**安全のため、正しく移せない設定を含むものは「中途半端にコピーしない」方針**です。
+コピー元を指したままの壊れたリソースができると、差分レポートにも現れず気付けないためです。
+
+**Cloud Run サービス / ジョブ**
+
+- VPC コネクタ / Direct VPC egress / Cloud SQL 接続を使っている
+- Secret Manager の値を環境変数・ボリュームで参照している
+- CMEK（顧客管理鍵）/ Binary Authorization を使っている
+- サイドカー（複数コンテナ）/ GPU を使っている
+- 特定リビジョンにトラフィックを固定している（カナリア配信・リビジョンタグ）
+
+**Cloud Functions**
+
+- **イベントトリガ**（Pub/Sub / Cloud Storage / Firestore 等）。**HTTP トリガのみ対応**です。
+  参照先のトピック名やバケット名がコピー先で変わるため、機械的に写すと誤ったイベントを
+  購読する関数になってしまいます。
+- Secret Manager 参照 / VPC コネクタ / CMEK
+- **第 1 世代でソース zip を取得できないもの**。コンソールやローカルからアップロードして
+  作った関数は Google 管理の領域にしかソースが無く、gcloud にダウンロード手段がありません。
+  コンソールの「ソース」タブから zip を取得して手動デプロイしてください。
+
+### 確認をお願いしたい点
+
+- **平文の環境変数に入っている秘匿情報**（`*_TOKEN` / `*_SECRET` / `*_WEBHOOK` など）は、
+  コピー元と**同じ値のまま**コピーされます。別組織に同じ秘密が増えるため、
+  不要ならコピー先で値の差し替え / ローテーションをしてください（DIFF.md の「確認」に一覧が出ます）。
+- **実行サービスアカウント**は、コピー先の同名 SA（既定 SA ならコピー先の既定 SA）に
+  読み替えます。読み替えできない場合はコピー先の既定 SA で起動するため、権限が異なる可能性があります。
+- コピー元の Cloud Run サービスが「未認証アクセスを許可」なら、これまでどおり Step 5.7 が
+  同じ公開設定を付けます。**1 回の `make run` で公開設定まで入る**ようになりました
+  （以前はサービスを手動で作ってから再実行が必要でした）。
+  なお公開設定が付くのは **Step 5.7（GCE 復元の後）**です。Step 4.7 が終わった直後に
+  コンソールを見ると「認証が必要」に見えますが、実行が完走すれば付きます。
+- **Cloud Run のデプロイ方法の表示が「ソース」→「コンテナ」に変わります**（動くものは同じです）。
+  コピー元の「ソースからデプロイ」という表示は Cloud Build のビルド ID とソース zip の
+  GCS パスが根拠ですが、どちらも**コピー元を指している**ため引き継ぎません。
+  コピー先には**同一 digest のコンテナイメージ**が渡るので、実行されるものは変わりません。
+  コピー先でも「ソース」表示にしたい場合は、ソースをコピー先に置いて
+  `gcloud run deploy --source` で再ビルドしてください。
+- **Cloud Run / Cloud Functions の URL は変わります**（プロジェクト番号が変わるため）。
+  コピー元の URL を指している設定（DNS・Webhook・フロントエンド）は手動で更新してください。
+- Cloud Functions のソース zip は、コピー先に
+  `<コピー先プロジェクト ID>-fn-source-migration` バケットを作って受け渡します
+  （`steps.serverless_sync.source_bucket` で変更可）。
+
+### 権限の追加（既存環境は bootstrap の再実行が必要です）
+
+- コピー元: `run.services.get/list`、`cloudfunctions.functions.get/list`（読み取りのみ）
+  → `scripts/bootstrap_cross_project.sh` を再実行してください。
+  付与していなくても移行は止まりません（コピーが警告付きでスキップされます）。
+- コピー先: `roles/iam.serviceAccountUser`（実行 SA を指定するために必要）
+  → `scripts/bootstrap_dst_sa.sh` を再実行してください。
+
+### Cloud Functions 用に「ビルド専用サービスアカウント」をコピー先へ作ります
+
+Cloud Functions のデプロイは、コピー先の Cloud Build がビルドを実行します。その既定の
+ビルド SA は「既定の Compute サービスアカウント」
+(`<プロジェクト番号>-compute@developer.gserviceaccount.com`) ですが、2024-05-03 以降に
+作られたプロジェクトは組織ポリシー
+（`constraints/iam.automaticIamGrantsForDefaultServiceAccounts`）により
+この SA に権限が一切付きません。**移行先は必ず新規プロジェクトなので毎回該当し**、
+すべての関数が次のエラーでデプロイに失敗していました。
+
+```
+Could not build the function due to a missing permission on the build service account.
+```
+
+Step 4.7 が関数をコピーする前に、コピー先プロジェクトごとに専用 SA
+**`fn-build@<コピー先プロジェクト>.iam.gserviceaccount.com`** を作成し、公式が指定する
+最小ロール（`roles/logging.logWriter` / `roles/artifactregistry.writer` /
+`roles/storage.objectViewer`）だけを付与して、デプロイ時に
+`--build-service-account` で明示するようにしました。
+
+**既定の Compute SA には手を入れません。** この SA は VM・Cloud Run・全 Function の
+「実行 ID」も兼ねるため、そこにビルド用の広い権限を足すと移行と無関係のワークロードの
+権限まで広がってしまうためです（コピー先組織が既定 SA でのビルドを禁止している場合にも
+この方式なら動きます）。
+
+- 作成した事実は実行ログの WARNING と DIFF.md の「確認」に出ます。
+- **この SA は移行後も残してください**。関数の設定に記録されるため、削除すると
+  再デプロイが失敗します（コピー先の正式なビルド ID として使う想定です）。
+- 自前のビルド SA を使う場合は `steps.serverless_sync.build_service_account: <email>`
+  （作成・権限付与はご自身で。ツールは指定するだけです）。
+- 自動用意そのものを止める場合は `grant_build_service_account: false`
+  （既定のビルド SA に `roles/cloudbuild.builds.builder` が必要になります）。
+- 用意できなかった場合は移行を止めず、DIFF.md に「要対応」＋手動コマンドを出します。
+
+### 「既定のサービスアカウントの権限」の差分を DIFF.md に出します
+
+上と同じ組織ポリシーの影響で、**コピー先の既定 Compute SA / App Engine SA は
+権限ゼロのまま**です。本ツールはこれらの SA を IAM 複製の対象外にしています
+（プロジェクトごとに別 ID で、コピー先にも同名の SA が既定で存在するため）が、
+「存在は同じでも権限は同じでない」状態になります。
+
+そこで **コピー元の既定 SA が持っていたロールのうち、コピー先に無いもの**を
+DIFF.md の「確認」に付与コマンド付きで出すようにしました。既定 SA で動く
+VM / Cloud Run / Cloud Functions がある場合は確認してください
+（自動では付与しません。別組織に `roles/editor` を勝手に生やさないためです）。
+
+### 設定
+
+`steps.serverless_sync` は**キーを書かなくても有効**です。無効化したいときだけ
+`enabled: false`、特定のサービス・関数だけ除外したいときは `skip_services` を指定してください。
+ビルド専用 SA については `build_service_account` / `grant_build_service_account` を
+上記のとおり指定できます。
 
 ---
 

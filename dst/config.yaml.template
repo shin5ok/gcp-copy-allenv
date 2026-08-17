@@ -148,7 +148,7 @@ rename_rules:
 # 各手順の実行有無 (enabled) および個別設定を行います。
 #
 # ■ enabled を省略した場合の既定値はステップごとに違います
-#   - enable_apis / iam_sync / network_firewall … 既定 **true**
+#   - enable_apis / iam_sync / network_firewall / serverless_sync … 既定 **true**
 #     (設定を書かなくても動く。後から追加したステップで、キーの無い既存 config でも
 #      有効になるようにしてある。無効化したいときだけ enabled: false を明記する)
 #   - 上記以外のステップ … 既定 **false**
@@ -232,7 +232,7 @@ steps:
     #            「30 分待ちの操作」自体が発生しない。
     #   明示リスト … `gcloud beta resource-config list-resource-types --project=<src>` の
     #            Kind 名（大文字始まり）。上の resource_types（Terraform 型）とは別物。
-    # export_resource_types: "auto"
+    export_resource_types: "auto"
     # export_resource_types:
     #   - "ComputeInstance"
     #   - "ComputeNetwork"
@@ -251,6 +251,52 @@ steps:
   # [Step 4] dst へIaCでの再現 (Terraform適用)
   terraform_apply:
     enabled: true
+
+  # [Step 4.7] サーバーレス（Cloud Run / Cloud Functions）を src → dst に複製
+  # bulk-export (config-connector) は Cloud Run を **1 件も出力しない**ため、
+  # Terraform では複製されない。それぞれのサービス自身の仕組みで複製する。
+  #   - Cloud Run サービス / ジョブ … `describe --format=export` で YAML を取り出し、
+  #     dst 用に書き換えて `replace`（イメージは Step 3.7 が複製済みのものを参照）
+  #   - Cloud Functions (第 1/2 世代) … ソース zip を dst のバケットへ複製し、
+  #     `gcloud functions deploy` で **dst 側で再ビルド**（イメージ複製は不要）
+  # このキー自体を書かなくても有効（設定不要で動く）。無効化したいときだけ false。
+  #
+  # ■ 安全側の方針: 「中途半端に複製しない」
+  #   下記に当てはまるものは **複製せず** DIFF.md の要対応に手順つきで出します。
+  #   コピー元を指したままの壊れたリソースが dst にできると、差分レポートにも
+  #   現れず気付けないためです。
+  #   [Cloud Run サービス / ジョブ]
+  #     - VPC コネクタ / Direct VPC egress / Cloud SQL 接続
+  #     - Secret Manager 参照（環境変数・ボリューム）
+  #     - CMEK / Binary Authorization
+  #     - サイドカー（複数コンテナ）/ GPU / 非 emptyDir ボリューム
+  #     - 特定リビジョンへのトラフィック固定（カナリア配信・リビジョンタグ）
+  #   [Cloud Functions]
+  #     - イベントトリガ（Pub/Sub / GCS / Firestore 等。**HTTP トリガのみ対応**）
+  #     - Secret Manager 参照 / VPC コネクタ / CMEK
+  #     - 第 1 世代でソース zip を取得できないもの
+  #       （コンソールや `--source=<ローカル>` で作った関数は Google 管理の
+  #        アップロード領域にしか無く、gcloud にダウンロード手段が無い）
+  #
+  # ■ 確認をお願いしたい点
+  #   - 平文の環境変数（`*_TOKEN` / `*_SECRET` / `*_WEBHOOK` 等）は **src と同じ値**
+  #     で複製します。別 ORG に同じ秘密が増えるため、不要なら dst で差し替えを。
+  #   - 実行サービスアカウントは dst の同名 SA（既定 SA なら dst の既定 SA）に
+  #     読み替えます。読み替え不能なら dst の既定 SA で起動します。
+  #
+  # ■ 必要権限（bootstrap スクリプトが付与。既存環境は再実行が必要）
+  #   src … run.services.get/list, cloudfunctions.functions.get/list,
+  #         storage.objects.get（関数ソース zip の読み取り）
+  #   dst … roles/iam.serviceAccountUser（実行 SA を指定するための actAs）
+  serverless_sync:
+    enabled: true
+    # 複製したくないサービス / ジョブ / 関数の名前を列挙する（任意）。
+    # skip_services:
+    #   - "legacy-api"
+    # 関数ソース zip の受け渡しに使う dst バケット名（任意）。
+    # 未指定なら `<dst プロジェクト ID>-fn-source-migration` を関数と同じ
+    # リージョンに自動作成します（冪等）。
+    # source_bucket: ""
 
   # [Step 4.5] host project のファイアウォールルール・ポリシーを dst に複製
   # bulk-export は network_firewall_policy を出力しないため gcloud で直接同期する

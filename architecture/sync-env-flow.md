@@ -32,10 +32,11 @@ flowchart TD
   S3 -->|".tf が出揃って初めて<br/>必要 API が確定する"| S35["Step 3.5  enable_apis final<br/>全量 + enabled になるまで待つ"]
   S35 -->|"Cloud Run は image の @sha256 を<br/>revision 作成時に解決する"| S37["Step 3.7  artifact_registry<br/>gcrane でイメージ複製"]
   S37 --> S4["Step 4  terraform_apply<br/>import → plan → apply"]
-  S4 -->|"FW は dst network の実在が前提"| S45["Step 4.5  network_firewall<br/>classic rules / policy rules"]
+  S4 -->|"SA / VPC / バケットが<br/>dst に揃ってから"| S47["Step 4.7  serverless_sync<br/>Cloud Run サービス・ジョブ<br/>Cloud Functions"]
+  S47 -->|"FW は dst network の実在が前提"| S45["Step 4.5  network_firewall<br/>classic rules / policy rules"]
   S45 --> S5["Step 5  gce_restore<br/>snapshot から VM を復元"]
   S5 -->|"guest OS の boot 完了を待つ"| S55["Step 5.5  電源状態を src に合わせる"]
-  S55 -->|"SA が dst に出来てから付与"| S57["Step 5.7  iam_sync"]
+  S55 -->|"SA が dst に出来てから付与<br/>Run の公開設定は Step 4.7 の後でないと付かない"| S57["Step 5.7  iam_sync"]
   S57 --> S6["Step 6  data_sync  GCS / BQ"]
   S6 --> S7["Step 7  vpc_sc"]
   S7 --> S99["Step 99  DIFF.md<br/>CAI と .tf を突き合わせて<br/>要対応 / 参考 に仕分け"]
@@ -51,7 +52,7 @@ flowchart TD
   class G,E gate;
   class X,NG,XF halt;
   class OK pass;
-  class A,S1,S15,S2,S3,S35,S37,S4,S45,S5,S55,S57,S6,S7,S99 step;
+  class A,S1,S15,S2,S3,S35,S37,S4,S47,S45,S5,S55,S57,S6,S7,S99 step;
 ```
 
 *図 1 — ステップの順序は依存関係で決まっている。半端な番号 = 後から割り込ませた位置。*
@@ -67,7 +68,7 @@ flowchart TD
 > **未実行のステップと Step 99 の DIFF.md** だけです。
 >
 > なお図の各ステップは `step_enabled()` による opt-in で、既定 true は
-> `network_firewall` / `iam_sync` / `enable_apis` の 3 つだけです。Step 99 はさらに
+> `network_firewall` / `iam_sync` / `enable_apis` / `serverless_sync` の 4 つだけです。Step 99 はさらに
 > **`cai_scan` と `bulk_export` の両方が有効**なときしか走りません。
 > つまり **DIFF.md が無いことは異常終了の証拠になりません**。
 
@@ -129,7 +130,7 @@ flowchart TD
   R2 --> D1{"3.8 project = が<br/>dst ID 集合に無い非数値か"}
   D1 -->|"はい = 越境出力"| K1["捨てる<br/>無関係な実プロジェクトへの<br/>書き込みを防ぐ"]
   D1 -->|"いいえ"| D2{"4. _skip_reason_for_file<br/>複製不能 or GKE 管理か"}
-  D2 -->|"self-managed 証明書<br/>occurrence / GKE 管理"| K2["捨てる + DIFF に注記"]
+  D2 -->|"self-managed 証明書 / occurrence<br/>GKE 管理 / Cloud Run・Functions"| K2["捨てる + DIFF に注記<br/>サーバーレスは Step 4.7 が所有"]
   D2 -->|"いいえ"| D3{"3.85 src で IN_USE の<br/>内部アドレスか"}
   D3 -->|"はい"| K3["捨てる<br/>Step 5 が mig-(vm)-(ip) で予約し直す"]
   D3 -->|"いいえ"| D4{"3.9 resource_types の<br/>include / exclude に外れるか"}
@@ -160,6 +161,11 @@ flowchart TD
 同じ純粋関数 `gke_managed_tf_skip_reason()` を Step 3 と Step 4 の**両方**から呼びます。
 customize 側だけに置くと `skip_on_run: true` が customize ごとスキップし、
 古い `active/` をそのまま apply して同じ 404 が再発しました。
+
+> **Cloud Run / Cloud Functions も同じ二段構えです。** こちらは 404 対策ではなく
+> **二重所有の防止**で、`serverless_tf_skip_reason()` を customize と
+> `_purge_serverless_tf_files` の両方から呼びます。Step 4.7 と Terraform が
+> 同じリソースを持つと、実行のたびに互いの設定を巻き戻すためです。
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace, Menlo, Consolas, 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif","fontSize":"13px","lineColor":"#7C8D92","textColor":"#16242A","edgeLabelBackground":"#EDF1F1"}}}%%
@@ -216,7 +222,7 @@ Terraform ルート（`active/<src>/`）ごとに並列。state は分離済み�
 flowchart TD
   A["_terraform_one_project"] --> D1{"mock 生成物が混じっているか<br/>_MOCK_TF_MARK / 旧ラベル"}
   D1 -->|"ある"| F1["このルートだけ失敗<br/>rm -rf を案内して return<br/>他ルートは続行"]
-  D1 -->|"ない"| P["_purge_gke_managed_tf_files<br/>最終防衛線 / dry_run でも実行"]
+  D1 -->|"ない"| P["_purge_gke_managed_tf_files<br/>_purge_serverless_tf_files<br/>最終防衛線 / dry_run でも実行"]
   P --> D0{"実行モード"}
   D0 -->|"make plan（dry_run）"| I["provider.tf だけ書き出す<br/>init / plan は run_command が<br/>[DRY RUN] 予定: と出して空振り"]
   I --> STOP["何も実行されず終了<br/>tfplan は生成されない<br/>state reset / API 有効化 / import も走らない"]
@@ -261,6 +267,105 @@ flowchart TD
 
 ---
 
+## Step 4.7 — サーバーレス複製（Terraform を使わない理由と、作らない判断）
+
+`bulk-export` は **Cloud Run を 1 件も出力しません**。gcloud の asset type → KRM Kind 変換表に
+`run.googleapis.com/Service` が無く、`export_resource_types` を渡す経路では
+CAI のリストを作る時点で落ちるためです。そこで Terraform ではなく、
+**それぞれのサービス自身の仕組み**で複製します。
+
+Cloud Run の `replace` は「**送った spec が正**」＝ YAML から落ちたフィールドは
+コピー先で既定値に戻る破壊的 API です。だからこのステップは
+「移せないものは中途半端に作らない」方針に倒しています。
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace, Menlo, Consolas, 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif","fontSize":"13px","lineColor":"#7C8D92","textColor":"#16242A","edgeLabelBackground":"#EDF1F1"}}}%%
+flowchart TD
+  L["src の Cloud Run サービス / ジョブ / Functions を列挙"] --> D0{"API が無効 = 未使用か"}
+  D0 -->|"はい"| SK0["INFO 複製対象なし<br/>run を失敗にしない"]
+  D0 -->|"いいえ"| SP{"リソース種別"}
+
+  SP -->|"Cloud Run サービス / ジョブ"| D1{"gen2 Function の実体か<br/>serviceConfig.service で判定"}
+  D1 -->|"はい"| FN["Run としては複製しない<br/>Function 側が担当する分担"]
+  D1 -->|"いいえ"| D2{"移せない設定を含むか<br/>VPC / Cloud SQL / Secret / CMEK /<br/>サイドカー / GPU / リビジョン固定"}
+  D2 -->|"含む"| K1["作らない + DIFF に要対応<br/>参照先が src のままの<br/>壊れたリソースを作らない"]
+  D2 -->|"含まない"| RW["YAML を書き換え<br/>namespace / イメージ / 実行 SA / env<br/>未知のフィールドは触らない"]
+  RW --> D3{"参照イメージが dst に在るか"}
+  D3 -->|"無い"| K2["作らない + DIFF に要対応<br/>Image not found で<br/>tainted 化するのを防ぐ"]
+  D3 -->|"在る"| V{"replace --dry-run の<br/>サーバ側検証"}
+  V -->|"失敗"| ERR["このリソースだけ失敗<br/>他は続行し終端で exit 1"]
+  V -->|"成功"| AP["replace を実行"]
+
+  SP -->|"Cloud Functions"| B0["dst プロジェクト単位で 1 回<br/>専用ビルド SA fn-build@ を冪等作成<br/>不足する最小 3 ロールだけ付与"]
+  B0 --> BD{"用意できたか"}
+  BD -->|"できない"| K4["DIFF に要対応<br/>専用 SA / 既定 SA 両方の<br/>手動コマンドを案内"]
+  BD -->|"できた / 設定で無効"| D4{"複製できるか<br/>HTTP トリガ / ソース zip 取得可 /<br/>Secret・VPC・CMEK なし"}
+  D4 -->|"いいえ"| K3["作らない + DIFF に要対応<br/>イベントトリガ / gen1 の<br/>sourceUploadUrl のみ 等"]
+  D4 -->|"はい"| CP["ソース受け渡しバケットを冪等作成<br/>lock + 存在再確認で並列 409 を吸収<br/>src 認証で download → dst 認証で upload"]
+  CP --> DP["gcloud functions deploy<br/>--build-service-account で<br/>ビルド SA を明示 / dst 側で再ビルド"]
+
+  classDef gate fill:#FAF0DA,stroke:#8A6612,stroke-width:1.5px,color:#3D2E08;
+  classDef skip fill:#E8E2F6,stroke:#5C4F91,stroke-width:1.5px,color:#2F2758;
+  classDef halt fill:#F7DFDB,stroke:#9F3428,stroke-width:1.5px,color:#48160F;
+  classDef pass fill:#DDEEE7,stroke:#0D6A53,stroke-width:1.5px,color:#0A382C;
+  classDef step fill:#E4EAEC,stroke:#3E5257,stroke-width:1.2px,color:#16242A;
+  class D0,SP,D1,D2,D3,D4,V,BD gate;
+  class SK0,FN,K1,K2,K3,K4 skip;
+  class ERR halt;
+  class AP,DP pass;
+  class L,RW,CP,B0 step;
+```
+
+*図 6 — 「作らない」判断が 3 箇所ある。いずれも DIFF.md に手順つきで出る。関数のビルド SA だけは事前に**用意する**（用意しないと全関数が落ちるため）。*
+
+> **中途半端に作らないのは、気付けなくなるからです。** 参照先が src を指したまま
+> コピー先にリソースを作ると、CAI とコピー先の差分には現れません
+> （**存在はしている**ため）。実行時に初めて壊れていることが分かります。
+> 一方「作らなかった」ものは DIFF.md の要対応に必ず出ます。
+> だから迷ったら**作らない**側に倒します — GKE の除外判定（迷ったらコピーする）とは
+> **逆向き**である点に注意してください。GKE は「落とし過ぎ = コピー漏れ」が損害でしたが、
+> ここは「作り過ぎ = 気付けない故障」が損害だからです。
+
+> **Cloud Run ジョブはテンプレートが 1 段深い。** サービスは
+> `spec.template.spec`（RevisionSpec）ですが、ジョブは Execution を挟むため
+> `spec.template.spec.template.spec`（TaskSpec）です。書き換えをパス決め打ちにすると
+> **ジョブだけ素通りして src 参照のまま複製**されるため、`containers` を持つ dict を
+> 走査する実装にしてあります。
+
+> **Cloud Functions は HTTP トリガのみ対応です。** イベントトリガは参照先の
+> トピック名やバケット名が `rename_rules` でコピー先では変わるうえ、Eventarc の
+> チャネル設定も要るため、機械的に写すと**誤ったイベント源を購読する関数**に
+> なりかねません。第 1 世代でソース zip が `sourceUploadUrl`（署名付きアップロード URL）
+> しか無い場合も、gcloud にダウンロード手段が無いため複製できません。
+
+> **関数のビルドは「専用サービスアカウントを作って明示指定」します。** deploy の
+> ビルドは Cloud Build が実行し、その既定 ID はコピー先の default compute SA です。
+> ところが 2024-05-03 以降に作られたプロジェクトは組織ポリシー
+> `constraints/iam.automaticIamGrantsForDefaultServiceAccounts` により
+> **この SA にロールが 1 つも付かない**ため、コピー先は必ず新規プロジェクトである
+> 本ツールでは**全関数が `missing permission on the build service account` で失敗**します。
+>
+> 既定 SA に広いロールを足す方法は採りません。既定 SA は **VM / Cloud Run / 全 Function の
+> 実行 ID も兼ねる**ため移行と無関係の権限まで広がり、コピー先組織が
+> `cloudbuild.useComputeServiceAccount` を無効にしている場合は付与しても動かないからです。
+> 代わりに `fn-build@<dst>` を作り、公式指定の 3 ロール
+> （`logging.logWriter` / `artifactregistry.writer` / `storage.objectViewer`）だけ付与して
+> `--build-service-account` で渡します。**この SA は関数の設定に記録される**ので、
+> 移行後も残す前提です（消すと再デプロイが壊れます）。
+>
+> なお gcloud 自身も同じ判定を持っていますが（`ValidateDefaultBuildServiceAccountAndPromptWarning`）、
+> 対話プロンプトで警告する実装のため **`--quiet` を付けている本ツールでは警告すら出ません**。
+> 原因がビルドログまで潜っていたのはこのためです。
+
+> **ソース受け渡しバケットの作成は直列化しています。** 関数の複製は**関数単位で並列**
+> なので、同じコピー先プロジェクトの複数関数が同時に「無い → 作る」を実行すると
+> 片方が `409 ... you already own it` で落ちます。lock で直列化したうえで、
+> 作成失敗時は実在を再確認して存在すれば成功として扱います
+> （409 という文字列だけで成功と判定はしません。名前が他人に取られている 409 と
+> 区別できないためです）。
+
+---
+
 ## Step 5 / 5.5 — VM 復元と電源状態
 
 復元中は**必ず RUNNING で残し**、全 VM が揃ってから電源状態を合わせます。
@@ -298,7 +403,57 @@ flowchart TD
   class L,U,SA1,SD,WAIT step;
 ```
 
-*図 6 — GKE ノードの除外は `list_worker` の 1 箇所だけ。復元と電源処理の両方に効く。*
+*図 7 — GKE ノードの除外は `list_worker` の 1 箇所だけ。復元と電源処理の両方に効く。*
+
+---
+
+## Step 5.7 — IAM 複製（複製しないものほど説明が要る）
+
+複製元は **コピー元各プロジェクトの project IAM ポリシーだけ**です。除外の理由は
+「コピー先の権限が緩まない方向に倒す」か「別 ORG では ID が変わる」のどちらかで、
+**唯一の例外が既定ランタイム SA** — こちらは「コピー先に同名の SA が既定で存在する」
+という理由での除外なので、権限が付かない現在は差分を可視化します。
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"ui-monospace, Menlo, Consolas, 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif","fontSize":"13px","lineColor":"#7C8D92","textColor":"#16242A","edgeLabelBackground":"#EDF1F1"}}}%%
+flowchart TD
+  R0["先に Cloud Run の公開設定を複製<br/>allUsers → run.invoker<br/>付与したら末尾に WARNING + 取消コマンド"] --> P["src の project IAM ポリシーを読む"]
+  P --> D0{"バインディングのメンバー種別"}
+  D0 -->|"Google 管理 service agent"| SK0["複製しない<br/>警告も出さない / コピー先に既存"]
+  D0 -->|"既定ランタイム SA<br/>default compute / appspot"| D5{"コピー先の同等 SA が<br/>同じロールを持つか"}
+  D0 -->|"user-managed SA"| D1{"読み替えできるか"}
+  D5 -->|"持つ"| Q["何も出さない"]
+  D5 -->|"持たない / 判定不能"| NOTE["DIFF に「確認」<br/>不足ロールと付与コマンド<br/>自動付与はしない"]
+  D1 -->|"条件付きバインディング"| SK1["skip + WARNING<br/>条件式が src を参照しうる"]
+  D1 -->|"ORG カスタムロール<br/>mapping 外のプロジェクト"| SK2["skip + WARNING<br/>別 ORG に同じ ID が無い"]
+  D1 -->|"読み替え可"| G["コピー先の同名 SA へ付与<br/>プロジェクト単位で並列 / 内部は直列<br/>etag 競合を避ける"]
+  G --> D2{"高権限ロールか"}
+  D2 -->|"roles/owner 等"| W["付与する + 末尾に WARNING<br/>何を・どこに・なぜ・取消コマンド"]
+  D2 -->|"いいえ"| OK["完了"]
+
+  classDef gate fill:#FAF0DA,stroke:#8A6612,stroke-width:1.5px,color:#3D2E08;
+  classDef skip fill:#E8E2F6,stroke:#5C4F91,stroke-width:1.5px,color:#2F2758;
+  classDef pass fill:#DDEEE7,stroke:#0D6A53,stroke-width:1.5px,color:#0A382C;
+  classDef step fill:#E4EAEC,stroke:#3E5257,stroke-width:1.2px,color:#16242A;
+  class D0,D1,D2,D5 gate;
+  class SK0,SK1,SK2,NOTE,Q,W skip;
+  class G,OK pass;
+  class R0,P step;
+```
+
+*図 8 — 「複製しない」判断のうち、既定ランタイム SA だけは DIFF に差分を出す。*
+
+> **「コピー先に同等物がある」の前提が変わりました。** 既定 compute / appspot SA を
+> 複製対象から外しているのは、プロジェクトごとに ID が変わるうえ**コピー先にも
+> 同名の SA が最初から存在する**ためです。この判断は、かつて GCP がプロジェクト作成時に
+> 既定 compute SA へ `roles/editor` を自動付与していた前提で成り立っていました。
+> 現在は組織ポリシー `constraints/iam.automaticIamGrantsForDefaultServiceAccounts` が
+> 新規プロジェクトで既定強制のため、**存在は同等でも権限は同等ではありません**。
+>
+> 複製方針は変えていません（別 ORG に `roles/editor` を自動で生やさないため）。
+> 代わりに「コピー元の既定 SA が持っていたロール」と「コピー先の現状」を突き合わせ、
+> **不足分だけ**を付与コマンド付きの「確認」として `DIFF.md` に出します。
+> コピー先のポリシーを読めない場合は全件出します（見落とすより過剰報告）。
 
 ---
 
@@ -316,7 +471,12 @@ flowchart TD
 | コピー先プロジェクトが未作成 | 止める | `check_dst_projects_exist` | 30 分後の全滅を先回りする |
 | mock 生成の `.tf` が残存 | そのルートのみ失敗 | `_terraform_one_project` | 他ルートは続行し、終端で exit 1 |
 | API 有効化に失敗 | soft fail | `_soft_run` | WARNING + 手動コマンド案内。ただし `_soft_run` 自体は src 書込ガードと mock の未知コマンド検出で `sys.exit(1)` する |
-| コピー元で AR 未使用（API 無効の 403） | soft fail | `is_api_disabled_error` | INFO「複製対象なし」に落とす |
+| コピー元で AR / Cloud Run / Functions 未使用（API 無効の 403） | soft fail | `is_api_disabled_error` | INFO「複製対象なし」に落とす |
+| サーバーレスが移せない設定を含む | 作らない + 要対応 | `run_service_unsupported_reasons` / `function_unsupported_reasons` | 壊れたリソースを作らない。DIFF に手順を出す |
+| `replace --dry-run` の検証に失敗 | そのリソースのみ失敗 | `_sync_one_run_resource` | 他は続行し、終端で exit 1 |
+| 関数ソース用バケットの並列作成が衝突（409） | 吸収して続行 | `_ensure_fn_source_bucket` | lock + 実在の再確認。既存を再利用する |
+| 関数ビルド専用 SA を用意できない | soft fail + 要対応 | `_ensure_fn_build_service_account` | 移行は止めない。DIFF に手動コマンドを出す |
+| 関数の deploy が失敗 | そのリソースのみ失敗 | `_sync_one_function` | DIFF にビルドログの引き方を出す。他は続行し、終端で exit 1 |
 | suspend が ACPI に失敗 | 警告のみ | `_try_dst_suspend` | exit code に影響させない |
 | secure tag が未マッピング | skip + 警告 | `fw_policy_rule_flags` | FW を意図せず緩めない |
 | コピー先で setIamPolicy 権限が無い | skip + 案内 | `_dst_can_set_iam_policy` | failed に積まない |
@@ -340,6 +500,9 @@ flowchart TD
 | クロスプロジェクト restore | restore plan は別プロジェクトの backup plan を直接参照できない | backup-channels / restore-channels を作る |
 | self-managed SSL 証明書 | 秘密鍵は API から export 不能 | 鍵を持つ利用者がコピー先で作成 |
 | Secret Manager の値 | 秘密情報を自動で写さない方針 | 利用者 |
+| イベントトリガの Cloud Functions | 参照先のトピック / バケット名がコピー先で変わる。誤ったイベント源を購読させない | 利用者（手順は DIFF に掲載） |
+| 第 1 世代 Functions のうちソース取得不能なもの | `sourceUploadUrl` のみで gcloud にダウンロード手段が無い | 利用者（コンソールから zip を取得） |
+| 既定ランタイム SA（default compute / appspot）の権限 | プロジェクトごとに ID が変わるため複製対象外。組織ポリシーでコピー先には `roles/editor` も付かない | 利用者（不足ロールと付与コマンドを DIFF に掲載） |
 | Filestore のデータ | Backup for GKE の volume backup は PD のみ | 利用者 |
 
 ---

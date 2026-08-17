@@ -14,6 +14,24 @@ from scripts.sync_env import (
     validate_steps_config,
     diff_coverage,
     _ASSET_COVERAGE,
+    _AUTO_HANDLED_STEPS,
+    parse_gen2_function_run_services,
+    run_service_unsupported_reasons,
+    rewrite_run_image_ref,
+    resolve_dst_run_service_account,
+    run_secretish_env_names,
+    rewrite_run_service_yaml,
+    serverless_tf_skip_reason,
+    parse_run_jobs_list,
+    parse_functions_list,
+    function_source_object,
+    function_unsupported_reasons,
+    build_function_deploy_flags,
+    function_secretish_env_names,
+    missing_build_sa_roles,
+    default_runtime_sa_roles,
+    _FN_BUILD_SA_ROLE,
+    _FN_BUILD_SA_ROLES,
     fw_policy_rule_layer4,
     fw_policy_rule_flags,
     fw_policy_rule_secure_tags,
@@ -5150,7 +5168,12 @@ class TestStepEnableApisFinal:
                                         "iam.googleapis.com",
                                         "iamcredentials.googleapis.com",
                                         "serviceusage.googleapis.com",
-                                        "cloudresourcemanager.googleapis.com"}), \
+                                        "cloudresourcemanager.googleapis.com",
+                                        # serverless_sync (既定 true) の dst API
+                                        "run.googleapis.com",
+                                        "cloudfunctions.googleapis.com",
+                                        "cloudbuild.googleapis.com",
+                                        "artifactregistry.googleapis.com"}), \
              patch.object(o, "_enable_apis_on_dst", return_value=[]) as enabler, \
              patch.object(o, "_wait_for_apis_enabled") as waiter:
             o.step_enable_apis(final=True)
@@ -5166,7 +5189,12 @@ class TestStepEnableApisFinal:
         o = self._orch(temp_dir, steps={
             "bulk_export": {"output_dir": os.path.join(temp_dir, "terraform")}})
         with patch.object(o, "_list_enabled_services",
-                          return_value={"compute.googleapis.com"} | set(_BASE_DST_APIS)), \
+                          return_value={"compute.googleapis.com",
+                                        "run.googleapis.com",
+                                        "cloudfunctions.googleapis.com",
+                                        "cloudbuild.googleapis.com",
+                                        "artifactregistry.googleapis.com"}
+                          | set(_BASE_DST_APIS)), \
              patch.object(o, "_enable_apis_on_dst", return_value=[]), \
              patch.object(o, "_wait_for_apis_enabled") as waiter:
             o.step_enable_apis(final=False)
@@ -5930,7 +5958,9 @@ class TestSyncRunServiceInvokers:
             assert is_known_mock_command(c), c
 
     def test_run_service_asset_types_registered(self):
-        assert _ASSET_COVERAGE["run.googleapis.com/Service"] == "terraform_apply"
+        # Step 4.7 (serverless_sync) が Knative YAML で複製する担当。
+        assert _ASSET_COVERAGE["run.googleapis.com/Service"] == "serverless_sync"
+        assert "serverless_sync" in _AUTO_HANDLED_STEPS
         assert "run.googleapis.com/Revision" in _ASSET_COVERAGE
         assert "google_cloud_run_v2_service" in \
             _CAI_TO_TF_RESOURCE["run.googleapis.com/Service"]
@@ -5968,8 +5998,11 @@ class TestResourceTypeFilterPure:
 
 class TestResourceTypeFilterInCustomize:
     def _run(self, temp_dir, resource_types):
+        # このクラスの検証対象は resource_types フィルタなので、Cloud Run の
+        # 所有権（Step 4.7）は無効にしてサンプル .tf をそのまま残す。
         cfg = _full_config(temp_dir, steps={
-            "bulk_export": {"enabled": True, "resource_types": resource_types}})
+            "bulk_export": {"enabled": True, "resource_types": resource_types},
+            "serverless_sync": {"enabled": False}})
         cfg["global"]["dry_run"] = False
         path = os.path.join(temp_dir, "config.yaml")
         _write_yaml(path, cfg)
@@ -6950,3 +6983,797 @@ class TestAutoKindExclusion:
         cmd = ("gcloud beta resource-config list-resource-types "
                "--project=p --format=json --quiet")
         assert is_src_read_only(cmd) and is_known_mock_command(cmd)
+
+
+# ============================================================
+# Step 4.7: Cloud Run サービス複製 (serverless_sync)
+# ============================================================
+_RUN_DOC = {
+    "apiVersion": "serving.knative.dev/v1",
+    "kind": "Service",
+    "metadata": {
+        "name": "eigo-teacher",
+        "namespace": "111111111111",
+        "uid": "abc-123",
+        "resourceVersion": "42",
+        "labels": {"cloud.googleapis.com/location": "asia-northeast1"},
+        "annotations": {
+            "run.googleapis.com/build-id": "b1",
+            "run.googleapis.com/build-name": "projects/111111111111/locations/global/builds/b1",
+            "run.googleapis.com/urls": '["https://x.a.run.app"]',
+            "run.googleapis.com/ingress-status": "all",
+            "run.googleapis.com/ingress": "internal-and-cloud-load-balancing",
+        },
+    },
+    "spec": {
+        "template": {
+            "metadata": {
+                "name": "eigo-teacher-00007-xyz",
+                "annotations": {"autoscaling.knative.dev/maxScale": "100"},
+                "labels": {"client.knative.dev/nonce": "nonce1",
+                           "run.googleapis.com/startupProbeType": "Default"},
+            },
+            "spec": {
+                "containerConcurrency": 100,
+                "serviceAccountName": "eigo-teacher@src-alone.iam.gserviceaccount.com",
+                "containers": [{
+                    "image": ("asia-northeast1-docker.pkg.dev/src-alone/"
+                              "cloud-run-source-deploy/eigo-teacher@sha256:" + "a" * 64),
+                    "env": [{"name": "PROJECT_ID", "value": "src-alone"}],
+                }],
+            },
+        },
+        "traffic": [{"latestRevision": True, "percent": 100}],
+    },
+    "status": {"url": "https://x.a.run.app"},
+}
+_PROJ_MAP = {"src-alone": "dst-alone"}
+_NUM_MAP = {"111111111111": "222222222222"}
+
+
+class TestRewriteRunServiceYaml:
+    def _rewrite(self, doc=None):
+        import copy
+        return rewrite_run_service_yaml(
+            copy.deepcopy(doc or _RUN_DOC), "src-alone", "dst-alone",
+            _PROJ_MAP, _NUM_MAP)
+
+    def test_namespace_is_always_dst(self):
+        """namespace は必ず dst に向ける（src が残ると別プロジェクトを触りうる）。"""
+        out, _ = self._rewrite()
+        assert out["metadata"]["namespace"] == "dst-alone"
+
+    def test_output_only_fields_removed(self):
+        out, _ = self._rewrite()
+        anns = out["metadata"].get("annotations", {})
+        assert "run.googleapis.com/urls" not in anns
+        assert "run.googleapis.com/ingress-status" not in anns
+        # build-* は前方一致でまとめて落とす
+        assert not [k for k in anns if k.startswith("run.googleapis.com/build-")]
+        # 利用者が設定した ingress は残す（消すと dst が公開側に緩む）
+        assert anns["run.googleapis.com/ingress"] == "internal-and-cloud-load-balancing"
+        assert "uid" not in out["metadata"] and "resourceVersion" not in out["metadata"]
+        assert "status" not in out
+
+    def test_revision_name_and_nonce_removed(self):
+        out, _ = self._rewrite()
+        tmpl_meta = out["spec"]["template"].get("metadata", {})
+        assert "name" not in tmpl_meta
+        assert "client.knative.dev/nonce" not in (tmpl_meta.get("labels") or {})
+
+    def test_image_project_rewritten_digest_kept(self):
+        out, _ = self._rewrite()
+        image = out["spec"]["template"]["spec"]["containers"][0]["image"]
+        assert image.startswith("asia-northeast1-docker.pkg.dev/dst-alone/")
+        assert image.endswith("@sha256:" + "a" * 64)
+
+    def test_service_account_rewritten(self):
+        out, _ = self._rewrite()
+        assert (out["spec"]["template"]["spec"]["serviceAccountName"]
+                == "eigo-teacher@dst-alone.iam.gserviceaccount.com")
+
+    def test_env_exact_project_id_rewritten(self):
+        out, _ = self._rewrite()
+        env = out["spec"]["template"]["spec"]["containers"][0]["env"]
+        assert env[0]["value"] == "dst-alone"
+
+    def test_env_partial_match_not_rewritten(self):
+        """部分一致では置換しない（URL や JSON の中身を壊さない）。"""
+        import copy
+        doc = copy.deepcopy(_RUN_DOC)
+        doc["spec"]["template"]["spec"]["containers"][0]["env"] = [
+            {"name": "URL", "value": "https://src-alone.example.com/x"}]
+        out, _ = self._rewrite(doc)
+        env = out["spec"]["template"]["spec"]["containers"][0]["env"]
+        assert env[0]["value"] == "https://src-alone.example.com/x"
+
+    def test_unknown_fields_are_preserved(self):
+        """知らないフィールドは触らない（replace は送った spec が正なので消すと既定値に戻る）。"""
+        import copy
+        doc = copy.deepcopy(_RUN_DOC)
+        doc["spec"]["template"]["spec"]["timeoutSeconds"] = 300
+        doc["spec"]["template"]["metadata"]["annotations"][
+            "run.googleapis.com/startup-cpu-boost"] = "true"
+        out, _ = self._rewrite(doc)
+        assert out["spec"]["template"]["spec"]["timeoutSeconds"] == 300
+        assert (out["spec"]["template"]["metadata"]["annotations"]
+                ["run.googleapis.com/startup-cpu-boost"] == "true")
+        assert (out["spec"]["template"]["spec"]["containerConcurrency"] == 100)
+
+    def test_input_document_not_mutated(self):
+        before = json.dumps(_RUN_DOC, sort_keys=True)
+        self._rewrite()
+        assert json.dumps(_RUN_DOC, sort_keys=True) == before
+
+
+class TestRunImageRewrite:
+    def test_ar_project_swapped(self):
+        img, why = rewrite_run_image_ref(
+            "asia-northeast1-docker.pkg.dev/src-alone/repo/img:v1", _PROJ_MAP)
+        assert img == "asia-northeast1-docker.pkg.dev/dst-alone/repo/img:v1"
+        assert why is None
+
+    def test_gcr_project_swapped(self):
+        img, _ = rewrite_run_image_ref("us.gcr.io/src-alone/img:v1", _PROJ_MAP)
+        assert img == "us.gcr.io/dst-alone/img:v1"
+
+    def test_mapping_outside_project_left_alone(self):
+        img, why = rewrite_run_image_ref(
+            "asia-northeast1-docker.pkg.dev/other-proj/repo/img:v1", _PROJ_MAP)
+        assert img == "asia-northeast1-docker.pkg.dev/other-proj/repo/img:v1"
+        assert why and "project_mapping" in why
+
+    def test_third_party_registry_left_alone(self):
+        img, why = rewrite_run_image_ref("docker.io/library/nginx:latest", _PROJ_MAP)
+        assert img == "docker.io/library/nginx:latest" and why is None
+
+
+class TestResolveDstRunServiceAccount:
+    def test_user_managed_in_mapping(self):
+        sa, note = resolve_dst_run_service_account(
+            "app@src-alone.iam.gserviceaccount.com", _PROJ_MAP, _NUM_MAP)
+        assert sa == "app@dst-alone.iam.gserviceaccount.com" and note is None
+
+    def test_default_compute_uses_dst_number(self):
+        """VM 用リゾルバと違い、既定 compute SA は「除去」ではなく dst 番号へ読み替える。"""
+        sa, note = resolve_dst_run_service_account(
+            "111111111111-compute@developer.gserviceaccount.com", _PROJ_MAP, _NUM_MAP)
+        assert sa == "222222222222-compute@developer.gserviceaccount.com"
+        assert note is None
+
+    def test_default_compute_without_number_map_falls_back(self):
+        sa, note = resolve_dst_run_service_account(
+            "999-compute@developer.gserviceaccount.com", _PROJ_MAP, {})
+        assert sa is None and note and "既定 compute SA" in note
+
+    def test_mapping_outside_sa_is_dropped_with_note(self):
+        sa, note = resolve_dst_run_service_account(
+            "app@other-proj.iam.gserviceaccount.com", _PROJ_MAP, _NUM_MAP)
+        assert sa is None and note and "project_mapping" in note
+
+    def test_appspot_sa(self):
+        sa, _ = resolve_dst_run_service_account(
+            "src-alone@appspot.gserviceaccount.com", _PROJ_MAP, _NUM_MAP)
+        assert sa == "dst-alone@appspot.gserviceaccount.com"
+
+
+class TestRunServiceUnsupportedReasons:
+    def test_plain_service_is_supported(self):
+        assert run_service_unsupported_reasons(_RUN_DOC) == []
+
+    def _with_annotation(self, key, value="x"):
+        import copy
+        doc = copy.deepcopy(_RUN_DOC)
+        doc["spec"]["template"]["metadata"]["annotations"][key] = value
+        return doc
+
+    def test_vpc_connector_rejected(self):
+        r = run_service_unsupported_reasons(
+            self._with_annotation("run.googleapis.com/vpc-access-connector"))
+        assert r and "VPC" in r[0]
+
+    def test_cloudsql_rejected(self):
+        assert run_service_unsupported_reasons(
+            self._with_annotation("run.googleapis.com/cloudsql-instances"))
+
+    def test_direct_vpc_egress_rejected(self):
+        assert run_service_unsupported_reasons(
+            self._with_annotation("run.googleapis.com/network-interfaces"))
+
+    def test_secret_env_rejected(self):
+        import copy
+        doc = copy.deepcopy(_RUN_DOC)
+        doc["spec"]["template"]["spec"]["containers"][0]["env"] = [
+            {"name": "S", "valueFrom": {"secretKeyRef": {"name": "s", "key": "1"}}}]
+        r = run_service_unsupported_reasons(doc)
+        assert r and "Secret Manager" in r[0]
+
+    def test_sidecar_rejected(self):
+        import copy
+        doc = copy.deepcopy(_RUN_DOC)
+        doc["spec"]["template"]["spec"]["containers"].append(
+            {"name": "sidecar", "image": "docker.io/envoy:v1"})
+        assert run_service_unsupported_reasons(doc)
+
+    def test_revision_pinned_traffic_rejected(self):
+        import copy
+        doc = copy.deepcopy(_RUN_DOC)
+        doc["spec"]["traffic"] = [
+            {"revisionName": "eigo-teacher-00006-abc", "percent": 90},
+            {"latestRevision": True, "percent": 10}]
+        assert run_service_unsupported_reasons(doc)
+
+    def test_secret_volume_rejected(self):
+        import copy
+        doc = copy.deepcopy(_RUN_DOC)
+        doc["spec"]["template"]["spec"]["volumes"] = [
+            {"name": "v", "secret": {"secretName": "s"}}]
+        assert run_service_unsupported_reasons(doc)
+
+    def test_unparsable_doc_rejected(self):
+        assert run_service_unsupported_reasons(None)
+
+
+class TestGen2FunctionRunServices:
+    def test_service_config_is_used(self):
+        text = json.dumps([{
+            "name": "projects/p/locations/us-central1/functions/test-1",
+            "environment": "GEN_2",
+            "serviceConfig": {
+                "service": "projects/p/locations/us-central1/services/test-1"},
+        }])
+        assert parse_gen2_function_run_services(text) == {("test-1", "us-central1")}
+
+    def test_gen1_is_ignored(self):
+        text = json.dumps([{
+            "name": "projects/p/locations/us-central1/functions/function-1",
+            "environment": "GEN_1"}])
+        assert parse_gen2_function_run_services(text) == set()
+
+    def test_falls_back_to_function_name(self):
+        text = json.dumps([{
+            "name": "projects/p/locations/asia-northeast1/functions/fn",
+            "environment": "GEN_2"}])
+        assert parse_gen2_function_run_services(text) == {("fn", "asia-northeast1")}
+
+    def test_region_is_part_of_the_key(self):
+        """同名でもリージョンが違えば別サービス（名前だけで除外すると誤除外になる）。"""
+        text = json.dumps([{
+            "name": "projects/p/locations/us-central1/functions/api",
+            "environment": "GEN_2",
+            "serviceConfig": {
+                "service": "projects/p/locations/us-central1/services/api"},
+        }])
+        got = parse_gen2_function_run_services(text)
+        assert ("api", "asia-northeast1") not in got
+
+    def test_garbage_input(self):
+        assert parse_gen2_function_run_services("not json") == set()
+
+
+class TestRunSecretishEnv:
+    def test_detects_secret_like_names(self):
+        import copy
+        doc = copy.deepcopy(_RUN_DOC)
+        doc["spec"]["template"]["spec"]["containers"][0]["env"] = [
+            {"name": "LINE_CHANNEL_TOKEN", "value": "t"},
+            {"name": "LINE_CHANNEL_SECRET", "value": "s"},
+            {"name": "SLACK_WEBHOOK", "value": "https://hooks"},
+            {"name": "PROJECT_ID", "value": "p"},
+        ]
+        assert run_secretish_env_names(doc) == [
+            "LINE_CHANNEL_SECRET", "LINE_CHANNEL_TOKEN", "SLACK_WEBHOOK"]
+
+    def test_secret_manager_refs_not_counted(self):
+        import copy
+        doc = copy.deepcopy(_RUN_DOC)
+        doc["spec"]["template"]["spec"]["containers"][0]["env"] = [
+            {"name": "API_TOKEN",
+             "valueFrom": {"secretKeyRef": {"name": "s", "key": "1"}}}]
+        assert run_secretish_env_names(doc) == []
+
+
+class TestServerlessTfOwnership:
+    def test_run_service_tf_is_skipped(self):
+        assert serverless_tf_skip_reason(
+            'resource "google_cloud_run_v2_service" "x" {\n}\n')
+        assert serverless_tf_skip_reason(
+            'resource "google_cloud_run_service" "x" {\n}\n')
+
+    def test_jobs_and_functions_are_also_owned(self):
+        """Phase 2 で jobs / functions も Step 4.7 の所有になった（二重所有を断つ）。"""
+        assert serverless_tf_skip_reason(
+            'resource "google_cloud_run_v2_job" "x" {\n}\n')
+        assert serverless_tf_skip_reason(
+            'resource "google_cloudfunctions2_function" "x" {\n}\n')
+        assert serverless_tf_skip_reason(
+            'resource "google_cloudfunctions_function" "x" {\n}\n')
+
+    def test_other_resources_untouched(self):
+        assert serverless_tf_skip_reason(
+            'resource "google_compute_network" "n" {\n}\n') is None
+
+    def test_replace_and_deploy_are_denied_on_src(self):
+        assert not is_src_read_only(
+            "gcloud run services replace x.yaml --region=r --project=p")
+        assert not is_src_read_only(
+            "gcloud functions deploy fn --gen2 --project=p")
+
+    def test_read_commands_allowed_and_mock_known(self):
+        for cmd in ("gcloud run services describe s --region=r --project=p "
+                    "--format=export --quiet",
+                    "gcloud functions list --project=p --format=json --quiet"):
+            assert is_src_read_only(cmd) and is_known_mock_command(cmd)
+        assert is_known_mock_command(
+            "gcloud run services replace x.yaml --region=r --project=p --quiet")
+
+
+# ============================================================
+# Step 4.7 Phase 2: Cloud Run jobs / Cloud Functions
+# ============================================================
+_JOB_DOC = {
+    "apiVersion": "run.googleapis.com/v1",
+    "kind": "Job",
+    "metadata": {"name": "batch1", "namespace": "111111111111", "uid": "u1"},
+    "spec": {
+        "template": {                      # ExecutionTemplateSpec
+            "spec": {                      # ExecutionSpec
+                "taskCount": 2,
+                "template": {              # TaskTemplateSpec
+                    "metadata": {"name": "batch1-abc"},
+                    "spec": {              # TaskSpec
+                        "maxRetries": 3,
+                        "serviceAccountName": "batch@src-alone.iam.gserviceaccount.com",
+                        "containers": [{
+                            "image": ("asia-northeast1-docker.pkg.dev/src-alone/"
+                                      "repo/batch:v1"),
+                            "env": [{"name": "PROJECT_ID", "value": "src-alone"}],
+                        }],
+                    },
+                },
+            },
+        },
+    },
+}
+
+
+class TestRewriteRunJobYaml:
+    """Job は Execution を挟んでテンプレートが 1 段深い。パス決め打ちだと素通りする。"""
+
+    def _rewrite(self, doc=None):
+        import copy
+        return rewrite_run_service_yaml(
+            copy.deepcopy(doc or _JOB_DOC), "src-alone", "dst-alone",
+            _PROJ_MAP, _NUM_MAP)
+
+    def _task_spec(self, doc):
+        return doc["spec"]["template"]["spec"]["template"]["spec"]
+
+    def test_nested_image_rewritten(self):
+        out, _ = self._rewrite()
+        assert (self._task_spec(out)["containers"][0]["image"]
+                == "asia-northeast1-docker.pkg.dev/dst-alone/repo/batch:v1")
+
+    def test_nested_service_account_rewritten(self):
+        out, _ = self._rewrite()
+        assert (self._task_spec(out)["serviceAccountName"]
+                == "batch@dst-alone.iam.gserviceaccount.com")
+
+    def test_nested_env_rewritten(self):
+        out, _ = self._rewrite()
+        assert self._task_spec(out)["containers"][0]["env"][0]["value"] == "dst-alone"
+
+    def test_top_level_name_kept_template_name_dropped(self):
+        out, _ = self._rewrite()
+        assert out["metadata"]["name"] == "batch1"          # リソース名は残す
+        assert out["metadata"]["namespace"] == "dst-alone"
+        tmpl_meta = out["spec"]["template"]["spec"]["template"].get("metadata", {})
+        assert "name" not in tmpl_meta                      # 実行名は dst で採番
+        assert "uid" not in out["metadata"]
+
+    def test_job_specific_fields_preserved(self):
+        out, _ = self._rewrite()
+        assert out["spec"]["template"]["spec"]["taskCount"] == 2
+        assert self._task_spec(out)["maxRetries"] == 3
+
+    def test_unsupported_detection_reaches_nested_spec(self):
+        import copy
+        doc = copy.deepcopy(_JOB_DOC)
+        self._task_spec(doc)["containers"][0]["env"] = [
+            {"name": "S", "valueFrom": {"secretKeyRef": {"name": "s", "key": "1"}}}]
+        assert run_service_unsupported_reasons(doc)
+
+    def test_secretish_env_reaches_nested_spec(self):
+        import copy
+        doc = copy.deepcopy(_JOB_DOC)
+        self._task_spec(doc)["containers"][0]["env"] = [
+            {"name": "API_TOKEN", "value": "t"}]
+        assert run_secretish_env_names(doc) == ["API_TOKEN"]
+
+
+class TestParseRunJobsList:
+    def test_parses_name_and_region(self):
+        text = json.dumps([{"metadata": {
+            "name": "batch1",
+            "labels": {"cloud.googleapis.com/location": "asia-northeast1"}}}])
+        assert parse_run_jobs_list(text) == [("batch1", "asia-northeast1")]
+
+    def test_garbage(self):
+        assert parse_run_jobs_list("nope") == []
+
+
+_FN_GEN2 = {
+    "name": "projects/src-alone/locations/us-central1/functions/api",
+    "environment": "GEN_2",
+    "buildConfig": {
+        "runtime": "nodejs22",
+        "entryPoint": "handler",
+        "source": {"storageSource": {
+            "bucket": "gcf-v2-sources-111111111111-us-central1",
+            "object": "api/function-source.zip"}},
+    },
+    "serviceConfig": {
+        "serviceAccountEmail": "111111111111-compute@developer.gserviceaccount.com",
+        "availableMemory": "256Mi",
+        "timeoutSeconds": 30,
+        "maxInstanceCount": 100,
+        "ingressSettings": "ALLOW_ALL",
+        "environmentVariables": {"PROJECT_ID": "src-alone", "MODE": "prod"},
+    },
+}
+_FN_GEN1_UPLOAD_ONLY = {
+    "name": "projects/src-alone/locations/us-central1/functions/legacy",
+    "runtime": "python39",
+    "entryPoint": "hello",
+    "httpsTrigger": {},
+    "sourceUploadUrl": "https://storage.googleapis.com/gcf-upload/x.zip",
+}
+
+
+class TestParseFunctionsList:
+    def test_gen_flag_and_region(self):
+        text = json.dumps([
+            {"name": "projects/p/locations/us-central1/functions/a",
+             "environment": "GEN_2"},
+            {"name": "projects/p/locations/asia-northeast1/functions/b",
+             "environment": "GEN_1"},
+        ])
+        got = parse_functions_list(text)
+        assert got == [
+            {"name": "b", "region": "asia-northeast1", "gen2": False},
+            {"name": "a", "region": "us-central1", "gen2": True},
+        ]
+
+    def test_garbage(self):
+        assert parse_functions_list("nope") == []
+
+
+class TestFunctionSourceObject:
+    def test_gen2_storage_source(self):
+        assert function_source_object(_FN_GEN2) == (
+            "gcf-v2-sources-111111111111-us-central1", "api/function-source.zip")
+
+    def test_gen1_source_archive_url(self):
+        fn = {"sourceArchiveUrl": "gs://my-bucket/fn/src.zip"}
+        assert function_source_object(fn) == ("my-bucket", "fn/src.zip")
+
+    def test_gen1_upload_url_is_not_retrievable(self):
+        """署名付きアップロード URL しか無い gen1 はソースを取得できない。"""
+        assert function_source_object(_FN_GEN1_UPLOAD_ONLY) is None
+
+
+class TestFunctionUnsupportedReasons:
+    def test_plain_http_gen2_is_supported(self):
+        assert function_unsupported_reasons(_FN_GEN2) == []
+
+    def test_gen1_without_retrievable_source_rejected(self):
+        r = function_unsupported_reasons(_FN_GEN1_UPLOAD_ONLY)
+        assert r and "sourceUploadUrl" in r[0]
+
+    def test_event_trigger_rejected(self):
+        import copy
+        fn = copy.deepcopy(_FN_GEN2)
+        fn["eventTrigger"] = {"eventType": "google.cloud.pubsub.topic.v1.messagePublished"}
+        r = function_unsupported_reasons(fn)
+        assert r and "イベントトリガ" in r[0]
+
+    def test_secret_env_rejected(self):
+        import copy
+        fn = copy.deepcopy(_FN_GEN2)
+        fn["serviceConfig"]["secretEnvironmentVariables"] = [{"key": "S"}]
+        assert function_unsupported_reasons(fn)
+
+    def test_vpc_connector_rejected(self):
+        import copy
+        fn = copy.deepcopy(_FN_GEN2)
+        fn["serviceConfig"]["vpcConnector"] = "projects/src/locations/r/connectors/c"
+        assert function_unsupported_reasons(fn)
+
+    def test_cmek_rejected(self):
+        import copy
+        fn = copy.deepcopy(_FN_GEN2)
+        fn["kmsKeyName"] = "projects/src/locations/r/keyRings/k/cryptoKeys/c"
+        assert function_unsupported_reasons(fn)
+
+
+class TestBuildFunctionDeployFlags:
+    def _build(self, fn=None, build_sa=None):
+        return build_function_deploy_flags(
+            fn or _FN_GEN2, "dst-alone", "gs://dst-bucket/api/function-source.zip",
+            _PROJ_MAP, _NUM_MAP, build_sa)
+
+    def test_no_build_sa_flag_by_default(self):
+        flags, _env, _notes = self._build()
+        assert not any(f.startswith("--build-service-account=") for f in flags)
+
+    def test_build_sa_flag_uses_full_resource_path(self):
+        """--build-service-account は projects/<p>/serviceAccounts/<email> 形式必須。"""
+        flags, _env, _notes = self._build(
+            build_sa="fn-build@dst-alone.iam.gserviceaccount.com")
+        assert ("--build-service-account=projects/dst-alone/serviceAccounts/"
+                "fn-build@dst-alone.iam.gserviceaccount.com") in flags
+
+    def test_core_flags(self):
+        flags, _env, _notes = self._build()
+        assert "--gen2" in flags
+        assert "--runtime=nodejs22" in flags
+        assert "--entry-point=handler" in flags
+        assert "--source=gs://dst-bucket/api/function-source.zip" in flags
+        assert "--trigger-http" in flags
+
+    def test_service_config_is_carried_over(self):
+        """取りこぼすと dst で黙って既定値になるので、読めるものは明示する。"""
+        flags, _env, _notes = self._build()
+        assert "--memory=256Mi" in flags
+        assert "--timeout=30s" in flags
+        assert "--max-instances=100" in flags
+        assert "--ingress-settings=all" in flags
+
+    def test_default_compute_sa_mapped_to_dst_number(self):
+        flags, _env, _notes = self._build()
+        assert ("--service-account=222222222222-compute@developer.gserviceaccount.com"
+                in flags)
+
+    def test_env_project_id_exact_match_rewritten(self):
+        _flags, env, _notes = self._build()
+        assert env["PROJECT_ID"] == "dst-alone"
+        assert env["MODE"] == "prod"
+
+    def test_reserved_env_vars_removed(self):
+        import copy
+        fn = copy.deepcopy(_FN_GEN2)
+        fn["serviceConfig"]["environmentVariables"]["FUNCTION_TARGET"] = "handler"
+        _flags, env, _notes = self._build(fn)
+        assert "FUNCTION_TARGET" not in env
+
+    def test_gen1_uses_no_gen2_and_its_own_fields(self):
+        fn = {
+            "name": "projects/src-alone/locations/us-central1/functions/legacy",
+            "runtime": "python39", "entryPoint": "hello",
+            "sourceArchiveUrl": "gs://b/o.zip",
+            "availableMemoryMb": 256, "timeout": "60s",
+            "ingressSettings": "ALLOW_INTERNAL_ONLY",
+            "serviceAccountEmail": "src-alone@appspot.gserviceaccount.com",
+        }
+        flags, _env, _notes = self._build(fn)
+        assert "--no-gen2" in flags
+        assert "--runtime=python39" in flags
+        assert "--memory=256MB" in flags
+        assert "--timeout=60s" in flags
+        assert "--ingress-settings=internal-only" in flags
+        assert "--service-account=dst-alone@appspot.gserviceaccount.com" in flags
+
+
+class TestFunctionSecretishEnv:
+    def test_detects(self):
+        import copy
+        fn = copy.deepcopy(_FN_GEN2)
+        fn["serviceConfig"]["environmentVariables"]["SLACK_TOKEN"] = "x"
+        assert function_secretish_env_names(fn) == ["SLACK_TOKEN"]
+
+
+class TestMissingBuildSaRoles:
+    """関数ビルド専用 SA に不足しているロールの判定。"""
+
+    MEMBER = "serviceAccount:fn-build@dst-alone.iam.gserviceaccount.com"
+
+    def test_new_sa_needs_all_roles(self):
+        assert missing_build_sa_roles(set(), self.MEMBER) == list(_FN_BUILD_SA_ROLES)
+
+    def test_unknown_policy_falls_back_to_all(self):
+        """取得不能で見送ると deploy が必ず失敗する側に倒れるため全部付与する。"""
+        assert missing_build_sa_roles(None, self.MEMBER) == list(_FN_BUILD_SA_ROLES)
+
+    def test_partial_grant_returns_only_missing(self):
+        held = {(self.MEMBER, _FN_BUILD_SA_ROLES[0])}
+        assert missing_build_sa_roles(held, self.MEMBER) == list(_FN_BUILD_SA_ROLES[1:])
+
+    def test_all_present_returns_empty(self):
+        held = {(self.MEMBER, r) for r in _FN_BUILD_SA_ROLES}
+        assert missing_build_sa_roles(held, self.MEMBER) == []
+
+    def test_editor_or_owner_is_enough(self):
+        assert missing_build_sa_roles({(self.MEMBER, "roles/editor")}, self.MEMBER) == []
+        assert missing_build_sa_roles({(self.MEMBER, "roles/owner")}, self.MEMBER) == []
+
+    def test_other_member_does_not_count(self):
+        other = "serviceAccount:someone-else@dst-alone.iam.gserviceaccount.com"
+        held = {(other, r) for r in _FN_BUILD_SA_ROLES}
+        assert missing_build_sa_roles(held, self.MEMBER) == list(_FN_BUILD_SA_ROLES)
+
+
+class TestDefaultRuntimeSaRoles:
+    """複製対象外にしている既定ランタイム SA のロール抽出（DIFF 可視化用）。"""
+
+    POLICY = {"bindings": [
+        {"role": "roles/editor", "members": [
+            "serviceAccount:111111111111-compute@developer.gserviceaccount.com",
+            "user:someone@example.com"]},
+        {"role": "roles/storage.admin", "members": [
+            "serviceAccount:111111111111-compute@developer.gserviceaccount.com"]},
+        {"role": "roles/editor", "members": [
+            "serviceAccount:src-alone@appspot.gserviceaccount.com"]},
+        {"role": "roles/viewer", "members": [
+            "serviceAccount:app@src-alone.iam.gserviceaccount.com"]},
+    ]}
+
+    def test_collects_default_compute_and_appspot(self):
+        got = default_runtime_sa_roles(self.POLICY)
+        assert got == {
+            "111111111111-compute@developer.gserviceaccount.com":
+                ["roles/editor", "roles/storage.admin"],
+            "src-alone@appspot.gserviceaccount.com": ["roles/editor"],
+        }
+
+    def test_user_managed_sa_is_not_included(self):
+        """user-managed SA は iam_sync が本来の複製経路で扱う。"""
+        got = default_runtime_sa_roles(self.POLICY)
+        assert all("iam.gserviceaccount.com" not in e for e in got)
+
+    def test_conditional_binding_excluded(self):
+        policy = {"bindings": [{
+            "role": "roles/editor", "condition": {"expression": "x"},
+            "members": [
+                "serviceAccount:111111111111-compute@developer.gserviceaccount.com"],
+        }]}
+        assert default_runtime_sa_roles(policy) == {}
+
+    def test_garbage(self):
+        assert default_runtime_sa_roles(None) == {}
+        assert default_runtime_sa_roles({}) == {}
+
+
+class TestFunctionBuildSaNotes:
+    def test_granted_note_is_confirmation(self):
+        kind, what, why, how = customize_note_row({
+            "kind": "function_build_sa_granted",
+            "resource": "fn-build@dst-alone.iam.gserviceaccount.com",
+            "project": "dst-alone", "region": "-",
+            "detail": ", ".join(_FN_BUILD_SA_ROLES),
+        })
+        assert kind == "確認" and "ビルド" in what
+        assert "roles/logging.logWriter" in why
+        assert "build_service_account" in how
+
+    def test_manual_note_is_action_with_both_paths(self):
+        kind, _what, _why, how = customize_note_row({
+            "kind": "function_build_sa_manual",
+            "resource": "fn-build@dst-alone.iam.gserviceaccount.com",
+            "project": "dst-alone", "region": "-", "detail": "PERMISSION_DENIED",
+        })
+        assert kind == "要対応"
+        assert "service-accounts create" in how and _FN_BUILD_SA_ROLE in how
+
+    def test_default_runtime_sa_note_shows_dst_member_and_command(self):
+        kind, what, why, how = customize_note_row({
+            "kind": "default_runtime_sa_roles",
+            "resource": "111111111111-compute@developer.gserviceaccount.com",
+            "project": "dst-alone", "region": "-",
+            "detail": "roles/editor, roles/storage.admin",
+            "dst_member": "222222222222-compute@developer.gserviceaccount.com",
+        })
+        assert kind == "確認" and "既定ランタイム SA" in what
+        assert "222222222222-compute@developer.gserviceaccount.com" in why
+        assert "add-iam-policy-binding dst-alone" in how
+        assert "--role=roles/editor" in how
+
+    def test_deploy_failed_note_points_at_build_log(self):
+        kind, _what, _why, how = customize_note_row({
+            "kind": "function_deploy_failed", "resource": "test-1",
+            "project": "dst-alone", "region": "us-central1", "detail": "build failed",
+        })
+        assert kind == "要対応" and "gcloud builds list" in how
+
+
+class TestValidateBuildServiceAccountConfig:
+    def test_non_bool_rejected(self):
+        errs = validate_steps_config({"steps": {
+            "serverless_sync": {"grant_build_service_account": "false"}}})
+        assert any("grant_build_service_account" in e for e in errs)
+
+    def test_bool_ok(self):
+        assert validate_steps_config({"steps": {
+            "serverless_sync": {"grant_build_service_account": False}}}) == []
+
+    def test_build_sa_must_be_email(self):
+        errs = validate_steps_config({"steps": {
+            "serverless_sync": {"build_service_account": "fn-build"}}})
+        assert any("build_service_account" in e for e in errs)
+
+    def test_build_sa_email_ok(self):
+        assert validate_steps_config({"steps": {"serverless_sync": {
+            "build_service_account": "fn-build@dst.iam.gserviceaccount.com"}}}) == []
+
+
+class TestEnsureFnSourceBucket:
+    """並列 deploy でのバケット二重作成（409）を吸収する。"""
+
+    def _orch(self, temp_dir, exists, create_rc):
+        cfg = _full_config(temp_dir)
+        path = os.path.join(temp_dir, "config.yaml")
+        _write_yaml(path, cfg)
+        o = MigrationOrchestrator(path)
+        o.load_config()
+        o.mock = False
+        o.dry_run = False
+        o.dst_logger = logging.getLogger("test-dst")
+        o.calls = []
+        o._gcloud_exists = lambda cmd, sa: (o.calls.append(("describe", cmd))
+                                            or exists.pop(0))
+        def fake_soft_run(cmd, side, logger, **kw):
+            o.calls.append(("create", cmd))
+            return create_rc, "", "HTTPError 409: ... you already own it."
+        o._soft_run = fake_soft_run
+        return o
+
+    def test_creates_when_missing(self, temp_dir):
+        o = self._orch(temp_dir, exists=[False], create_rc=0)
+        assert o._ensure_fn_source_bucket("b", "dst-p", "us-central1", None) is None
+        assert [c[0] for c in o.calls] == ["describe", "create"]
+
+    def test_second_call_is_cached(self, temp_dir):
+        o = self._orch(temp_dir, exists=[False], create_rc=0)
+        o._ensure_fn_source_bucket("b", "dst-p", "us-central1", None)
+        assert o._ensure_fn_source_bucket("b", "dst-p", "us-central1", None) is None
+        assert [c[0] for c in o.calls] == ["describe", "create"]
+
+    def test_409_from_parallel_worker_is_success(self, temp_dir):
+        """他 worker が先に作った場合、create は 409 でも実在すれば成功扱い。"""
+        o = self._orch(temp_dir, exists=[False, True], create_rc=1)
+        assert o._ensure_fn_source_bucket("b", "dst-p", "us-central1", None) is None
+
+    def test_real_failure_is_reported(self, temp_dir):
+        o = self._orch(temp_dir, exists=[False, False], create_rc=1)
+        why = o._ensure_fn_source_bucket("b", "dst-p", "us-central1", None)
+        assert why and "gs://b" in why
+
+
+class TestSrcGcsDownloadException:
+    """関数ソース zip の取得は「src からローカルへの download」だけ許す。"""
+
+    def test_download_to_local_is_allowed(self):
+        assert is_src_read_only("gcloud storage cp gs://src-bucket/a.zip /tmp/a.zip")
+
+    def test_upload_to_src_is_still_denied(self):
+        assert not is_src_read_only("gcloud storage cp /tmp/a.zip gs://src-bucket/a.zip")
+
+    def test_bucket_to_bucket_is_still_denied(self):
+        assert not is_src_read_only("gcloud storage cp gs://a/x gs://b/x")
+
+    def test_other_storage_writes_still_denied(self):
+        assert not is_src_read_only("gcloud storage rm gs://src-bucket/a.zip")
+        assert not is_src_read_only("gcloud storage buckets create gs://x --project=p")
+
+    def test_run_and_function_reads_allowed(self):
+        for cmd in ("gcloud run jobs list --project=p --format=json --quiet",
+                    "gcloud run jobs describe j --region=r --project=p "
+                    "--format=export --quiet",
+                    "gcloud functions describe f --region=r --project=p "
+                    "--format=json --quiet"):
+            assert is_src_read_only(cmd) and is_known_mock_command(cmd)
+
+    def test_job_replace_and_fn_deploy_denied_on_src(self):
+        assert not is_src_read_only(
+            "gcloud run jobs replace j.yaml --region=r --project=p")
+        assert not is_src_read_only(
+            "gcloud functions deploy f --gen2 --region=r --project=p")

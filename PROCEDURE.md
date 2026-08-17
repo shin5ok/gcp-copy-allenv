@@ -47,9 +47,11 @@
 ### 0d. 設定ファイルの編集
 - `cp dst/config.yaml.template dst/config.yaml` してから 0a で集めた値を埋める:
   - `project_mapping`: src/dst プロジェクト ID、`host_project` + `service_projects`、`*_impersonate_service_account`（両方オプション。**src を書き換えたくない場合は src/dst とも未指定=ローカル認証がおすすめ**）
-    - `host_project.skip: true`（オプション）: 既に構築済みの dst host を再利用する場合に指定。host を全ステップから除外（`create_projects` / SA preflight / cai_scan / bulk_export / terraform_apply / network_firewall / gce_restore / data_sync）し、`terraform/active/<src_host>/` の state も孤児削除から保護して温存する。ID/番号置換マップには残るため service 側の host 参照（Shared VPC ネットワーク URL 等）は dst へ正しく書き換わる。
+    - `host_project.skip: true`（オプション）: 既に構築済みの dst host を再利用する場合に指定。host を全ステップから除外（`create_projects` / SA preflight / cai_scan / enable_apis / bulk_export / terraform_apply / serverless_sync / network_firewall / gce_restore / iam_sync / data_sync）し、`terraform/active/<src_host>/` の state も孤児削除から保護して温存する。ID/番号置換マップには残るため service 側の host 参照（Shared VPC ネットワーク URL 等）は dst へ正しく書き換わる。
   - `rename_rules.gcs.value`: 固定文字列 or `"auto"`（日付ベース suffix `-dst-MMDDHHMM` を `terraform/.gcs_rename_value` に永続化）
-  - `steps`: 8 ステップ (`cai_scan` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `network_firewall` / `gce_restore` / `data_sync` / `vpc_sc`) の有効/無効、`gce_snapshot.max_age_days`、`bulk_export.skip_on_run`、`vpc_sc.billing_project`（**必須・明示指定**）等
+  - `steps`: 各ステップ (`cai_scan` / `enable_apis` / `gce_snapshot` / `bulk_export` / `terraform_apply` / `serverless_sync` / `network_firewall` / `gce_restore` / `iam_sync` / `data_sync` / `vpc_sc`) の有効/無効、`gce_snapshot.max_age_days`、`bulk_export.skip_on_run`、`vpc_sc.billing_project`（**必須・明示指定**）等
+    - **`enable_apis` / `serverless_sync` / `network_firewall` / `iam_sync` はキーを書かなくても有効**（既定 true）。止めたいときだけ `enabled: false` を書く。
+    - `serverless_sync` の任意設定: `skip_services`（複製しないサービス / 関数名）、`source_bucket`（関数ソース受け渡し用バケット名）、`build_service_account`（自前のビルド SA を使う）、`grant_build_service_account: false`（ビルド専用 SA の自動用意を止める）
   - `bootstrap`: 0a で集めた `org_id` / `folder_id` / `billing_account`
 
 ---
@@ -108,8 +110,11 @@
     - `vpc_sc.enabled=true` なのに `access_policy` / `perimeter` / `billing_project` のいずれかが空（`billing_project` は quota project。未設定だと `SERVICE_DISABLED` で必ず失敗するため必須）。
     - `bulk_export` / `data_sync` 有効時に `rename_rules.gcs.method` が `suffix|prefix|custom` 以外、または `suffix|prefix` で `value` 空（src と同名バケットになり衝突）。
     - `gce_snapshot` 有効時に `max_age_days` が正の整数でない。
+    - `bulk_export.resource_types`（Terraform 型・`google_` 始まり必須）と `export_resource_types`（KRM Kind・大文字始まり or `"auto"`）の取り違え。typo は「何にも一致せず全除外」という静かな事故になるため実行前に弾く。
+    - `data_sync.artifact_registry.scope` が `all|tagged` 以外（綴り誤りを黙って `all` に倒すと「絞ったつもりが全量」になる）。
+    - `serverless_sync.skip_services` が文字列リストでない / `grant_build_service_account` が true・false でない / `build_service_account` が email 形式でない。
   - 不備は `[設定不備] ...` として全件列挙し `exit 1`（dst へ一切書き込まずに停止）。
-- 有効ステップに必要な CLI を検査: `gcloud` / `terraform` / `bq` / `config-connector`
+- 有効ステップに必要な CLI を検査: `gcloud` / `terraform` / `bq` / `config-connector` / **`gcrane` または `crane`**（`data_sync` 有効かつ `artifact_registry.enabled != false` のとき。イメージ複製は digest を保つ必要があるため docker は不可）
 - 借用 SA 検証:
   - `gcloud auth print-access-token` で SA 実在 + tokenCreator 権限を確認
   - `gcloud projects test-iam-permissions` で代表権限（src=read / dst=write）を確認
@@ -120,7 +125,11 @@
   - src 側のコマンド書込動詞拒否ガード (`is_src_read_only`) は impersonate の有無に関わらず常時有効
 
 ### 計画ステップ（src は read-only）
+
+> 番号は **Step 番号**で、上から**実行順**に並べている（`4.7` が `4.5` より先に走るのは、Step 4.5 が後から挿入されたため。番号順 ≠ 実行順）。
+
 1. **cai_scan**: Cloud Asset Inventory で src の有効リソース一覧を取得（「何が存在するか」のスナップショット）
+1.5. **enable_apis**（Step 3.5 で 2 回目）: dst で必要な API を有効化する。**dry-run でも「何を有効化する予定か」まで出す**（有効 API の一覧取得は read-only なので `make plan` でも実行される）。src 由来を先に、`.tf` が出揃った Step 3.5 で全量を有効化して伝播を待つ 2 段構え。
 2. **gce_snapshot**: 各 VM に期限内（既定 30 日）の有効スナップショットがあるか検証（復元元の鮮度チェック）
 3. **bulk_export**: `gcloud beta resource-config bulk-export --resource-format=terraform` で HCL 出力（並列）
    - src の現状を Terraform コードとして書き出し、dst 向けに書き換える工程
@@ -129,11 +138,15 @@
    - 同一プロジェクト内 network 参照を `google_compute_network.<label>.self_link` に書き換え
    - `boot_disk.source` 行を削除（Step 5 で管理するため）
    - 成果物: `terraform/active/<src>/`
+3.7. **artifact_registry**（`data_sync` 配下）: 複製するコンテナイメージを列挙する計画。**Terraform より前**に置く（Cloud Run は `image = "...@sha256:<digest>"` を revision 作成時に解決するため、apply の後では間に合わない）。
 4. **terraform_apply**: `terraform plan -out=tfplan` を生成（apply はしない）
-5. **network_firewall** (Step 4.5): classic firewall ルールと Network Firewall Policy を dst host VPC に複製する計画。`secure_tag_map` 未登録の tagValues 参照は skip + WARNING。
-6. **gce_restore**: スナップショットから復元するディスク差し替え計画
-7. **data_sync**: GCS（リネーム後名）/ BigQuery（src の location 継承）の同期計画
-8. **vpc_sc** (Step 7): 既存ペリメタへ dst プロジェクト（番号）を追記する計画。`access_policy` / `perimeter` / `billing_project` のいずれかが未設定なら skip + WARNING。
+   - ⚠️ **`make plan` は Terraform を一切実行しません**。`terraform init` / `plan` も dry-run では `[DRY RUN] 予定:` と表示して空振りするため、**tfplan は生成されず** `make run` は毎回ゼロから plan を計算します。import 可否や dst の API 有効化は `make run` で初めて検証されます。
+4.7. **serverless_sync**: Cloud Run サービス / ジョブと Cloud Functions の複製計画。書き換え後の YAML と実行予定の `gcloud functions deploy` コマンドを表示する。移せない設定を含むものは「作らない」判断とその理由が出る。
+4.5. **network_firewall**: classic firewall ルールと Network Firewall Policy を dst host VPC に複製する計画。`secure_tag_map` 未登録の tagValues 参照は skip + WARNING。
+5. **gce_restore**: スナップショットから復元するディスク差し替え計画
+5.7. **iam_sync**: src の project IAM を dst の同名 SA へ複製する計画 + Cloud Run の公開設定（`allUsers → run.invoker`）の複製計画。
+6. **data_sync**: GCS（リネーム後名）/ BigQuery（src の location 継承）の同期計画
+7. **vpc_sc**: 既存ペリメタへ dst プロジェクト（番号）を追記する計画。`access_policy` / `perimeter` / `billing_project` のいずれかが未設定なら skip + WARNING。
 
 ### 差分レポート
 - 直後に **`logs/<タイムスタンプ>/DIFF.md`** を出力（CAI スキャン結果と bulk-export terraform の差分）
@@ -157,36 +170,58 @@
 
 **目的**: `make plan` で確認した内容を dst にだけ実書き込みする。src には一切触れない。VM は「OS 状態・データごと」復元される。
 
-`make plan` と同じ事前チェック後、dst にのみ書き込み（**実行順は以下の小数点番号と一致**）:
+`make plan` と同じ事前チェック後、dst にのみ書き込み（**番号は Step 番号。上から実行順**で、`4.7` が `4.5` より先に走る）:
 
-1. **Terraform apply (Step 4)**: dst host に VPC / subnet / Cloud Router / Cloud NAT を再現
+3.7. **Artifact Registry**: src の AR イメージを dst へ複製する。**Terraform より前**に実行する（Cloud Run / Cloud Functions が `@sha256:<digest>` で固定参照するため、apply 時に実体が無いと `Image not found` で revision 作成が失敗し tainted で残る）。
+   - 転送は **gcrane / crane のみ**（`check_prerequisites` が実行前に必須チェック）。registry→registry 転送で **digest が変わらない**ことが前提条件。docker の pull→push はマルチアーキイメージを単一プラットフォームに落として digest が変わるため使わない。
+   - `steps.data_sync.artifact_registry.scope: tagged` で「タグ無し = 置き換えられた過去ビルド」を除外できる。`.tf` が digest 固定で参照しているイメージは scope に関わらず必ず残す。
+
+4. **Terraform apply**: dst host に VPC / subnet / Cloud Router / Cloud NAT を再現
    - 冪等性: dst プロジェクト変更時は `terraform.tfstate` を破棄して import からやり直し（`active/<src>/.dst_project` マーカー判定）
    - `google_storage_bucket` はリネーム後の実名で import して adopt
    - VM/disk は Step 4 では作らず Step 5 で管理（責務分離）
    - **FW rules / Network Firewall Policy は Terraform では作らず Step 4.5 で gcloud 複製**（後述）。`google_compute_firewall` 等を bulk-export 由来の `.tf` に残しておくと Step 4.5 と二重定義になるため、`customize_hcl` 段階で除外している。
 
-1.5. **Network Firewall (Step 4.5 / `step_network_firewall`)**: Terraform で表現しきれない FW を `gcloud` で冪等複製する独立フェーズ。実行順は **Step 4 (terraform_apply) の直後・Step 5 (gce_restore) の前**。
+4.7. **サーバーレス複製 (`step_serverless_sync`)**: Cloud Run サービス / ジョブと Cloud Functions を、それぞれのサービス自身の仕組みで複製する。**bulk-export は Cloud Run を確実に出力できない**ため Terraform では扱わない（`serverless_tf_skip_reason()` が customize と apply 直前の両方で該当 `.tf` を落とし、二重所有を断つ）。実行順は **Step 4 の後**（SA / VPC / バケットが揃ってから）・**Step 5.7 の前**（Cloud Run の公開設定は Step 5.7 が付ける）。
+   - **Cloud Run**: `describe --format=export` → dst 用に書き換え → `replace --dry-run` でサーバ側検証 → `replace`。`replace` は「送った spec が正」＝落としたフィールドが既定値に戻る破壊的 API のため、**未知のフィールドは触らない**。VPC コネクタ / Cloud SQL / Secret Manager 参照 / CMEK / サイドカー / GPU / リビジョン固定を含むものは**複製せず** DIFF の要対応に手順を出す（参照先が src のままの壊れたリソースを作らないため）。
+   - **Cloud Functions**: ソース zip を「src 認証でローカルに download → dst 認証で upload」の 2 段で `<dst>-fn-source-migration` バケット（関数と同じリージョンに冪等作成）へ運び、`gcloud functions deploy` で **dst 側で再ビルド**する。HTTP トリガのみ対応。
+   - **関数ビルド専用 SA を先に用意する**: deploy のビルドは Cloud Build が実行し、その既定 ID は dst の default compute SA (`<番号>-compute@developer.gserviceaccount.com`) だが、**2024-05-03 以降に作られたプロジェクトは組織ポリシー `constraints/iam.automaticIamGrantsForDefaultServiceAccounts` によりこの SA にロールが 1 つも付かない**。移行先は必ず新規プロジェクトなので毎回該当し、放置すると全関数が `Could not build the function due to a missing permission on the build service account` で失敗する。そこで dst プロジェクト単位で `fn-build@<dst>.iam.gserviceaccount.com` を冪等作成し、公式指定の最小ロール（`roles/logging.logWriter` / `roles/artifactregistry.writer` / `roles/storage.objectViewer`）のうち**不足分だけ**付与して、deploy に `--build-service-account` で明示する。
+     - **既定 SA に `roles/cloudbuild.builds.builder` を足す方式は採らない**: 既定 SA は VM / Cloud Run / 全 Function の**実行 ID も兼ねる**ため移行と無関係の権限まで広がり、dst ORG が `cloudbuild.useComputeServiceAccount` を無効化していると付与しても動かない。
+     - この SA は関数の設定 (`buildServiceAccount`) に記録されるため、**移行後も残す前提**（削除すると再デプロイが失敗する）。作成・付与した事実は WARNING + `DIFF.md` の「確認」に出る。
+     - 自前の SA を使うなら `steps.serverless_sync.build_service_account: <email>`（作成・権限付与はツールでは行わない）、自動用意を止めるなら `grant_build_service_account: false`。用意できなかった場合は移行を止めず DIFF の要対応 + 手動コマンドに落とす。
+     - 付与直後は IAM 伝播が間に合わないことがあるため、待機してから deploy し、**そのプロジェクトの deploy だけ 1 回再試行**する。
+   - **ソース受け渡しバケットの作成は直列化**: 関数の複製は関数単位で並列なので、同一 dst で同時に作成すると片方が `409 ... you already own it` で落ちる。lock で直列化し、作成失敗時は実在を再確認して存在すれば成功として扱う。
+
+4.5. **Network Firewall (`step_network_firewall`)**: Terraform で表現しきれない FW を `gcloud` で冪等複製する独立フェーズ。実行順は **Step 4.7 (serverless_sync) の直後・Step 5 (gce_restore) の前**。
    - **冒頭で `_replicate_host_networks()` を呼び、dst host の Shared VPC ネットワーク (例: `shared-vpc`) と subnet を src host と同型に複製**する。FW rule / FW policy association は `--network=<NAME>` を要求するため、これが無いと `Could not fetch resource: 'projects/<dst_host>/global/networks/<name>' was not found` で全 FW 操作が失敗する。冪等 (`_gcloud_exists` ガード) で、Step 5 から再度呼ばれても describe のみ。
    - 防御的に `_sync_classic_firewall_rules` は参照される dst network を一括 pre-flight チェック、`_sync_fw_policy_associations` は assoc 単位で existence チェックし、未存在の network を参照する rule/assoc は cryptic な API エラーを量産せず skip + WARNING に倒す。
    - `network-firewall-policies` のサブコマンドごとに scope flag が異なる: `list`=`--regions=`（複数形）/ `describe`・`create`=`--global`・`--region=`（ポリシー本体）/ `rules ...`・`associations create`=`--global-firewall-policy`・`--firewall-policy-region=`。誤ると `unrecognized arguments`。`fw_rule_scope_flag()` で変換する。
    - `fw_policy_rule_flags()` は REST API の FirewallPolicyRule 全フィールドに対応する。INGRESS ルールは `srcIpRanges / srcThreatIntelligences / srcAddressGroups / srcFqdns / srcSecureTags / srcRegionCodes / srcNetworkScope` のいずれかが必須（gcloud 仕様）。欠落すると `Must specify src_... for ingress direction` / `Could not fetch resource:` で失敗する。
    - **Secure tag**（`tagValues/<数値ID>`）は ORG スコープの permanent ID で別 ORG には存在しない。そのまま渡すと `rules create` が `Could not fetch resource:` で失敗する。`config steps.network_firewall.secure_tag_map` に src→dst の tagValues を登録すると変換して複製。未登録タグを参照するルールは FW を意図せず緩めないようエラーにせずスキップし WARNING を出す。
 
-2. **gce_restore (Step 5)**: 期限内スナップショットから dst にディスクを復元 → boot disk を差し替え → **どの VM も一旦 RUNNING で残す**（OS 状態・データごと復元）
+5. **gce_restore**: 期限内スナップショットから dst にディスクを復元 → boot disk を差し替え → **どの VM も一旦 RUNNING で残す**（OS 状態・データごと復元）
    - 並列化: `_replicate_host_networks()` の後、(project, vm) のフラット work unit に展開し VM 単位で並列復元（`parallel_jobs=8` 推奨）。VM 内の操作チェーン (stop → detach → delete → create disk → attach → start → secondary disks) は依存があるため直列。
    - snapshot 未検出時の挙動: 並列モードで `sys.exit(1)` すると他 VM の進行を巻き添えで止めるため、`stats.failed` に記録して return する（最終的に `main()` で exit 1）。
 
-2.5. **電源状態反映 (Step 5.5 / `_finalize_vm_power_states`)**: 全 VM の復元完了後に、src と同じ電源状態 (`TERMINATED` / `SUSPENDED`) に揃える独立フェーズ。
+5.5. **電源状態反映 (`_finalize_vm_power_states`)**: 全 VM の復元完了後に、src と同じ電源状態 (`TERMINATED` / `SUSPENDED`) に揃える独立フェーズ。
    - **なぜ分離するか**: GCE suspend は guest OS が **ACPI S3 シグナルに 3 分以内に応答** する必要があり、boot 直後の VM では失敗しやすい。Step 5 の VM 復元ループの中で個別に suspend すると `Suspending instance(s) <name>....failed` が頻発する。
    - **待機**: `config.steps.gce_restore.power_state_wait_seconds` (既定 120 秒) だけ sleep してから状態反映を開始。`make plan` / `make mock` ではスキップ。
    - **TERMINATED 目標**: `gcloud compute instances stop --quiet` を `allow_fail=True` で発行（ACPI 失敗時は forceful fallback があるため通常成功）。
    - **SUSPENDED 目標**: `_try_dst_suspend` が `subprocess` を直接呼び、失敗しても `stats.failed` を増やさない（run 全体の exit code に影響させない）。失敗時は WARNING + 手動復旧コマンド (`gcloud compute instances suspend <name> --zone=<zone> --project=<dst>`) を案内するだけ。
    - **transient / 未対応 OS**: suspend 非対応構成（GPU/TPU 付き、Confidential VM、メモリ 208GB 超、CSEK 付きディスク、未設定の Debian 8/9/Windows）は WARNING のみで RUNNING のまま残る。
    - **並列**: pending リストを `_parallel_for_each` で `parallel_jobs` 並列実行。
-3. **data_sync (Step 6)**:
+
+5.7. **IAM 複製 (`step_iam_sync`)**: src 各プロジェクトの **project IAM ポリシー**を dst の同名 SA へ複製する（キー未指定でも有効）。dst SA が無ければ空 SA を冪等作成してから付与する。付与は **dst プロジェクト単位で並列 / プロジェクト内は直列**（`add-iam-policy-binding` は read-modify-write なので同一プロジェクトの並列実行は etag 競合になる）。
+   - **Cloud Run の公開設定もここで複製する**: 「未認証アクセスを許可」= サービス個別の `allUsers → roles/run.invoker` は bulk-export にも project IAM にも現れず、放置すると src で公開のサービスが dst で認証必須になる。Step 4.7 でサービスが出来ているので **1 回の `make run` で公開設定まで入る**。付与内容は末尾に WARNING で一覧 + 取消コマンドを出す（公開 = インターネット開放のため必ず見せる）。
+   - **複製しないもの**（いずれも dst の権限が緩む方向には作用しない）: 条件付きバインディング / ORG カスタムロール / `project_mapping` 外のプロジェクトの SA・カスタムロール / Google 管理 service agent / SA 自身の IAM / バケット・データセット等のリソース単位バインディング。
+   - **`roles/owner` 等の超高権限ロールも src と同じなら複製する**（忠実再現が既定）。付与した場合は実行ログ末尾に「何を・どこに・なぜ・取消コマンド」を WARNING でまとめる。
+   - **既定ランタイム SA（default compute / appspot）は複製しないが、差分を `DIFF.md` に出す**: これらはプロジェクトごとに ID が変わるため「dst にも同等物が既定で存在する」前提で除外している。しかし上と同じ組織ポリシーにより **dst の既定 SA には `roles/editor` すら付かない**ので、「存在は同等・権限は同等でない」状態になる。自動付与はせず（別 ORG に `roles/editor` を勝手に生やさないため）、**src の既定 SA が持っていたロールのうち dst に無いもの**を付与コマンド付きの「確認」として出す。既定 SA で動く VM / Cloud Run / Cloud Functions がある場合は必ず確認すること。
+   - dst 側に `roles/resourcemanager.projectIamAdmin` が必要（`bootstrap_dst_sa.sh` が付与）。権限が無い場合はエラーにせず skip し、手動用の `add-iam-policy-binding` を案内する。
+
+6. **data_sync**:
    - GCS: リネーム後バケットへ `gcloud storage rsync` で同期
    - BigQuery: src の location を継承してデータセット作成 → コピー
-4. **VPC Service Controls (Step 7)**: 全データ移行の **最後** に、dst プロジェクト（番号）を既存ペリメタへ `--add-resources` で追記する（org / access policy 自体は触らない・冪等）。先に封じ込めると後続操作が境界で弾かれるため最後に実行する。
+7. **VPC Service Controls**: 全データ移行の **最後** に、dst プロジェクト（番号）を既存ペリメタへ `--add-resources` で追記する（org / access policy 自体は触らない・冪等）。先に封じ込めると後続操作が境界で弾かれるため最後に実行する。
    - **`steps.vpc_sc.billing_project` は必須・明示指定**。`gcloud access-context-manager perimeters describe/update` は org/policy スコープで `--project` を持たないため、quota project を明示しないとローカル `gcloud config` の `core/project`（移行と無関係なプロジェクト）が quota に使われ、そこで API 無効 → `accesscontextmanager.googleapis.com ... SERVICE_DISABLED` で失敗する。
    - **誤ったプロジェクトを自動推測しない**安全方針: `access_policy` / `perimeter` / `billing_project` のいずれかが未設定なら「設定不足」として skip + WARNING（host dst や先頭 dst へ勝手にフォールバックしない）。`billing_project` には dst ORG 内で API を有効化できるプロジェクト（通常は dst ホスト）を明示する。
    - ステップ冒頭で `billing_project` に `accesscontextmanager` API を有効化（冪等 / allow_fail）してから describe/update を `--billing-project=<billing_project>` 付きで実行する。describe には `--quiet` を付け、API 無効時の対話プロンプトでハングしないようにする。
@@ -208,6 +243,12 @@
 - `logs/<timestamp>/{org,dst}.log` / `logs/<timestamp>/DIFF.md` をレビュー
   - ステップ単位 `━━━━` 区切り、`✓/+/−/✗` 記号、スレッドタグ `[main]` / `[cai-scan_0]`
   - `verbose_logging: true` で生コマンド + STDOUT を DEBUG レベルで記録
+- **`DIFF.md` は「要対応」→「確認」→ 参考の順に読む**。冒頭の要対応テーブルが「放置すると実害が出るもの」、続く注記セクションがツール側の補正・スキップの記録で、**手を動かす必要があるものはすべてここに出る**（各ステップが `.customize_notes.json` / `.serverless_notes.json` / `.iam_notes.json` に書いたものを集約している）。
+  - 今回の run で **新しく dst の権限を増やした / 増やさなかった**判断も「確認」に出る。代表例:
+    - 関数ビルド専用 SA `fn-build@<dst>` の作成とロール付与（残す前提。不要なら取消コマンドあり）
+    - 既定ランタイム SA（default compute / appspot）に **付けなかった**ロールの一覧と付与コマンド
+    - 平文の環境変数に入っていた秘匿情報らしき値（src と同じ値で複製済み。差し替え / ローテーションの判断用）
+    - `deletion_protection = false` の補完（本番切替時に戻す）
 - リポジトリ直下の `DIFF.md` は最新実行の `logs/<timestamp>/DIFF.md` への相対 symlink（`cat DIFF.md` で常に最新版）。実体は日付付きで残るため、過去実行と並べて差分を比較できる。
 - `logs/` は `.gitignore` 配下、`/DIFF.md`（symlink）も `.gitignore` に登録済み（fresh clone で dangling になるため）。
 
