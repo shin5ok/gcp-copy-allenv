@@ -64,6 +64,7 @@
     "semgrep@claude-plugins-official": true,
     "claude-code-setup@claude-plugins-official": true,
     "frontend-design@claude-plugins-official": true,
-    "codex@openai-codex": true
+    "codex@openai-codex": true,
+    "skill-creator@claude-plugins-official": true
   }
 }
